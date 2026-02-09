@@ -178,6 +178,44 @@ docker logs -f chess-coach
 
 ---
 
+### Run from GHCR
+
+Pull the published image:
+
+```bash
+docker pull ghcr.io/<owner>/<repo>:latest
+```
+
+One-time trait backfill seed (100 games) with snapshot check at the end:
+
+```bash
+docker run --rm \
+  -e DATABASE_URL="<postgres_connection_url>" \
+  -v "$(pwd)/output:/app/output" \
+  ghcr.io/<owner>/<repo>:latest \
+  -m src.cli.seed_traits --player <user> --games 100 --no-skip-snapshots
+```
+
+Normal mode:
+
+```bash
+docker compose up -d
+```
+
+Or directly with `docker run`:
+
+```bash
+docker run --rm \
+  --network host \
+  -e CHESS_USERNAME="<chesscom_username>" \
+  -e OPENAI_API_KEY="<optional_if_provider_gpt>" \
+  -v "$(pwd)/chess_reviews:/data" \
+  ghcr.io/<owner>/<repo>:latest \
+  chess_review.py --username "${CHESS_USERNAME}" --out /data --state-db /data/state.sqlite --provider ollama --ollama-url http://127.0.0.1:11434 --ollama-model "${OLLAMA_MODEL:-llama3.2:latest}" --poll-seconds "${POLL_SECONDS:-300}" --update-index
+```
+
+---
+
 ## Configuration flags (common)
 
 Inside `docker-compose.yml`, the container is launched with flags such as:
