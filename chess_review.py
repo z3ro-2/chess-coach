@@ -46,7 +46,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 
@@ -182,8 +182,78 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 
 def is_processed(conn: sqlite3.Connection, game_url: str) -> bool:
+    if is_game_ingested_in_db(game_url):
+        return True
+
     cur = conn.execute("SELECT 1 FROM processed_games WHERE game_url = ?", (game_url,))
     return cur.fetchone() is not None
+
+
+_INGEST_DB_CONN: Any = None
+_INGEST_DB_CLOSE: Optional[Callable[[], None]] = None
+_INGEST_DB_URL_COLUMN: Optional[str] = None
+_INGEST_DB_INIT_ATTEMPTED = False
+
+
+def _init_ingest_db_check() -> None:
+    global _INGEST_DB_CONN, _INGEST_DB_CLOSE, _INGEST_DB_URL_COLUMN, _INGEST_DB_INIT_ATTEMPTED
+
+    if _INGEST_DB_INIT_ATTEMPTED:
+        return
+    _INGEST_DB_INIT_ATTEMPTED = True
+
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
+        return
+
+    try:
+        from src.cli.seed_traits import _connect_db, _table_columns  # reuse existing DB utilities
+    except Exception as e:
+        print(f"[warn] Could not load DB utilities for idempotent ingest check: {e}", file=sys.stderr)
+        return
+
+    try:
+        _INGEST_DB_CONN, _INGEST_DB_CLOSE = _connect_db(database_url)
+        columns = _table_columns(_INGEST_DB_CONN, "games")
+        if "game_url" in columns:
+            _INGEST_DB_URL_COLUMN = "game_url"
+        elif "url" in columns:
+            _INGEST_DB_URL_COLUMN = "url"
+    except Exception as e:
+        print(f"[warn] Could not initialize DB ingest check: {e}", file=sys.stderr)
+        _INGEST_DB_CONN = None
+        _INGEST_DB_CLOSE = None
+        _INGEST_DB_URL_COLUMN = None
+
+
+def is_game_ingested_in_db(game_url: str) -> bool:
+    _init_ingest_db_check()
+    if _INGEST_DB_CONN is None or _INGEST_DB_URL_COLUMN is None:
+        return False
+
+    try:
+        from src.cli.seed_traits import _fetchone  # reuse existing DB utilities
+        row = _fetchone(
+            _INGEST_DB_CONN,
+            f"SELECT 1 FROM games WHERE {_INGEST_DB_URL_COLUMN} = %s LIMIT 1",
+            (game_url,),
+        )
+        return row is not None
+    except Exception as e:
+        print(f"[warn] DB ingest check failed, falling back to local state DB: {e}", file=sys.stderr)
+        return False
+
+
+def _close_ingest_db_check() -> None:
+    global _INGEST_DB_CONN, _INGEST_DB_CLOSE
+    if _INGEST_DB_CLOSE is None:
+        return
+    try:
+        _INGEST_DB_CLOSE()
+    except Exception:
+        pass
+    _INGEST_DB_CONN = None
+    _INGEST_DB_CLOSE = None
 
 
 def mark_processed(
@@ -751,22 +821,25 @@ def main() -> int:
 
     conn = init_db(args.state_db)
 
-    if args.once:
-        poll_once(conn, args)
-        return 0
-
-    while True:
-        try:
-            created = poll_once(conn, args)
-            # if we just created output, poll quickly once more (sometimes games arrive slightly delayed)
-            sleep_s = 20 if created > 0 else args.poll_seconds
-        except KeyboardInterrupt:
+    try:
+        if args.once:
+            poll_once(conn, args)
             return 0
-        except Exception as e:
-            print(f"[error] poll cycle failed: {e}", file=sys.stderr)
-            sleep_s = min(args.poll_seconds, 120)
 
-        time.sleep(sleep_s)
+        while True:
+            try:
+                created = poll_once(conn, args)
+                # if we just created output, poll quickly once more (sometimes games arrive slightly delayed)
+                sleep_s = 20 if created > 0 else args.poll_seconds
+            except KeyboardInterrupt:
+                return 0
+            except Exception as e:
+                print(f"[error] poll cycle failed: {e}", file=sys.stderr)
+                sleep_s = min(args.poll_seconds, 120)
+
+            time.sleep(sleep_s)
+    finally:
+        _close_ingest_db_check()
 
 
 if __name__ == "__main__":
