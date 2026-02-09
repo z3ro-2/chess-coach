@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chess-coach.local/schemas/trait-events-single-game.schema.json",
+  "title": "Trait Events Extracted From Single Game",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "events"
+  ],
+  "properties": {
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/trait_event"
+      }
+    }
+  },
+  "$defs": {
+    "trait_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trait_key",
+        "direction",
+        "weight",
+        "confidence",
+        "phase",
+        "note"
+      ],
+      "properties": {
+        "trait_key": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{2,64}$"
+        },
+        "direction": {
+          "type": "integer",
+          "enum": [
+            -1,
+            0,
+            1
+          ]
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 2.0
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 1.0
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "opening",
+            "middlegame",
+            "endgame"
+          ]
+        },
+        "move_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "evidence_strength": {
+          "type": "string",
+          "enum": [
+            "minor",
+            "standard",
+            "major"
+          ]
+        }
+      }
+    }
+  }
+}
