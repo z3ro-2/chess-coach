@@ -664,7 +664,11 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Chess.com game poller -> LLM coach notes -> Markdown files")
 
-    p.add_argument("--username", required=True, help="Chess.com username")
+    p.add_argument(
+        "--username",
+        default=os.environ.get("CHESS_USERNAME", ""),
+        help="Chess.com username (or env CHESS_USERNAME).",
+    )
     p.add_argument("--out", type=Path, default=Path("./chess_reviews"), help="Output directory")
     p.add_argument(
         "--state-db",
@@ -716,6 +720,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = p.parse_args()
+
+    if not args.username:
+        p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
 
     # Normalize rules filter: allow disabling with empty string
     if args.rules_filter is not None:
