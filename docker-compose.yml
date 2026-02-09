@@ -1,0 +1,22 @@
+services:
+  chess-coach:
+    build:
+      context: .
+    container_name: chess-coach
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ${HOME}/chess:/data
+    command:
+      [
+        "--username", "loganm20",
+        "--out", "/data",
+        "--state-db", "/data/state.sqlite",
+        "--provider", "ollama",
+        "--ollama-url", "http://127.0.0.1:11434",
+        "--ollama-model", "llama3.2:latest",
+        "--poll-seconds", "300",
+        "--update-index"
+      ]
