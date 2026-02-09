@@ -98,6 +98,7 @@ def seed_traits_for_player(
     skipped_existing_event_games = 0
     applied_updates = 0
     processed_games = 0
+    snapshot_result: dict[str, Any] | None = None
 
     for idx, game_row in enumerate(games, start=1):
         game_id = int(game_row["id"])
@@ -141,6 +142,8 @@ def seed_traits_for_player(
         if not dry_run:
             apply_trait_updates_for_game(player_id, game_id, db_session_or_conn=conn)
             applied_updates += 1
+            if not skip_snapshots:
+                snapshot_result = maybe_create_trait_snapshot(player_id, db_session_or_conn=conn)
 
         processed_games += 1
         if idx % 10 == 0:
@@ -152,10 +155,6 @@ def seed_traits_for_player(
                 skipped_existing_event_games,
                 applied_updates,
             )
-
-    snapshot_result: dict[str, Any] | None = None
-    if not dry_run and not skip_snapshots:
-        snapshot_result = maybe_create_trait_snapshot(player_id, db_session_or_conn=conn)
 
     return {
         "player_id": player_id,
