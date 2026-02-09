@@ -681,8 +681,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gpt-model", default="gpt-4o-mini", help="OpenAI model (provider=gpt)")
     p.add_argument("--max-tokens", type=int, default=1400, help="Max tokens for OpenAI responses")
 
-    p.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
-    p.add_argument("--ollama-model", default="llama3.1:8b", help="Ollama model name")
+    p.add_argument(
+        "--ollama-url",
+        default=os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+        help="Ollama base URL",
+    )
+    p.add_argument(
+        "--ollama-model",
+        default=os.environ.get("OLLAMA_MODEL", "llama3.1:8b"),
+        help="Ollama model name",
+    )
 
     p.add_argument("--poll-seconds", type=int, default=300, help="Polling interval (seconds)")
     p.add_argument("--once", action="store_true", help="Run one poll cycle then exit")
