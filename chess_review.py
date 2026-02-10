@@ -51,6 +51,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 import requests
+from src.config.output_paths import get_output_root
+from src.db.bootstrap import ensure_bootstrap
+from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
+from src.db.player_metrics import record_player_rating_for_game
 
 CHESSCOM_GAMES_URL = "https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
 DEFAULT_TIMEOUT = 120  # seconds (local Ollama cold starts can be slow)
@@ -173,7 +177,12 @@ CREATE INDEX IF NOT EXISTS idx_processed_end_time ON processed_games(end_time);
 
 
 def init_db(db_path: Path) -> sqlite3.Connection:
+    db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        db_path.touch(exist_ok=True)
+    except Exception:
+        pass
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.executescript(SCHEMA_SQL)
@@ -187,73 +196,6 @@ def is_processed(conn: sqlite3.Connection, game_url: str) -> bool:
 
     cur = conn.execute("SELECT 1 FROM processed_games WHERE game_url = ?", (game_url,))
     return cur.fetchone() is not None
-
-
-_INGEST_DB_CONN: Any = None
-_INGEST_DB_CLOSE: Optional[Callable[[], None]] = None
-_INGEST_DB_URL_COLUMN: Optional[str] = None
-_INGEST_DB_INIT_ATTEMPTED = False
-
-
-def _init_ingest_db_check() -> None:
-    global _INGEST_DB_CONN, _INGEST_DB_CLOSE, _INGEST_DB_URL_COLUMN, _INGEST_DB_INIT_ATTEMPTED
-
-    if _INGEST_DB_INIT_ATTEMPTED:
-        return
-    _INGEST_DB_INIT_ATTEMPTED = True
-
-    database_url = os.environ.get("DATABASE_URL", "").strip()
-    if not database_url:
-        return
-
-    try:
-        from src.cli.seed_traits import _connect_db, _table_columns  # reuse existing DB utilities
-    except Exception as e:
-        print(f"[warn] Could not load DB utilities for idempotent ingest check: {e}", file=sys.stderr)
-        return
-
-    try:
-        _INGEST_DB_CONN, _INGEST_DB_CLOSE = _connect_db(database_url)
-        columns = _table_columns(_INGEST_DB_CONN, "games")
-        if "game_url" in columns:
-            _INGEST_DB_URL_COLUMN = "game_url"
-        elif "url" in columns:
-            _INGEST_DB_URL_COLUMN = "url"
-    except Exception as e:
-        print(f"[warn] Could not initialize DB ingest check: {e}", file=sys.stderr)
-        _INGEST_DB_CONN = None
-        _INGEST_DB_CLOSE = None
-        _INGEST_DB_URL_COLUMN = None
-
-
-def is_game_ingested_in_db(game_url: str) -> bool:
-    _init_ingest_db_check()
-    if _INGEST_DB_CONN is None or _INGEST_DB_URL_COLUMN is None:
-        return False
-
-    try:
-        from src.cli.seed_traits import _fetchone  # reuse existing DB utilities
-        row = _fetchone(
-            _INGEST_DB_CONN,
-            f"SELECT 1 FROM games WHERE {_INGEST_DB_URL_COLUMN} = %s LIMIT 1",
-            (game_url,),
-        )
-        return row is not None
-    except Exception as e:
-        print(f"[warn] DB ingest check failed, falling back to local state DB: {e}", file=sys.stderr)
-        return False
-
-
-def _close_ingest_db_check() -> None:
-    global _INGEST_DB_CONN, _INGEST_DB_CLOSE
-    if _INGEST_DB_CLOSE is None:
-        return
-    try:
-        _INGEST_DB_CLOSE()
-    except Exception:
-        pass
-    _INGEST_DB_CONN = None
-    _INGEST_DB_CLOSE = None
 
 
 def mark_processed(
@@ -545,6 +487,7 @@ def call_ollama_generate(
 def ensure_dirs(out_dir: Path) -> None:
     (out_dir / "md").mkdir(parents=True, exist_ok=True)
     (out_dir / "pgn").mkdir(parents=True, exist_ok=True)
+    (out_dir / "logs").mkdir(parents=True, exist_ok=True)
 
 
 def write_text(path: Path, text: str) -> None:
@@ -670,6 +613,15 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         model=used_model,
         content_hash=h,
     )
+    record_player_rating_for_game(
+        player_username=args.username,
+        game_url=game.game_url,
+        end_time=game.end_dt_utc,
+        player_color=game.your_color,
+        pgn=game.pgn,
+        time_control=game.time_control,
+        rated=game.rated,
+    )
 
     if args.update_index:
         update_index(args.out)
@@ -733,18 +685,28 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Chess.com game poller -> LLM coach notes -> Markdown files")
+    output_root: Optional[Path]
+    try:
+        output_root = get_output_root()
+    except KeyError:
+        output_root = None
 
     p.add_argument(
         "--username",
         default=os.environ.get("CHESS_USERNAME", ""),
         help="Chess.com username (or env CHESS_USERNAME).",
     )
-    p.add_argument("--out", type=Path, default=Path("./chess_reviews"), help="Output directory")
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=output_root,
+        help="Output directory (defaults to CHESS_OUTPUT_DIR if set).",
+    )
     p.add_argument(
         "--state-db",
         type=Path,
-        default=Path("./chess_reviews/state.sqlite"),
-        help="SQLite state DB path",
+        default=(output_root / "state.sqlite") if output_root is not None else None,
+        help="SQLite state DB path (defaults to CHESS_OUTPUT_DIR/state.sqlite if set).",
     )
 
     p.add_argument("--provider", choices=["gpt", "ollama"], default="ollama", help="LLM provider")
@@ -779,6 +741,17 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--update-index", action="store_true", help="Update index.md after new reviews")
     p.add_argument("--dry-run", action="store_true", help="Detect new games but do not call LLM or write files")
+    p.add_argument(
+        "--no-bootstrap",
+        action="store_true",
+        help="Disable first-run Postgres bootstrap seeding.",
+    )
+    p.add_argument(
+        "--bootstrap-games",
+        type=int,
+        default=None,
+        help="Number of games to bootstrap on first run (overrides CHESS_BOOTSTRAP_GAMES).",
+    )
 
     # Telegram notifications (optional)
     p.add_argument(
@@ -801,6 +774,12 @@ def parse_args() -> argparse.Namespace:
 
     if not args.username:
         p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
+    if args.out is None:
+        p.error("CHESS_OUTPUT_DIR is not set; set it or pass --out explicitly.")
+    if args.state_db is None:
+        args.state_db = Path(args.out) / "state.sqlite"
+    if args.bootstrap_games is not None and args.bootstrap_games <= 0:
+        p.error("--bootstrap-games must be > 0.")
 
     # Normalize rules filter: allow disabling with empty string
     if args.rules_filter is not None:
@@ -816,10 +795,21 @@ def main() -> int:
     # Safety: ensure Ollama host resolution is always localhost when running with host networking
     if "ollama" in args.ollama_url:
         args.ollama_url = args.ollama_url.replace("ollama", "127.0.0.1")
-    args.out = args.out.expanduser().resolve()
-    args.state_db = args.state_db.expanduser().resolve()
+    args.out = Path(args.out)
+    args.state_db = Path(args.state_db)
 
     conn = init_db(args.state_db)
+    if not args.no_bootstrap:
+        bootstrap_result = ensure_bootstrap(
+            username=args.username,
+            bootstrap_games=args.bootstrap_games,
+            fetch_recent_games_fn=fetch_recent_games,
+            parse_game_fn=parse_game,
+        )
+        if bootstrap_result.get("ran"):
+            inserted = int(bootstrap_result.get("inserted_games", 0))
+            requested = int(bootstrap_result.get("requested_games", 0))
+            print(f"[info] Bootstrap seeded {inserted}/{requested} games for {args.username}.")
 
     try:
         if args.once:
@@ -839,7 +829,7 @@ def main() -> int:
 
             time.sleep(sleep_s)
     finally:
-        _close_ingest_db_check()
+        close_ingest_db_check()
 
 
 if __name__ == "__main__":

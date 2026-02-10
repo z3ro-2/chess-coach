@@ -95,7 +95,7 @@ Create a `.env` file in the repo root (this file should **not** be committed):
 CHESS_USERNAME=your_chesscom_username
 
 # OPTIONAL
-CHESS_OUTPUT_DIR=/home/youruser/Documents/chess
+CHESS_OUTPUT_DIR=/data
 OLLAMA_MODEL=llama3.2:latest
 POLL_SECONDS=300
 
@@ -108,6 +108,9 @@ TG_CHAT_ID=
 ```
 
 A `.env.example` file is provided for reference.
+
+When running in Docker, `CHESS_OUTPUT_DIR` inside the container should be `/data`.
+The host path should be mounted to `/data` so all outputs (md, pgn, state.sqlite, trait_books, index.md) land on the host volume.
 
 ---
 
@@ -122,7 +125,7 @@ Before running, ensure you have:
 The compose file:
 - Runs a single `chess-coach` container
 - Connects to Ollama running on the host via `network_mode: host`
-- Persists output to a user-defined directory
+- Persists output by mounting host `${HOME}/chess` to container `/data`
 
 ---
 
@@ -191,7 +194,8 @@ One-time trait backfill seed (100 games) with snapshot check at the end:
 ```bash
 docker run --rm \
   -e DATABASE_URL="<postgres_connection_url>" \
-  -v "$(pwd)/output:/app/output" \
+  -e CHESS_OUTPUT_DIR="/data" \
+  -v "$(pwd)/output:/data" \
   ghcr.io/<owner>/<repo>:latest \
   -m src.cli.seed_traits --player <user> --games 100 --no-skip-snapshots
 ```

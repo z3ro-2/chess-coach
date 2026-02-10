@@ -11,4 +11,4 @@ services:
       - .env
 
     volumes:
-      - ${CHESS_OUTPUT_DIR:-./chess_reviews}:/data
+      - ${HOME}/chess:/data

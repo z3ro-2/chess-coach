@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.config.output_paths import get_trait_books_root
 from src.traits.trait_book import generate_trait_book_markdown
 
 
@@ -662,7 +662,7 @@ def _safe_path_component(value: str) -> str:
 
 
 def _build_snapshot_path(platform_user: str, cutoff_game_count: int) -> Path:
-    base_dir = Path(os.environ.get("TRAIT_BOOK_BASE_DIR", "output/trait_books"))
+    base_dir = get_trait_books_root()
     return base_dir / platform_user / f"trait_book_{cutoff_game_count:04d}.md"
 
 
