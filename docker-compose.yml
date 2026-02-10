@@ -8,6 +8,8 @@ services:
       POSTGRES_DB: chesscoach
       POSTGRES_USER: chess
       POSTGRES_PASSWORD: chess
+    networks:
+      - chessnet
     volumes:
       - chess_postgres_data:/var/lib/postgresql/data
     ports:
@@ -30,6 +32,12 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ${HOME}/chess:/data
+    networks:
+      - chessnet
 
 volumes:
   chess_postgres_data:
+
+networks:
+  chessnet:
+    driver: bridge
