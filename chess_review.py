@@ -1132,8 +1132,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--state-db",
         type=Path,
-        default=(output_root / "state.sqlite") if output_root is not None else None,
-        help="SQLite state DB path (defaults to CHESS_OUTPUT_DIR/state.sqlite if set).",
+        default=os.environ.get("STATE_DB", "/data/state.sqlite"),
+        help="Path to the SQLite state database (default from STATE_DB env or /data/state.sqlite)",
     )
 
     p.add_argument("--provider", choices=["gpt", "ollama"], default="ollama", help="LLM provider")
@@ -1215,8 +1215,6 @@ def parse_args() -> argparse.Namespace:
         p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
     if args.out is None:
         p.error("CHESS_OUTPUT_DIR is not set; set it or pass --out explicitly.")
-    if args.state_db is None:
-        args.state_db = Path(args.out) / "state.sqlite"
     if args.bootstrap_games is not None and args.bootstrap_games <= 0:
         p.error("--bootstrap-games must be > 0.")
     if args.player_summary_every_n <= 0:
@@ -1238,6 +1236,7 @@ def main() -> int:
     logger.info("LLM endpoint resolved to %s", args.ollama_url)
     args.out = Path(args.out)
     args.state_db = Path(args.state_db)
+    logger.info("SQLite state DB path: %s", args.state_db)
 
     conn = init_db(args.state_db)
     if getattr(args, "command", None):

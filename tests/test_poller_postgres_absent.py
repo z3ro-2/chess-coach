@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import chess_review
@@ -164,3 +165,26 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
 
     assert result is None
     assert len(calls) == calls_before_restart
+
+
+def test_state_db_defaults_from_env_and_init_db_writes(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("CHESS_USERNAME", "logan")
+    monkeypatch.setenv("CHESS_OUTPUT_DIR", str(tmp_path / "out"))
+    monkeypatch.setenv("STATE_DB", "/data/state.sqlite")
+    monkeypatch.setattr(sys, "argv", ["chess_review.py", "--once"])
+
+    args = chess_review.parse_args()
+    assert str(args.state_db) == "/data/state.sqlite"
+
+    writable_state_db = tmp_path / "data" / "state.sqlite"
+    monkeypatch.setenv("STATE_DB", str(writable_state_db))
+    monkeypatch.setattr(sys, "argv", ["chess_review.py", "--once"])
+    args = chess_review.parse_args()
+    conn = chess_review.init_db(args.state_db)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    assert writable_state_db.exists()

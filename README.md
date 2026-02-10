@@ -192,6 +192,7 @@ Common `.env` options:
 ```env
 CHESS_USERNAME=your_username
 CHESS_OUTPUT_DIR=/data
+STATE_DB=/data/state.sqlite
 DATABASE_URL=postgresql://chess:chess@postgres:5432/chesscoach
 OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_MODEL=llama3.2:latest
@@ -200,6 +201,7 @@ PLAYER_SUMMARY_EVERY_N=20
 ```
 
 Docker note: if `OLLAMA_URL` is unset or uses `127.0.0.1`/`localhost`, runtime auto-resolves to `http://host.docker.internal:11434` in containers.
+`STATE_DB` sets the local SQLite state DB path. It must be writable by the container user; default is `/data/state.sqlite`.
 
 Common CLI flags:
 - `--username`
