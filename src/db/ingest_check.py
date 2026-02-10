@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable
-
-from src.cli.seed_traits import _connect_db, _fetchone, _table_columns
+from typing import Any, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +30,16 @@ def is_game_ingested_in_db(game_url: str) -> bool:
 
 
 def close_ingest_db_check() -> None:
-    global _INGEST_DB_CONN, _INGEST_DB_CLOSE
-    if _INGEST_DB_CLOSE is None:
-        return
-    try:
-        _INGEST_DB_CLOSE()
-    except Exception:
-        logger.debug("Failed to close ingest DB check connection.", exc_info=True)
+    global _INGEST_DB_CONN, _INGEST_DB_CLOSE, _INGEST_DB_URL_COLUMN, _INGEST_DB_INIT_ATTEMPTED
+    if _INGEST_DB_CLOSE is not None:
+        try:
+            _INGEST_DB_CLOSE()
+        except Exception:
+            logger.debug("Failed to close ingest DB check connection.", exc_info=True)
     _INGEST_DB_CONN = None
     _INGEST_DB_CLOSE = None
+    _INGEST_DB_URL_COLUMN = None
+    _INGEST_DB_INIT_ATTEMPTED = False
 
 
 def _init_ingest_db_check() -> None:
@@ -61,9 +60,84 @@ def _init_ingest_db_check() -> None:
             _INGEST_DB_URL_COLUMN = "game_url"
         elif "url" in columns:
             _INGEST_DB_URL_COLUMN = "url"
+        else:
+            _INGEST_DB_CONN = None
+            if _INGEST_DB_CLOSE is not None:
+                _INGEST_DB_CLOSE()
+            _INGEST_DB_CLOSE = None
+            logger.debug("DB ingest check disabled: games table has no URL column.")
     except Exception:
         logger.debug("Could not initialize DB ingest check.", exc_info=True)
         _INGEST_DB_CONN = None
         _INGEST_DB_CLOSE = None
         _INGEST_DB_URL_COLUMN = None
 
+
+def _connect_db(database_url: str) -> tuple[Any, Callable[[], None]]:
+    try:
+        import psycopg2  # type: ignore
+
+        conn = psycopg2.connect(database_url)
+        conn.autocommit = False
+        return conn, conn.close
+    except Exception:
+        pass
+
+    from sqlalchemy import create_engine
+
+    engine = create_engine(database_url)
+    raw_conn = engine.raw_connection()
+
+    def _cleanup() -> None:
+        try:
+            raw_conn.close()
+        finally:
+            engine.dispose()
+
+    return raw_conn, _cleanup
+
+
+def _fetchone(conn: Any, query: str, params: tuple[Any, ...] = ()) -> Mapping[str, Any] | None:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        columns = [col[0] for col in (cur.description or [])]
+        if isinstance(row, Mapping):
+            return dict(row)
+        return {columns[idx]: row[idx] for idx in range(len(columns))}
+    finally:
+        cur.close()
+
+
+def _table_columns(conn: Any, table_name: str) -> set[str]:
+    rows = _fetchall(
+        conn,
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = ANY(current_schemas(false))
+          AND table_name = %s
+        """,
+        (table_name,),
+    )
+    return {str(row["column_name"]) for row in rows}
+
+
+def _fetchall(conn: Any, query: str, params: tuple[Any, ...] = ()) -> list[Mapping[str, Any]]:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        columns = [col[0] for col in (cur.description or [])]
+        out: list[Mapping[str, Any]] = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                out.append(dict(row))
+            else:
+                out.append({columns[idx]: row[idx] for idx in range(len(columns))})
+        return out
+    finally:
+        cur.close()

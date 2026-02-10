@@ -75,6 +75,7 @@ def test_ensure_bootstrap_runs_once_then_skips_with_parser_flow(monkeypatch) -> 
     monkeypatch.setattr(bootstrap_module, "_insert_games_for_player", _insert_games_stub)
     monkeypatch.setattr(bootstrap_module, "_seed_player_ratings_for_bootstrap", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(bootstrap_module, "_seed_rating_history_if_available", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(bootstrap_module, "_seed_traits_if_available", lambda *_args, **_kwargs: 0)
 
     first = bootstrap_module.ensure_bootstrap(
         username="logan",

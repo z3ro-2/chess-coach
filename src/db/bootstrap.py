@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
-import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from src.cli.seed_traits import _connect_db, _execute, _fetchone, _table_columns
 from src.db.player_metrics import extract_player_rating_from_pgn, insert_player_rating_row
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_BOOTSTRAP_GAMES = 25
 DEFAULT_LOOKBACK_DAYS = 365
@@ -27,8 +27,8 @@ def ensure_bootstrap(
     normalized_username = (username or "").strip()
     try:
         requested_games = _resolve_bootstrap_games(bootstrap_games)
-    except Exception as exc:
-        _warn("invalid_bootstrap_games", exc)
+    except Exception:
+        logger.warning("Bootstrap skipped: invalid CHESS_BOOTSTRAP_GAMES/--bootstrap-games value.", exc_info=True)
         return _result(False, "invalid_bootstrap_games", requested_games=DEFAULT_BOOTSTRAP_GAMES)
 
     if not normalized_username:
@@ -36,16 +36,18 @@ def ensure_bootstrap(
 
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
+        logger.debug("Bootstrap skipped: DATABASE_URL not set.")
         return _result(False, "no_database_url", requested_games=requested_games)
 
     fetch_fn, parse_fn = _resolve_parser_functions(fetch_recent_games_fn, parse_game_fn)
     if fetch_fn is None or parse_fn is None:
+        logger.debug("Bootstrap skipped: parser callables unavailable.")
         return _result(False, "parser_unavailable", requested_games=requested_games)
 
     try:
         conn, cleanup = _connect_db(database_url)
-    except Exception as exc:
-        _warn("db_unreachable", exc)
+    except Exception:
+        logger.debug("Bootstrap skipped: Postgres unreachable.", exc_info=True)
         return _result(False, "db_unreachable", requested_games=requested_games)
 
     try:
@@ -56,12 +58,12 @@ def ensure_bootstrap(
             fetch_recent_games_fn=fetch_fn,
             parse_game_fn=parse_fn,
         )
-    except Exception as exc:
+    except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
-        _warn("bootstrap_failed", exc)
+        logger.warning("Bootstrap failed unexpectedly.", exc_info=True)
         return _result(False, "bootstrap_failed", requested_games=requested_games)
     finally:
         cleanup()
@@ -78,16 +80,20 @@ def _ensure_bootstrap_with_conn(
     player_columns = _safe_table_columns(conn, "players")
     game_columns = _safe_table_columns(conn, "games")
     if not player_columns or not game_columns or "player_id" not in game_columns:
+        logger.warning("Bootstrap skipped: required schema missing (players/games tables).")
         return _result(False, "schema_missing", requested_games=requested_games)
 
     player_id = _resolve_or_create_player_id(conn, username=username, player_columns=player_columns)
     if player_id is None:
+        logger.warning("Bootstrap skipped: could not resolve player row in players table.")
         return _result(False, "schema_missing", requested_games=requested_games)
 
     existing_games = _count_games_for_player(conn, player_id=player_id)
     if existing_games is None:
+        logger.warning("Bootstrap skipped: unable to count games for player_id=%s.", player_id)
         return _result(False, "schema_missing", requested_games=requested_games)
     if existing_games > 0:
+        logger.debug("Bootstrap skipped: already seeded for player_id=%s.", player_id)
         return _result(False, "already_seeded", requested_games=requested_games)
 
     parsed_games = _collect_games_from_existing_parser(
@@ -97,6 +103,7 @@ def _ensure_bootstrap_with_conn(
         parse_game_fn=parse_game_fn,
     )
     if not parsed_games:
+        logger.debug("Bootstrap skipped: no recent games available.")
         return _result(False, "no_recent_games", requested_games=requested_games)
 
     inserted_games = _insert_games_for_player(
@@ -106,11 +113,30 @@ def _ensure_bootstrap_with_conn(
         game_columns=game_columns,
     )
     if inserted_games <= 0:
+        logger.debug("Bootstrap skipped: no new games inserted.")
         return _result(False, "no_new_games", requested_games=requested_games)
 
-    _seed_player_ratings_for_bootstrap(conn, username=username, games=parsed_games)
-    _seed_rating_history_if_available(conn, player_id=player_id, games=parsed_games)
-    conn.commit()
+    try:
+        _seed_player_ratings_for_bootstrap(conn, username=username, games=parsed_games)
+    except Exception:
+        logger.debug("Bootstrap rating seed skipped due to optional metrics failure.", exc_info=True)
+
+    try:
+        _seed_rating_history_if_available(conn, player_id=player_id, games=parsed_games)
+    except Exception:
+        logger.debug("Bootstrap rating_history seed skipped due to optional metrics failure.", exc_info=True)
+
+    try:
+        _seed_traits_if_available(conn, player_id=player_id, games=parsed_games, game_columns=game_columns)
+    except Exception:
+        logger.warning("Bootstrap trait seed skipped due to trait pipeline failure.", exc_info=True)
+
+    try:
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.warning("Bootstrap failed during commit.", exc_info=True)
+        return _result(False, "bootstrap_failed", requested_games=requested_games)
 
     return _result(
         True,
@@ -129,8 +155,8 @@ def _resolve_parser_functions(
 
     try:
         from chess_review import fetch_recent_games, parse_game
-    except Exception as exc:
-        _warn("parser_unavailable", exc)
+    except Exception:
+        logger.debug("Bootstrap parser import failed.", exc_info=True)
         return None, None
     return fetch_recent_games, parse_game
 
@@ -145,8 +171,8 @@ def _collect_games_from_existing_parser(
     lookback_days = _resolve_lookback_days(requested_games)
     try:
         raw_games = fetch_recent_games_fn(username, lookback_days)
-    except Exception as exc:
-        _warn("fetch_recent_games_failed", exc)
+    except Exception:
+        logger.debug("Bootstrap fetch_recent_games failed.", exc_info=True)
         return []
 
     collected: list[dict[str, Any]] = []
@@ -154,8 +180,8 @@ def _collect_games_from_existing_parser(
     for raw in raw_games:
         try:
             parsed = parse_game_fn(raw, username)
-        except Exception as exc:
-            _warn("parse_game_failed", exc)
+        except Exception:
+            logger.debug("Bootstrap parse_game failed for a game.", exc_info=True)
             continue
         if parsed is None:
             continue
@@ -197,8 +223,8 @@ def _resolve_lookback_days(requested_games: int) -> int:
 def _safe_table_columns(conn: Any, table_name: str) -> set[str]:
     try:
         return _table_columns(conn, table_name)
-    except Exception as exc:
-        _warn(f"table_columns_failed:{table_name}", exc)
+    except Exception:
+        logger.debug("Bootstrap table introspection failed for %s.", table_name, exc_info=True)
         return set()
 
 
@@ -233,7 +259,6 @@ def _resolve_or_create_player_id(
         + ")"
     )
     _execute(conn, sql, tuple(data[name] for name in col_names))
-    conn.commit()
 
     player_row = _find_player_row(conn, username=username, player_columns=player_columns)
     if player_row is None:
@@ -406,6 +431,9 @@ def _seed_rating_history_if_available(
     if not history_columns:
         return 0
     if "player_id" not in history_columns or "rating" not in history_columns:
+        logger.warning(
+            "Bootstrap skipped player_rating_history seed: table exists but required columns are missing."
+        )
         return 0
 
     inserted = 0
@@ -457,6 +485,60 @@ def _seed_rating_history_if_available(
     return inserted
 
 
+def _seed_traits_if_available(
+    conn: Any,
+    *,
+    player_id: int,
+    games: list[Mapping[str, Any]],
+    game_columns: set[str],
+) -> int:
+    traits_columns = _safe_table_columns(conn, "traits")
+    player_traits_columns = _safe_table_columns(conn, "player_traits")
+    trait_events_columns = _safe_table_columns(conn, "trait_events")
+    if not traits_columns or not player_traits_columns or not trait_events_columns:
+        logger.debug("Bootstrap trait seeding skipped: required trait tables are missing.")
+        return 0
+
+    try:
+        from src.db.trait_updates import apply_trait_updates_for_game
+    except Exception:
+        logger.debug("Bootstrap trait seeding skipped: trait update module unavailable.", exc_info=True)
+        return 0
+
+    url_column = "game_url" if "game_url" in game_columns else ("url" if "url" in game_columns else None)
+    if url_column is None:
+        logger.debug("Bootstrap trait seeding skipped: games table has no game URL column.")
+        return 0
+
+    updated_count = 0
+    for game in games:
+        game_url = str(game.get("game_url") or "")
+        if not game_url:
+            continue
+
+        row = _fetchone(
+            conn,
+            f"SELECT id FROM games WHERE player_id = %s AND {url_column} = %s LIMIT 1",
+            (player_id, game_url),
+        )
+        if row is None:
+            continue
+
+        game_id = int(row["id"])
+        try:
+            apply_trait_updates_for_game(player_id, game_id, db_session_or_conn=conn)
+            updated_count += 1
+        except Exception:
+            logger.warning(
+                "Bootstrap trait update failed for player_id=%s game_id=%s.",
+                player_id,
+                game_id,
+                exc_info=True,
+            )
+
+    return updated_count
+
+
 def _result(
     ran: bool,
     reason: str,
@@ -472,6 +554,79 @@ def _result(
     }
 
 
-def _warn(reason: str, exc: Exception) -> None:
-    print(f"[warn] bootstrap {reason}: {exc}", file=sys.stderr)
+def _connect_db(database_url: str) -> tuple[Any, Callable[[], None]]:
+    try:
+        import psycopg2  # type: ignore
 
+        conn = psycopg2.connect(database_url)
+        conn.autocommit = False
+        return conn, conn.close
+    except Exception:
+        pass
+
+    from sqlalchemy import create_engine
+
+    engine = create_engine(database_url)
+    raw_conn = engine.raw_connection()
+
+    def _cleanup() -> None:
+        try:
+            raw_conn.close()
+        finally:
+            engine.dispose()
+
+    return raw_conn, _cleanup
+
+
+def _execute(conn: Any, query: str, params: tuple[Any, ...] = ()) -> None:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+    finally:
+        cur.close()
+
+
+def _fetchone(conn: Any, query: str, params: tuple[Any, ...] = ()) -> Mapping[str, Any] | None:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        columns = [col[0] for col in (cur.description or [])]
+        if isinstance(row, Mapping):
+            return dict(row)
+        return {columns[idx]: row[idx] for idx in range(len(columns))}
+    finally:
+        cur.close()
+
+
+def _table_columns(conn: Any, table_name: str) -> set[str]:
+    rows = _fetchall(
+        conn,
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = ANY(current_schemas(false))
+          AND table_name = %s
+        """,
+        (table_name,),
+    )
+    return {str(row["column_name"]) for row in rows}
+
+
+def _fetchall(conn: Any, query: str, params: tuple[Any, ...] = ()) -> list[Mapping[str, Any]]:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        columns = [col[0] for col in (cur.description or [])]
+        out: list[Mapping[str, Any]] = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                out.append(dict(row))
+            else:
+                out.append({columns[idx]: row[idx] for idx in range(len(columns))})
+        return out
+    finally:
+        cur.close()

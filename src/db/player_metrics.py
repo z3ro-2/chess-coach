@@ -4,9 +4,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Mapping
-
-from src.cli.seed_traits import _connect_db, _execute, _fetchall, _fetchone
+from typing import Any, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +199,7 @@ def _query_ratings(
 
     owns_conn = False
     conn = db_session_or_conn
-    cleanup = None
+    cleanup: Callable[[], None] | None = None
 
     if conn is None:
         database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -280,3 +278,67 @@ def _normalize_snapshot_time(snapshot_time: datetime | str) -> datetime:
 def _is_postgres_url(database_url: str) -> bool:
     lower = (database_url or "").strip().lower()
     return lower.startswith(_POSTGRES_PREFIXES)
+
+
+def _connect_db(database_url: str) -> tuple[Any, Callable[[], None]]:
+    try:
+        import psycopg2  # type: ignore
+
+        conn = psycopg2.connect(database_url)
+        conn.autocommit = False
+        return conn, conn.close
+    except Exception:
+        pass
+
+    from sqlalchemy import create_engine
+
+    engine = create_engine(database_url)
+    raw_conn = engine.raw_connection()
+
+    def _cleanup() -> None:
+        try:
+            raw_conn.close()
+        finally:
+            engine.dispose()
+
+    return raw_conn, _cleanup
+
+
+def _execute(conn: Any, query: str, params: tuple[Any, ...] = ()) -> None:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+    finally:
+        cur.close()
+
+
+def _fetchone(conn: Any, query: str, params: tuple[Any, ...] = ()) -> Mapping[str, Any] | None:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        row = cur.fetchone()
+        if row is None:
+            return None
+        columns = [col[0] for col in (cur.description or [])]
+        if isinstance(row, Mapping):
+            return dict(row)
+        return {columns[idx]: row[idx] for idx in range(len(columns))}
+    finally:
+        cur.close()
+
+
+def _fetchall(conn: Any, query: str, params: tuple[Any, ...] = ()) -> list[Mapping[str, Any]]:
+    cur = conn.cursor()
+    try:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        columns = [col[0] for col in (cur.description or [])]
+        out: list[Mapping[str, Any]] = []
+        for row in rows:
+            if isinstance(row, Mapping):
+                out.append(dict(row))
+            else:
+                out.append({columns[idx]: row[idx] for idx in range(len(columns))})
+        return out
+    finally:
+        cur.close()
