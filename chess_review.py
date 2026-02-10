@@ -52,12 +52,14 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 
 import requests
+from src.commands import list_command_names, run_command
 from src.config.output_paths import get_output_root
 from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import fetch_player_runtime_snapshot, sync_game_record_and_traits
 from src.db.schema import ensure_postgres_core_schema
+from src.telegram_commands import poll_telegram_commands
 
 CHESSCOM_GAMES_URL = "https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
 DEFAULT_TIMEOUT = 120  # seconds (local Ollama cold starts can be slow)
@@ -1167,6 +1169,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Send Telegram message silently (no notification sound).",
     )
+    p.add_argument(
+        "command",
+        nargs="?",
+        choices=list_command_names(),
+        help="Run a command and exit (status, summary, stats, health, help).",
+    )
 
     args = p.parse_args()
 
@@ -1200,6 +1208,14 @@ def main() -> int:
     args.state_db = Path(args.state_db)
 
     conn = init_db(args.state_db)
+    if getattr(args, "command", None):
+        result = run_command(str(args.command), conn, args)
+        text = str(result.get("text", "") or "")
+        if text:
+            print(text)
+        conn.close()
+        return 0
+
     schema_status = ensure_postgres_core_schema()
     _report_postgres_schema_status(schema_status)
 
@@ -1222,6 +1238,10 @@ def main() -> int:
 
         while True:
             try:
+                try:
+                    poll_telegram_commands(conn, args)
+                except Exception as e:
+                    logger.debug("Telegram command polling failed: %s", e, exc_info=True)
                 created = poll_once(conn, args)
                 logger.info("Poll cycle complete: created=%d", created)
                 # if we just created output, poll quickly once more (sometimes games arrive slightly delayed)

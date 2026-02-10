@@ -267,6 +267,25 @@ Common CLI flags (if you override command) include:
 - `--ollama-model` – e.g. `llama3.2:latest`
 - `--poll-seconds` – polling interval (default: 300)
 - `--update-index` – maintain `index.md`
+- `--player-summary-every-n` – summary cadence (default from `PLAYER_SUMMARY_EVERY_N`, default `20`)
+
+CLI command mode (no polling):
+
+```bash
+python -m src.main status
+python -m src.main stats
+python -m src.main summary
+python -m src.main health
+python -m src.main help
+```
+
+Telegram command mode (when `TG_BOT_TOKEN` + `TG_CHAT_ID` are set):
+
+- `/status`
+- `/stats`
+- `/summary`
+- `/health`
+- `/help`
 
 ---
 
