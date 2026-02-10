@@ -154,6 +154,7 @@ Behavior:
 - Each game review is sent as a document
 - Each summary is sent when generated
 - Failures never stop processing
+- Command handling runs in its own fast loop and does not wait for the game poll interval
 
 ---
 
@@ -197,6 +198,8 @@ OLLAMA_MODEL=llama3.2:latest
 CHESS_BOOTSTRAP_GAMES=100
 PLAYER_SUMMARY_EVERY_N=20
 ```
+
+Docker note: if `OLLAMA_URL` is unset or uses `127.0.0.1`/`localhost`, runtime auto-resolves to `http://host.docker.internal:11434` in containers.
 
 Common CLI flags:
 - `--username`

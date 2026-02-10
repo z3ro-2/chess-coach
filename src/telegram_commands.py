@@ -27,7 +27,8 @@ def poll_telegram_commands(conn: sqlite3.Connection, args: Any) -> int:
     if last_update_id is not None:
         params["offset"] = int(last_update_id) + 1
 
-    updates = _telegram_get_updates(bot_token, params=params, timeout=int(getattr(args, "timeout", 5) or 5))
+    poll_timeout = 3
+    updates = _telegram_get_updates(bot_token, params=params, timeout=poll_timeout)
     if not updates:
         return 0
 
@@ -58,7 +59,7 @@ def poll_telegram_commands(conn: sqlite3.Connection, args: Any) -> int:
                 bot_token=bot_token,
                 chat_id=chat_id,
                 text=str(result.get("text", "")),
-                timeout=int(getattr(args, "timeout", 5) or 5),
+                timeout=5,
             )
             file_path = result.get("file")
             if isinstance(file_path, Path) and file_path.exists():
@@ -67,7 +68,7 @@ def poll_telegram_commands(conn: sqlite3.Connection, args: Any) -> int:
                     chat_id=chat_id,
                     file_path=file_path,
                     caption=f"{command_name} output",
-                    timeout=int(getattr(args, "timeout", 5) or 5),
+                    timeout=5,
                 )
             handled += 1
         except Exception:

@@ -44,6 +44,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1077,6 +1078,38 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _running_in_docker() -> bool:
+    return Path("/.dockerenv").exists()
+
+
+def _is_loopback_ollama_url(url: str) -> bool:
+    lowered = (url or "").strip().lower()
+    return lowered.startswith("http://127.0.0.1") or lowered.startswith("https://127.0.0.1") or lowered.startswith("http://localhost") or lowered.startswith("https://localhost")
+
+
+def _resolve_ollama_url_for_runtime(raw_url: str) -> str:
+    cleaned = (raw_url or "").strip()
+    if _running_in_docker():
+        if not cleaned or _is_loopback_ollama_url(cleaned):
+            return "http://host.docker.internal:11434"
+    if not cleaned:
+        return "http://localhost:11434"
+    return cleaned
+
+
+def _telegram_command_loop(args: argparse.Namespace, stop_event: threading.Event) -> None:
+    conn = init_db(Path(args.state_db))
+    try:
+        while not stop_event.is_set():
+            try:
+                poll_telegram_commands(conn, args)
+            except Exception as e:
+                logger.debug("Telegram command polling failed: %s", e, exc_info=True)
+            stop_event.wait(2.5)
+    finally:
+        conn.close()
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Chess.com game poller -> LLM coach notes -> Markdown files")
     output_root: Optional[Path]
@@ -1201,9 +1234,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
-    # Safety: ensure Ollama host resolution is always localhost when running with host networking
-    if "ollama" in args.ollama_url:
-        args.ollama_url = args.ollama_url.replace("ollama", "127.0.0.1")
+    args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
+    logger.info("LLM endpoint resolved to %s", args.ollama_url)
     args.out = Path(args.out)
     args.state_db = Path(args.state_db)
 
@@ -1231,6 +1263,17 @@ def main() -> int:
         else:
             logger.info("Bootstrap skipped: Postgres core schema is not ready.")
 
+    telegram_stop_event = threading.Event()
+    telegram_thread: Optional[threading.Thread] = threading.Thread(
+        target=_telegram_command_loop,
+        args=(args, telegram_stop_event),
+        daemon=True,
+        name="telegram-command-loop",
+    )
+    telegram_thread.start()
+    logger.info("Telegram command loop started")
+    logger.info("Polling loop started (interval=%ss)", args.poll_seconds)
+
     try:
         if args.once:
             poll_once(conn, args)
@@ -1238,10 +1281,6 @@ def main() -> int:
 
         while True:
             try:
-                try:
-                    poll_telegram_commands(conn, args)
-                except Exception as e:
-                    logger.debug("Telegram command polling failed: %s", e, exc_info=True)
                 created = poll_once(conn, args)
                 logger.info("Poll cycle complete: created=%d", created)
                 # if we just created output, poll quickly once more (sometimes games arrive slightly delayed)
@@ -1254,6 +1293,10 @@ def main() -> int:
 
             time.sleep(sleep_s)
     finally:
+        telegram_stop_event.set()
+        if telegram_thread is not None:
+            telegram_thread.join(timeout=1.5)
+        conn.close()
         close_ingest_db_check()
 
 

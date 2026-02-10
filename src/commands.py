@@ -125,14 +125,14 @@ def _health_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
     sqlite_ok = _sqlite_ok(conn)
     postgres_reachable = _postgres_reachable()
     telegram_configured = bool(getattr(args, "telegram_bot_token", "") and getattr(args, "telegram_chat_id", ""))
-    llm_reachable = _llm_reachable(args)
+    llm_status = _llm_status(args)
 
     lines = [
         "Health",
         f"- SQLite: {'ok' if sqlite_ok else 'not ok'}",
         f"- Postgres: {'reachable' if postgres_reachable else 'not reachable'}",
         f"- Telegram: {'configured' if telegram_configured else 'not configured'}",
-        f"- LLM endpoint: {'reachable' if llm_reachable else 'not reachable'}",
+        f"- LLM endpoint: {llm_status}",
     ]
     return {"text": "\n".join(lines), "file": None}
 
@@ -172,25 +172,47 @@ def _postgres_reachable() -> bool:
             pass
 
 
-def _llm_reachable(args: Any) -> bool:
+def _running_in_docker() -> bool:
+    return Path("/.dockerenv").exists()
+
+
+def _resolve_ollama_url_for_health(raw_url: str) -> str:
+    cleaned = (raw_url or "").strip()
+    if _running_in_docker():
+        lowered = cleaned.lower()
+        if not cleaned or lowered.startswith("http://127.0.0.1") or lowered.startswith("http://localhost"):
+            return "http://host.docker.internal:11434"
+    if not cleaned:
+        return ""
+    return cleaned
+
+
+def _llm_status(args: Any) -> str:
     provider = str(getattr(args, "provider", "ollama"))
     timeout = int(getattr(args, "timeout", 5) or 5)
     if provider == "gpt":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
-            return False
+            return "not configured"
         try:
             resp = requests.get(
                 "https://api.openai.com/v1/models",
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=timeout,
             )
-            return resp.status_code < 500
+            if resp.status_code < 500:
+                return "reachable"
+            return "configured but unreachable"
         except Exception:
-            return False
+            return "configured but unreachable"
+    base_url = _resolve_ollama_url_for_health(str(getattr(args, "ollama_url", "")))
+    if not base_url:
+        return "not configured"
     try:
-        url = str(getattr(args, "ollama_url", "http://localhost:11434")).rstrip("/") + "/api/tags"
+        url = base_url.rstrip("/") + "/api/tags"
         resp = requests.get(url, timeout=timeout)
-        return resp.status_code < 500
+        if resp.status_code < 500:
+            return "reachable"
+        return "configured but unreachable"
     except Exception:
-        return False
+        return "configured but unreachable"
