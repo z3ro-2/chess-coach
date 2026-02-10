@@ -23,7 +23,9 @@ services:
     env_file:
       - .env
     environment:
-      CHESS_OUTPUT_DIR: /data
+      DATABASE_URL: ${DATABASE_URL:-postgresql://chess:chess@postgres:5432/chesscoach}
+      CHESS_OUTPUT_DIR: ${CHESS_OUTPUT_DIR:-/data}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

@@ -39,6 +39,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -46,7 +47,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 
 
@@ -55,10 +56,12 @@ from src.config.output_paths import get_output_root
 from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
+from src.db.schema import ensure_postgres_core_schema
 
 CHESSCOM_GAMES_URL = "https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
 DEFAULT_TIMEOUT = 120  # seconds (local Ollama cold starts can be slow)
 USER_AGENT = "chess-review-daemon/0.1 (+https://chess.com/pubapi)"
+logger = logging.getLogger(__name__)
 
 # -----------------------------
 # Telegram notifications
@@ -791,6 +794,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
     # Safety: ensure Ollama host resolution is always localhost when running with host networking
     if "ollama" in args.ollama_url:
@@ -799,17 +803,20 @@ def main() -> int:
     args.state_db = Path(args.state_db)
 
     conn = init_db(args.state_db)
+    schema_status = ensure_postgres_core_schema()
+    _report_postgres_schema_status(schema_status)
+
     if not args.no_bootstrap:
-        bootstrap_result = ensure_bootstrap(
-            username=args.username,
-            bootstrap_games=args.bootstrap_games,
-            fetch_recent_games_fn=fetch_recent_games,
-            parse_game_fn=parse_game,
-        )
-        if bootstrap_result.get("ran"):
-            inserted = int(bootstrap_result.get("inserted_games", 0))
-            requested = int(bootstrap_result.get("requested_games", 0))
-            print(f"[info] Bootstrap seeded {inserted}/{requested} games for {args.username}.")
+        if schema_status.get("ready"):
+            bootstrap_result = ensure_bootstrap(
+                username=args.username,
+                bootstrap_games=args.bootstrap_games,
+                fetch_recent_games_fn=fetch_recent_games,
+                parse_game_fn=parse_game,
+            )
+            _report_bootstrap_status(args.username, bootstrap_result)
+        else:
+            logger.info("Bootstrap skipped: Postgres core schema is not ready.")
 
     try:
         if args.once:
@@ -819,6 +826,7 @@ def main() -> int:
         while True:
             try:
                 created = poll_once(conn, args)
+                logger.info("Poll cycle complete: created=%d", created)
                 # if we just created output, poll quickly once more (sometimes games arrive slightly delayed)
                 sleep_s = 20 if created > 0 else args.poll_seconds
             except KeyboardInterrupt:
@@ -830,6 +838,49 @@ def main() -> int:
             time.sleep(sleep_s)
     finally:
         close_ingest_db_check()
+
+
+def _report_postgres_schema_status(status: Mapping[str, Any]) -> None:
+    reason = str(status.get("reason", "unknown"))
+    if bool(status.get("ready")):
+        tables = status.get("tables_ready", [])
+        logger.info("Postgres schema ready: %s", ", ".join(str(t) for t in tables) if tables else "players,games")
+        return
+
+    if reason == "no_database_url":
+        logger.info("Postgres integration disabled: DATABASE_URL is not configured. Running SQLite-only.")
+        return
+
+    if reason == "db_unreachable":
+        logger.warning("Postgres integration unavailable: DATABASE_URL is set but connection failed.")
+        return
+
+    logger.warning("Postgres schema not ready (reason=%s). Bootstrap will be skipped.", reason)
+
+
+def _report_bootstrap_status(username: str, result: Mapping[str, Any]) -> None:
+    ran = bool(result.get("ran"))
+    reason = str(result.get("reason", "unknown"))
+    inserted = int(result.get("inserted_games", 0) or 0)
+    requested = int(result.get("requested_games", 0) or 0)
+
+    if ran:
+        logger.info("Bootstrap seeded %d/%d games for %s.", inserted, requested, username)
+        return
+
+    if reason in {"already_seeded", "no_recent_games", "no_new_games"}:
+        logger.info("Bootstrap skipped for %s (%s).", username, reason)
+        return
+
+    if reason == "no_database_url":
+        logger.info("Bootstrap disabled: DATABASE_URL is not configured.")
+        return
+
+    if reason == "db_unreachable":
+        logger.warning("Bootstrap skipped: unable to connect to DATABASE_URL.")
+        return
+
+    logger.warning("Bootstrap skipped for %s (%s).", username, reason)
 
 
 if __name__ == "__main__":

@@ -203,6 +203,10 @@ docker compose up -d --build
 docker logs -f chess-coach
 ```
 
+On first startup, the app automatically:
+- initializes core Postgres tables (`players`, `games`) if `DATABASE_URL` is reachable
+- runs bootstrap seeding when the player has no existing games in Postgres
+
 Generated files will appear on the host under `${HOME}/chess`:
 - `md/`
 - `pgn/`
