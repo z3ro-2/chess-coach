@@ -1,8 +1,16 @@
+"""Optional Postgres ingest dedupe checks for the poller.
+
+This module is lazy-initialized and always falls back to SQLite-only behavior
+when Postgres is unavailable or schema inspection fails.
+"""
+
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
+
+from src.db._pg_utils import _connect_db, _fetchone, _table_columns
 
 logger = logging.getLogger(__name__)
 
@@ -71,73 +79,3 @@ def _init_ingest_db_check() -> None:
         _INGEST_DB_CONN = None
         _INGEST_DB_CLOSE = None
         _INGEST_DB_URL_COLUMN = None
-
-
-def _connect_db(database_url: str) -> tuple[Any, Callable[[], None]]:
-    try:
-        import psycopg2  # type: ignore
-
-        conn = psycopg2.connect(database_url)
-        conn.autocommit = False
-        return conn, conn.close
-    except Exception:
-        pass
-
-    from sqlalchemy import create_engine
-
-    engine = create_engine(database_url)
-    raw_conn = engine.raw_connection()
-
-    def _cleanup() -> None:
-        try:
-            raw_conn.close()
-        finally:
-            engine.dispose()
-
-    return raw_conn, _cleanup
-
-
-def _fetchone(conn: Any, query: str, params: tuple[Any, ...] = ()) -> Mapping[str, Any] | None:
-    cur = conn.cursor()
-    try:
-        cur.execute(query, params)
-        row = cur.fetchone()
-        if row is None:
-            return None
-        columns = [col[0] for col in (cur.description or [])]
-        if isinstance(row, Mapping):
-            return dict(row)
-        return {columns[idx]: row[idx] for idx in range(len(columns))}
-    finally:
-        cur.close()
-
-
-def _table_columns(conn: Any, table_name: str) -> set[str]:
-    rows = _fetchall(
-        conn,
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = ANY(current_schemas(false))
-          AND table_name = %s
-        """,
-        (table_name,),
-    )
-    return {str(row["column_name"]) for row in rows}
-
-
-def _fetchall(conn: Any, query: str, params: tuple[Any, ...] = ()) -> list[Mapping[str, Any]]:
-    cur = conn.cursor()
-    try:
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        columns = [col[0] for col in (cur.description or [])]
-        out: list[Mapping[str, Any]] = []
-        for row in rows:
-            if isinstance(row, Mapping):
-                out.append(dict(row))
-            else:
-                out.append({columns[idx]: row[idx] for idx in range(len(columns))})
-        return out
-    finally:
-        cur.close()

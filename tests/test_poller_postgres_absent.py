@@ -77,3 +77,22 @@ def test_process_game_does_not_fail_when_postgres_is_down(monkeypatch, tmp_path)
 
     assert output_path is not None
     assert output_path.exists()
+
+
+def test_poll_once_without_postgres_does_not_crash(monkeypatch, tmp_path) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [])
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = True
+        args.retries = 1
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0

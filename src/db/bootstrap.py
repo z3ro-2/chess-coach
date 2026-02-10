@@ -1,3 +1,9 @@
+"""First-run Postgres bootstrap seeding for games, ratings, and optional traits.
+
+Bootstrap is idempotent per player and degrades gracefully when optional
+dependencies or schema objects are unavailable.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -5,6 +11,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from src.db._pg_utils import _connect_db, _execute, _fetchone, _table_columns
 from src.db.player_metrics import extract_player_rating_from_pgn, insert_player_rating_row
 
 logger = logging.getLogger(__name__)
@@ -24,11 +31,12 @@ def ensure_bootstrap(
     fetch_recent_games_fn: FetchRecentGamesFn | None = None,
     parse_game_fn: ParseGameFn | None = None,
 ) -> dict[str, Any]:
+    """Seed first-run Postgres state for one player, returning structured status."""
     normalized_username = (username or "").strip()
     try:
         requested_games = _resolve_bootstrap_games(bootstrap_games)
     except Exception:
-        logger.warning("Bootstrap skipped: invalid CHESS_BOOTSTRAP_GAMES/--bootstrap-games value.", exc_info=True)
+        logger.debug("Bootstrap skipped: invalid CHESS_BOOTSTRAP_GAMES/--bootstrap-games value.", exc_info=True)
         return _result(False, "invalid_bootstrap_games", requested_games=DEFAULT_BOOTSTRAP_GAMES)
 
     if not normalized_username:
@@ -150,15 +158,22 @@ def _resolve_parser_functions(
     fetch_recent_games_fn: FetchRecentGamesFn | None,
     parse_game_fn: ParseGameFn | None,
 ) -> tuple[FetchRecentGamesFn | None, ParseGameFn | None]:
+    """Resolve parser callables explicitly, with guarded lazy import fallback."""
     if fetch_recent_games_fn is not None and parse_game_fn is not None:
-        return fetch_recent_games_fn, parse_game_fn
+        return (fetch_recent_games_fn, parse_game_fn)
+
+    if fetch_recent_games_fn is not None or parse_game_fn is not None:
+        logger.debug(
+            "Bootstrap parser resolution failed: both fetch_recent_games_fn and parse_game_fn are required."
+        )
+        return (None, None)
 
     try:
         from chess_review import fetch_recent_games, parse_game
     except Exception:
         logger.debug("Bootstrap parser import failed.", exc_info=True)
-        return None, None
-    return fetch_recent_games, parse_game
+        return (None, None)
+    return (fetch_recent_games, parse_game)
 
 
 def _collect_games_from_existing_parser(
@@ -431,7 +446,7 @@ def _seed_rating_history_if_available(
     if not history_columns:
         return 0
     if "player_id" not in history_columns or "rating" not in history_columns:
-        logger.warning(
+        logger.debug(
             "Bootstrap skipped player_rating_history seed: table exists but required columns are missing."
         )
         return 0
@@ -552,81 +567,3 @@ def _result(
         "inserted_games": int(inserted_games),
         "requested_games": int(requested_games),
     }
-
-
-def _connect_db(database_url: str) -> tuple[Any, Callable[[], None]]:
-    try:
-        import psycopg2  # type: ignore
-
-        conn = psycopg2.connect(database_url)
-        conn.autocommit = False
-        return conn, conn.close
-    except Exception:
-        pass
-
-    from sqlalchemy import create_engine
-
-    engine = create_engine(database_url)
-    raw_conn = engine.raw_connection()
-
-    def _cleanup() -> None:
-        try:
-            raw_conn.close()
-        finally:
-            engine.dispose()
-
-    return raw_conn, _cleanup
-
-
-def _execute(conn: Any, query: str, params: tuple[Any, ...] = ()) -> None:
-    cur = conn.cursor()
-    try:
-        cur.execute(query, params)
-    finally:
-        cur.close()
-
-
-def _fetchone(conn: Any, query: str, params: tuple[Any, ...] = ()) -> Mapping[str, Any] | None:
-    cur = conn.cursor()
-    try:
-        cur.execute(query, params)
-        row = cur.fetchone()
-        if row is None:
-            return None
-        columns = [col[0] for col in (cur.description or [])]
-        if isinstance(row, Mapping):
-            return dict(row)
-        return {columns[idx]: row[idx] for idx in range(len(columns))}
-    finally:
-        cur.close()
-
-
-def _table_columns(conn: Any, table_name: str) -> set[str]:
-    rows = _fetchall(
-        conn,
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = ANY(current_schemas(false))
-          AND table_name = %s
-        """,
-        (table_name,),
-    )
-    return {str(row["column_name"]) for row in rows}
-
-
-def _fetchall(conn: Any, query: str, params: tuple[Any, ...] = ()) -> list[Mapping[str, Any]]:
-    cur = conn.cursor()
-    try:
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        columns = [col[0] for col in (cur.description or [])]
-        out: list[Mapping[str, Any]] = []
-        for row in rows:
-            if isinstance(row, Mapping):
-                out.append(dict(row))
-            else:
-                out.append({columns[idx]: row[idx] for idx in range(len(columns))})
-        return out
-    finally:
-        cur.close()

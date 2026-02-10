@@ -3,6 +3,9 @@ from datetime import datetime, timezone
 import src.db.bootstrap as bootstrap_module
 
 
+EXPECTED_KEYS = {"ran", "reason", "inserted_games", "requested_games"}
+
+
 def test_ensure_bootstrap_runs_once_then_skips_with_parser_flow(monkeypatch) -> None:
     state = {"game_count": 0}
 
@@ -94,9 +97,25 @@ def test_ensure_bootstrap_runs_once_then_skips_with_parser_flow(monkeypatch) -> 
     assert first["reason"] == "bootstrapped"
     assert first["inserted_games"] == 1
     assert first["requested_games"] == 25
+    assert set(first.keys()) == EXPECTED_KEYS
 
     assert second["ran"] is False
     assert second["reason"] == "already_seeded"
+    assert second["inserted_games"] == 0
+    assert second["requested_games"] == 25
+    assert set(second.keys()) == EXPECTED_KEYS
 
     assert len(fetch_calls) == 1
     assert len(parse_calls) == 1
+
+
+def test_ensure_bootstrap_skip_no_database_url_has_expected_shape(monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    result = bootstrap_module.ensure_bootstrap(username="logan", bootstrap_games=25)
+
+    assert result["ran"] is False
+    assert result["reason"] == "no_database_url"
+    assert result["inserted_games"] == 0
+    assert result["requested_games"] == 25
+    assert set(result.keys()) == EXPECTED_KEYS
