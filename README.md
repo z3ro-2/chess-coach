@@ -1,275 +1,165 @@
 # Chess Coach
 
-Automated chess game reviews using **Chess.com**, **LLMs (Ollama or GPT)**, and **Markdown output**.
+Automated chess game reviews using **Chess.com**, **LLMs (Ollama or GPT)**, and clean **Markdown output**.
 
-This project continuously polls your Chess.com account, detects newly finished games, and generates **coach-style game reviews** (focused on key mistakes, turning points, and improvement themes — not move-by-move engine noise). Each review is saved as a Markdown file and can optionally be sent to Telegram.
+This project runs continuously, watches your Chess.com account for new games, and generates **coach-style reviews** focused on mistakes, turning points, and improvement themes (not engine noise).
 
-The intended audience is human players (≈800–1600 rating), not engines.
-
----
-
-## What this does
-
-- Polls the Chess.com public API on an interval (default: every 5 minutes)
-- Detects **new games only** (no duplicates, state tracked via SQLite)
-- Generates a **Markdown coaching review** per game
-- Saves:
-  - `*.md` coaching notes
-  - `*.pgn` raw game archive
-  - `state.sqlite` (processed-game tracking)
-  - `player_stats.md` (rolling player metrics + traits snapshot)
-  - `player_summary.md` (every-N games summary)
-- Optionally:
-  - Sends the Markdown file to Telegram via bot
-  - Maintains an `index.md`
+It is designed for **human players (~800–1600 rating)** who want practical feedback over time.
 
 ---
 
-## LLM support
+## What this does (at a glance)
 
-This project supports **two interchangeable backends**:
+- Polls the Chess.com public API (default: every 5 minutes)
+- Detects **new games only** (restart-safe, no duplicates)
+- Generates **one Markdown review per game**
+- Tracks **player traits and statistics over time**
+- Produces:
+  - Per-game reviews
+  - Rolling stats (`player_stats.md`)
+  - Periodic summaries (`player_summary.md`)
+- Optionally sends reviews and summaries to Telegram
 
-- **Ollama (local, recommended)**
-- **OpenAI GPT (cloud)**
-
-Switching providers is done with **one flag**.
-
----
-
-## ⚠️ Important requirement (READ THIS)
-
-### Ollama must already be running on the host
-
-This Docker Compose setup **does NOT start Ollama for you**.
-
-You must already have an Ollama server running on the host machine, listening on:
-
-```
-http://127.0.0.1:11434
-```
-
-From inside the container, this is reached as:
-
-```
-http://host.docker.internal:11434
-```
-
-And the model you reference **must already be pulled**, for example:
-
-```bash
-ollama pull llama3.2:latest
-```
-
-This design avoids:
-- Duplicate model downloads
-- GPU contention
-- Port conflicts
+Everything is restart-safe and idempotent.
 
 ---
 
-## Repository layout
+## Quick Start (Docker, recommended)
 
-```
-chess-coach/
-├── chess_review.py        # Main application
-├── Dockerfile             # Container definition
-├── docker-compose.yml     # Runtime configuration (generic)
-├── requirements.txt       # Python dependencies
-├── .env.example           # Example environment variables (safe to commit)
-└── ~/chess/               # Host output directory (bind-mounted to /data)
-    ├── md/                # Generated coaching reviews
-    ├── pgn/               # Raw PGN archives
-    ├── index.md           # Optional index
-    └── state.sqlite       # Processed-game tracking
-```
-
----
-
-## Requirements
+### 1. Prerequisites
 
 - Docker + Docker Compose
 - A Chess.com account
-- **Ollama running on the host** (for local inference)
-  - OR an OpenAI API key (optional alternative)
+- **Ollama running on the host** (or OpenAI API key)
 
----
-
-## Environment variables
-
-Create a `.env` file in the repo root (this file should **not** be committed):
-
-```env
-# REQUIRED
-CHESS_USERNAME=your_chesscom_username
-
-# OPTIONAL
-CHESS_OUTPUT_DIR=/data
-DATABASE_URL=postgresql://chess:chess@postgres:5432/chesscoach
-OLLAMA_URL=http://host.docker.internal:11434
-OLLAMA_MODEL=llama3.2:latest
-PLAYER_SUMMARY_EVERY_N=20
-
-# Telegram notifications (optional)
-TG_BOT_TOKEN=
-TG_CHAT_ID=
-
-# OpenAI (only if using provider=gpt)
-# OPENAI_API_KEY=
-```
-
-A `.env.example` file is provided for reference.
-
-When running in Docker, `CHESS_OUTPUT_DIR` inside the container should be `/data`.
-The host path should be mounted to `/data` so all outputs (md, pgn, state.sqlite, trait_books, index.md) land on the host volume.
-
----
-
-## Docker Compose (default setup)
-
-The provided `docker-compose.yml` is intentionally generic and uses environment variables for all user-specific values.
-
-Before running, ensure you have:
-- Created a `.env` file (see above)
-- Set `CHESS_USERNAME`
-
-The compose file:
-- Runs `chess-coach` and `postgres`
-- Connects to host Ollama using `OLLAMA_URL=http://host.docker.internal:11434`
-- Persists output by mounting host `${HOME}/chess` to container `/data`
-
----
-
-## Telegram notifications (optional)
-
-If `TG_BOT_TOKEN` and `TG_CHAT_ID` are set:
-
-- Each generated `.md` file is sent as a Telegram document
-- `player_summary.md` is also sent every `PLAYER_SUMMARY_EVERY_N` new games
-- Failures do **not** stop processing
-
-Useful for:
-- Reviewing games on your phone
-- Keeping a daily chess journal
-
----
-
-## Notes / design decisions
-
-- No engine analysis is used by default (human-focused coaching)
-- SQLite is used for durability and simplicity
-- Docker container runs continuously; no cron
-- Ollama is intentionally external to avoid GPU duplication
-
----
-
-## Future improvements (ideas)
-
-- Optional Stockfish eval swing detection
-- Opening classification
-- Re-review old games with new models
-- Training-plan summaries per week/month
-
----
-
-
-## Quickstart
-
-### First-time setup
-
-Copy and configure environment:
-
-```bash
-cp .env.example .env
-```
-
-Set at least:
-- `CHESS_USERNAME`
-- `OLLAMA_MODEL`
-- `CHESS_OUTPUT_DIR=/data`
-
-Create the host output directory:
-
-```bash
-mkdir -p "${HOME}/chess"
-```
-
-Ensure Ollama is running on the host:
-
+Ollama must already be running on your machine:
 ```bash
 ollama serve
 ollama pull llama3.2:latest
 ```
 
-Then build and start:
+---
+
+### 2. Clone and configure
+
+```bash
+git clone <repo-url>
+cd chess-coach
+cp .env.example .env
+```
+
+Edit `.env` and set at minimum:
+```env
+CHESS_USERNAME=your_chesscom_username
+```
+
+---
+
+### 3. Create output directory
+
+```bash
+mkdir -p "${HOME}/chess"
+```
+
+This will be mounted into the container as `/data`.
+
+---
+
+### 4. Start the system
 
 ```bash
 docker compose up -d --build
 docker logs -f chess-coach
 ```
 
-On first startup, the app automatically:
-- initializes core Postgres tables (`players`, `games`) if `DATABASE_URL` is reachable
-- runs bootstrap seeding when the player has no existing games in Postgres
-
-Generated files will appear on the host under `${HOME}/chess`:
-- `md/`
-- `pgn/`
-- `state.sqlite*`
-- `index.md`
-- `player_stats.md`
-- `player_summary.md`
-- `trait_books/` (when snapshots are generated)
+That’s it. The container will keep running.
 
 ---
 
-### Run from GHCR
+## What gets generated
 
-Pull the published image:
+All outputs land under the host directory `${HOME}/chess`:
 
-```bash
-docker pull ghcr.io/<owner>/<repo>:latest
 ```
-
-One-time trait backfill seed (100 games) with snapshot check at the end:
-
-```bash
-docker run --rm \
-  -e DATABASE_URL="<postgres_connection_url>" \
-  -e CHESS_OUTPUT_DIR="/data" \
-  -v "$(pwd)/output:/data" \
-  ghcr.io/<owner>/<repo>:latest \
-  -m src.cli.seed_traits --player <user> --games 100 --no-skip-snapshots
-```
-
-Normal poller mode:
-
-```bash
-docker run --rm \
-  -e CHESS_USERNAME="<chesscom_username>" \
-  -e CHESS_OUTPUT_DIR="/data" \
-  -e OLLAMA_URL="http://host.docker.internal:11434" \
-  -e OLLAMA_MODEL="llama3.2:latest" \
-  -v "$(pwd)/output:/data" \
-  ghcr.io/<owner>/<repo>:latest \
-  -m src.main
+chess/
+├── md/                    # One Markdown review per game
+├── pgn/                   # Raw PGN archives
+├── player_stats.md        # Rolling player metrics + traits
+├── player_summary.md      # Every-N games summary
+├── index.md               # Optional index
+└── state.sqlite           # Local state (dedupe + cadence)
 ```
 
 ---
 
-## Configuration flags (common)
+## Bootstrap behavior (first run only)
 
-Default container entrypoint is `python -m src.main`.  
-Common CLI flags (if you override command) include:
+On first startup **only**, if Postgres is enabled and empty:
 
-- `--username` – Chess.com username (required)
-- `--provider` – `ollama` or `gpt`
-- `--ollama-url` – usually `http://host.docker.internal:11434` in Docker
-- `--ollama-model` – e.g. `llama3.2:latest`
-- `--poll-seconds` – polling interval (default: 300)
-- `--update-index` – maintain `index.md`
-- `--player-summary-every-n` – summary cadence (default from `PLAYER_SUMMARY_EVERY_N`, default `20`)
+- The app fetches your most recent games **directly from Chess.com**
+- Number of games is controlled by:
+  ```env
+  CHESS_BOOTSTRAP_GAMES=100
+  ```
+- Bootstrap:
+  - Seeds raw game records
+  - Seeds traits and ratings
+  - **Does NOT generate LLM game reviews**
+- After bootstrap completes:
+  - One **initial player summary** is generated
+  - It is sent to Telegram (if configured)
 
-CLI command mode (no polling):
+Bootstrap is **idempotent** and will not re-run on restart.
+
+---
+
+## Ongoing behavior (normal operation)
+
+### Per game
+For every new game you play:
+- One Markdown review is generated
+- One Telegram message is sent (if enabled)
+- Player stats are updated
+
+### Summaries
+- A full `player_summary.md` is generated every **N games**
+- Controlled by:
+  ```env
+  PLAYER_SUMMARY_EVERY_N=20
+  ```
+- Summary cadence is stored in SQLite, so restarts do not retrigger old summaries
+
+---
+
+## Player traits & stats
+
+- Traits (strengths, weaknesses, tendencies) are tracked incrementally
+- `player_stats.md` is rebuilt after every processed game
+- `player_summary.md` is a higher-level narrative summary
+- Summaries overwrite previous ones (no snapshot spam)
+
+Postgres is optional but recommended for long-term analysis.
+
+---
+
+## Telegram integration (optional)
+
+Set in `.env`:
+```env
+TG_BOT_TOKEN=...
+TG_CHAT_ID=...
+```
+
+Behavior:
+- Each game review is sent as a document
+- Each summary is sent when generated
+- Failures never stop processing
+
+---
+
+## Commands (no polling)
+
+You can run commands without polling:
 
 ```bash
 python -m src.main status
@@ -279,38 +169,53 @@ python -m src.main health
 python -m src.main help
 ```
 
-Telegram command mode (when `TG_BOT_TOKEN` + `TG_CHAT_ID` are set):
+### Telegram commands
+When Telegram is configured, you can send:
 
-- `/status`
-- `/stats`
-- `/summary`
-- `/health`
-- `/help`
+```
+/status
+/stats
+/summary
+/health
+/help
+```
+
+Responses include text output and attached Markdown files when applicable.
 
 ---
 
-## Output location
+## Configuration reference
 
-In Docker, keep `CHESS_OUTPUT_DIR=/data` and mount a host directory to `/data`.
-With the provided compose file, host output is `${HOME}/chess`.
+Common `.env` options:
+
+```env
+CHESS_USERNAME=your_username
+CHESS_OUTPUT_DIR=/data
+DATABASE_URL=postgresql://chess:chess@postgres:5432/chesscoach
+OLLAMA_URL=http://host.docker.internal:11434
+OLLAMA_MODEL=llama3.2:latest
+CHESS_BOOTSTRAP_GAMES=100
+PLAYER_SUMMARY_EVERY_N=20
+```
+
+Common CLI flags:
+- `--username`
+- `--provider ollama|gpt`
+- `--poll-seconds`
+- `--player-summary-every-n`
+- `--bootstrap-games`
 
 ---
 
-## Username
+## Design notes
 
-The `--username` flag refers to your **Chess.com username** (the one in your profile URL).
+- SQLite is authoritative for dedupe and cadence
+- Postgres is optional and best-effort
+- Ollama runs outside Docker to avoid GPU contention
+- No engine analysis by default (human coaching focus)
 
-Example:
-
-```
-https://www.chess.com/member/<username>  →  username = chess.com username
-```
-
-No personal usernames are hardcoded anywhere in this project or configuration.
-
+---
 
 ## License
 
 MIT
-
----
