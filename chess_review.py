@@ -847,6 +847,18 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def write_pgn_once(pgn_path: Path, pgn: str) -> None:
+    if pgn_path.exists():
+        logger.debug("PGN already exists, skipping write: %s", pgn_path)
+        return
+    pgn_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(pgn_path, "x", encoding="utf-8") as file_handle:
+            file_handle.write(pgn)
+    except FileExistsError:
+        logger.debug("PGN already exists, skipping write: %s", pgn_path)
+
+
 def format_local_dt(dt_utc: datetime, tz_name: str) -> datetime:
     if not tz_name or ZoneInfo is None:
         return dt_utc
@@ -909,7 +921,7 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
     md_path, pgn_path = build_paths(args.out, game, args.timezone)
 
     # Always archive raw PGN first.
-    write_text(pgn_path, game.pgn)
+    write_pgn_once(pgn_path, game.pgn)
 
     system_msg, user_msg = build_prompt(game)
 
