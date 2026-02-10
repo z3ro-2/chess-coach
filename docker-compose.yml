@@ -1,14 +1,33 @@
+
 services:
+  postgres:
+    image: postgres:16
+    container_name: chess-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: chesscoach
+      POSTGRES_USER: chess
+      POSTGRES_PASSWORD: chess
+    volumes:
+      - chess_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
   chess-coach:
     build:
       context: .
     container_name: chess-coach
+    depends_on:
+      - postgres
     restart: unless-stopped
-
-    network_mode: host
-
     env_file:
       - .env
-
+    environment:
+      CHESS_OUTPUT_DIR: /data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ${HOME}/chess:/data
+
+volumes:
+  chess_postgres_data:

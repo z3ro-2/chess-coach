@@ -46,6 +46,12 @@ You must already have an Ollama server running on the host machine, listening on
 http://127.0.0.1:11434
 ```
 
+From inside the container, this is reached as:
+
+```
+http://host.docker.internal:11434
+```
+
 And the model you reference **must already be pulled**, for example:
 
 ```bash
@@ -68,7 +74,7 @@ chess-coach/
 ├── docker-compose.yml     # Runtime configuration (generic)
 ├── requirements.txt       # Python dependencies
 ├── .env.example           # Example environment variables (safe to commit)
-└── chess_reviews/         # Example output directory (bind-mounted)
+└── ~/chess/               # Host output directory (bind-mounted to /data)
     ├── md/                # Generated coaching reviews
     ├── pgn/               # Raw PGN archives
     ├── index.md           # Optional index
@@ -96,8 +102,9 @@ CHESS_USERNAME=your_chesscom_username
 
 # OPTIONAL
 CHESS_OUTPUT_DIR=/data
+DATABASE_URL=postgresql://chess:chess@postgres:5432/chesscoach
+OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_MODEL=llama3.2:latest
-POLL_SECONDS=300
 
 # Telegram notifications (optional)
 TG_BOT_TOKEN=
@@ -123,8 +130,8 @@ Before running, ensure you have:
 - Set `CHESS_USERNAME`
 
 The compose file:
-- Runs a single `chess-coach` container
-- Connects to Ollama running on the host via `network_mode: host`
+- Runs `chess-coach` and `postgres`
+- Connects to host Ollama using `OLLAMA_URL=http://host.docker.internal:11434`
 - Persists output by mounting host `${HOME}/chess` to container `/data`
 
 ---
@@ -161,9 +168,26 @@ Useful for:
 ---
 
 
-## Running it
+## Quickstart
 
 ### First-time setup
+
+Copy and configure environment:
+
+```bash
+cp .env.example .env
+```
+
+Set at least:
+- `CHESS_USERNAME`
+- `OLLAMA_MODEL`
+- `CHESS_OUTPUT_DIR=/data`
+
+Create the host output directory:
+
+```bash
+mkdir -p "${HOME}/chess"
+```
 
 Ensure Ollama is running on the host:
 
@@ -178,6 +202,13 @@ Then build and start:
 docker compose up -d --build
 docker logs -f chess-coach
 ```
+
+Generated files will appear on the host under `${HOME}/chess`:
+- `md/`
+- `pgn/`
+- `state.sqlite*`
+- `index.md`
+- `trait_books/` (when snapshots are generated)
 
 ---
 
@@ -200,33 +231,29 @@ docker run --rm \
   -m src.cli.seed_traits --player <user> --games 100 --no-skip-snapshots
 ```
 
-Normal mode:
-
-```bash
-docker compose up -d
-```
-
-Or directly with `docker run`:
+Normal poller mode:
 
 ```bash
 docker run --rm \
-  --network host \
   -e CHESS_USERNAME="<chesscom_username>" \
-  -e OPENAI_API_KEY="<optional_if_provider_gpt>" \
-  -v "$(pwd)/chess_reviews:/data" \
+  -e CHESS_OUTPUT_DIR="/data" \
+  -e OLLAMA_URL="http://host.docker.internal:11434" \
+  -e OLLAMA_MODEL="llama3.2:latest" \
+  -v "$(pwd)/output:/data" \
   ghcr.io/<owner>/<repo>:latest \
-  chess_review.py --username "${CHESS_USERNAME}" --out /data --state-db /data/state.sqlite --provider ollama --ollama-url http://127.0.0.1:11434 --ollama-model "${OLLAMA_MODEL:-llama3.2:latest}" --poll-seconds "${POLL_SECONDS:-300}" --update-index
+  -m src.main
 ```
 
 ---
 
 ## Configuration flags (common)
 
-Inside `docker-compose.yml`, the container is launched with flags such as:
+Default container entrypoint is `python -m src.main`.  
+Common CLI flags (if you override command) include:
 
 - `--username` – Chess.com username (required)
 - `--provider` – `ollama` or `gpt`
-- `--ollama-url` – usually `http://127.0.0.1:11434`
+- `--ollama-url` – usually `http://host.docker.internal:11434` in Docker
 - `--ollama-model` – e.g. `llama3.2:latest`
 - `--poll-seconds` – polling interval (default: 300)
 - `--update-index` – maintain `index.md`
@@ -235,19 +262,8 @@ Inside `docker-compose.yml`, the container is launched with flags such as:
 
 ## Output location
 
-The compose file mounts a host directory specified by the user.
-
-Inside the container, all output goes to the configured output directory.
-
-On the host, you will find:
-
-```
-<your_output_dir>/md/*.md
-<your_output_dir>/pgn/*.pgn
-<your_output_dir>/state.sqlite
-```
-
-This directory can be a **Nextcloud-synced folder**.
+In Docker, keep `CHESS_OUTPUT_DIR=/data` and mount a host directory to `/data`.
+With the provided compose file, host output is `${HOME}/chess`.
 
 ---
 
