@@ -56,6 +56,7 @@ from src.config.output_paths import get_output_root
 from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
+from src.db.runtime_updates import fetch_player_runtime_snapshot, sync_game_record_and_traits
 from src.db.schema import ensure_postgres_core_schema
 
 CHESSCOM_GAMES_URL = "https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
@@ -176,6 +177,27 @@ CREATE TABLE IF NOT EXISTS processed_games (
 );
 
 CREATE INDEX IF NOT EXISTS idx_processed_end_time ON processed_games(end_time);
+
+CREATE TABLE IF NOT EXISTS processed_game_meta (
+  game_url TEXT PRIMARY KEY,
+  end_time INTEGER NOT NULL,
+  result TEXT NOT NULL,
+  player_color TEXT NOT NULL,
+  player_rating INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_meta_end_time ON processed_game_meta(end_time);
+
+CREATE TABLE IF NOT EXISTS summary_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_summary_processed_count INTEGER NOT NULL DEFAULT 0,
+  last_summary_end_time INTEGER,
+  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+INSERT OR IGNORE INTO summary_state (id, last_summary_processed_count, last_summary_end_time, updated_at)
+VALUES (1, 0, NULL, strftime('%s','now'));
 """
 
 
@@ -221,6 +243,330 @@ def mark_processed(
         (game_url, end_time, now, str(md_path), str(pgn_path), provider, model, content_hash),
     )
     conn.commit()
+
+
+def _player_rating_for_game(game: GameInfo) -> Optional[int]:
+    return game.white_rating if game.your_color == "white" else game.black_rating
+
+
+def _record_processed_game_meta(conn: sqlite3.Connection, game: GameInfo) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO processed_game_meta
+          (game_url, end_time, result, player_color, player_rating, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            game.game_url,
+            game.end_time,
+            game.result,
+            game.your_color,
+            _player_rating_for_game(game),
+            int(time.time()),
+        ),
+    )
+    conn.commit()
+
+
+def _performance_counts_from_rows(rows: List[Tuple[str, str]]) -> Tuple[int, int, int]:
+    wins = 0
+    losses = 0
+    draws = 0
+    for result, player_color in rows:
+        color = (player_color or "").lower()
+        if result == "1/2-1/2":
+            draws += 1
+            continue
+        if color == "white":
+            if result == "1-0":
+                wins += 1
+            elif result == "0-1":
+                losses += 1
+        elif color == "black":
+            if result == "0-1":
+                wins += 1
+            elif result == "1-0":
+                losses += 1
+    return wins, losses, draws
+
+
+def _fetch_recent_performance_sqlite(conn: sqlite3.Connection, limit: int) -> Tuple[int, int, int]:
+    cur = conn.execute(
+        """
+        SELECT result, player_color
+        FROM processed_game_meta
+        ORDER BY end_time DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    rows = [(str(r[0]), str(r[1])) for r in cur.fetchall()]
+    return _performance_counts_from_rows(rows)
+
+
+def _fetch_recent_ratings_sqlite(conn: sqlite3.Connection, limit: int) -> List[int]:
+    cur = conn.execute(
+        """
+        SELECT player_rating
+        FROM processed_game_meta
+        WHERE player_rating IS NOT NULL
+        ORDER BY end_time DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    return [int(r[0]) for r in cur.fetchall() if r[0] is not None]
+
+
+def _rating_trend_text(ratings: List[int]) -> str:
+    if not ratings:
+        return "No rating data yet."
+    latest = ratings[0]
+    oldest = ratings[-1]
+    delta = latest - oldest
+    if len(ratings) == 1:
+        return f"Latest observed rating: {latest}"
+    direction = "up" if delta > 0 else ("down" if delta < 0 else "flat")
+    return f"Recent trend: {latest} ({direction} {delta:+d} across {len(ratings)} games)"
+
+
+def _safe_short_text(value: Any, max_len: int = 120) -> str:
+    text = str(value or "").strip().replace("\n", " ")
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def _write_player_stats_markdown(
+    conn: sqlite3.Connection,
+    *,
+    out_dir: Path,
+    username: str,
+    recent_games: int = 20,
+) -> Path:
+    runtime = fetch_player_runtime_snapshot(player_username=username, recent_games=recent_games, trait_limit=10)
+    performance = runtime.get("performance") if runtime.get("available") else None
+    if isinstance(performance, dict):
+        wins = int(performance.get("wins", 0) or 0)
+        losses = int(performance.get("losses", 0) or 0)
+        draws = int(performance.get("draws", 0) or 0)
+    else:
+        wins, losses, draws = _fetch_recent_performance_sqlite(conn, recent_games)
+
+    ratings = []
+    if runtime.get("available"):
+        ratings = [int(r.get("rating")) for r in runtime.get("ratings", []) if r.get("rating") is not None]
+    if not ratings:
+        ratings = _fetch_recent_ratings_sqlite(conn, recent_games)
+
+    trait_rows = runtime.get("traits", []) if runtime.get("available") else []
+    lines: List[str] = [
+        "# Player Stats",
+        "",
+        f"- Updated (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Player: {username}",
+        f"- Source window: last {recent_games} processed games",
+        "",
+        "## Rating Trend",
+        _rating_trend_text(ratings),
+        "",
+        "## Recent Performance",
+        f"- Wins: {wins}",
+        f"- Losses: {losses}",
+        f"- Draws: {draws}",
+        "",
+        "## Current Trait Scores",
+    ]
+
+    if trait_rows:
+        for trait in trait_rows[:10]:
+            name = _safe_short_text(trait.get("name") or trait.get("key") or "Unknown trait", 64)
+            category = _safe_short_text(trait.get("category"), 20)
+            desc = _safe_short_text(trait.get("description"), 110)
+            confidence = float(trait.get("confidence", 0.0) or 0.0)
+            trend = float(trait.get("trend_ema", 0.0) or 0.0)
+            lines.append(
+                f"- **{name}** ({category}): confidence {confidence:.2f}, trend {trend:+.2f}. {desc}"
+            )
+    else:
+        lines.append("- No trait scores available yet.")
+
+    lines.append("")
+    path = out_dir / "player_stats.md"
+    write_text(path, "\n".join(lines))
+    return path
+
+
+def _load_recent_game_meta_for_summary(conn: sqlite3.Connection, limit: int) -> List[Tuple[int, str, str, Optional[int], str]]:
+    cur = conn.execute(
+        """
+        SELECT end_time, result, player_color, player_rating, game_url
+        FROM processed_game_meta
+        ORDER BY end_time DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    rows = cur.fetchall()
+    return [
+        (int(r[0]), str(r[1]), str(r[2]), int(r[3]) if r[3] is not None else None, str(r[4]))
+        for r in rows
+    ]
+
+
+def _summary_state(conn: sqlite3.Connection) -> Tuple[int, Optional[int]]:
+    cur = conn.execute(
+        "SELECT last_summary_processed_count, last_summary_end_time FROM summary_state WHERE id = 1"
+    )
+    row = cur.fetchone()
+    if row is None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO summary_state
+              (id, last_summary_processed_count, last_summary_end_time, updated_at)
+            VALUES (1, 0, NULL, ?)
+            """,
+            (int(time.time()),),
+        )
+        conn.commit()
+        return 0, None
+    return int(row[0] or 0), int(row[1]) if row[1] is not None else None
+
+
+def _set_summary_state(conn: sqlite3.Connection, processed_count: int, last_end_time: int) -> None:
+    conn.execute(
+        """
+        UPDATE summary_state
+        SET last_summary_processed_count = ?, last_summary_end_time = ?, updated_at = ?
+        WHERE id = 1
+        """,
+        (int(processed_count), int(last_end_time), int(time.time())),
+    )
+    conn.commit()
+
+
+def _build_player_summary_prompt(
+    *,
+    username: str,
+    cadence: int,
+    processed_count: int,
+    stats_markdown: str,
+    recent_meta: List[Tuple[int, str, str, Optional[int], str]],
+) -> Tuple[str, str]:
+    system_msg = (
+        "You are a chess coach writing a concise player-level progress summary in Markdown. "
+        "Focus on practical human patterns, momentum, and next-step focus."
+    )
+    game_lines: List[str] = []
+    for end_time, result, color, rating, game_url in recent_meta:
+        dt = datetime.fromtimestamp(end_time, tz=timezone.utc).strftime("%Y-%m-%d")
+        rating_text = str(rating) if rating is not None else "?"
+        game_lines.append(f"- {dt} | {color} | {result} | rating {rating_text} | {game_url}")
+    recent_games_block = "\n".join(game_lines) if game_lines else "- No recent games found."
+
+    user_msg = f"""Create a Markdown summary for this player's latest cadence window.
+
+Player: {username}
+Window size: {cadence}
+Total processed games: {processed_count}
+
+Current stats snapshot:
+```markdown
+{stats_markdown}
+```
+
+Recent games:
+{recent_games_block}
+
+Output requirements:
+1) Return Markdown only.
+2) Include sections:
+   - Snapshot
+   - Trends
+   - Focus for Next {cadence} Games
+3) Keep it practical, concise, and coach-like.
+4) No engine scores or centipawn language.
+"""
+    return system_msg, user_msg
+
+
+def _generate_player_summary_markdown(
+    args: argparse.Namespace,
+    *,
+    processed_count: int,
+    cadence: int,
+    stats_path: Path,
+    recent_meta: List[Tuple[int, str, str, Optional[int], str]],
+) -> str:
+    stats_markdown = stats_path.read_text(encoding="utf-8") if stats_path.exists() else ""
+    system_msg, user_msg = _build_player_summary_prompt(
+        username=args.username,
+        cadence=cadence,
+        processed_count=processed_count,
+        stats_markdown=stats_markdown,
+        recent_meta=recent_meta,
+    )
+    if args.provider == "gpt":
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set but --provider gpt was selected.")
+        return call_openai_chat(
+            api_key=api_key,
+            model=args.gpt_model,
+            system_msg=system_msg,
+            user_msg=user_msg,
+            timeout=args.timeout,
+            max_tokens=args.max_tokens,
+        )
+    return call_ollama_generate(
+        base_url=args.ollama_url,
+        model=args.ollama_model,
+        system_msg=system_msg,
+        user_msg=user_msg,
+        timeout=args.timeout,
+    )
+
+
+def _maybe_generate_player_summary(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    *,
+    latest_game: GameInfo,
+    stats_path: Path,
+) -> Optional[Path]:
+    cadence = max(1, int(args.player_summary_every_n))
+    cur = conn.execute("SELECT COUNT(*) FROM processed_games")
+    processed_count = int(cur.fetchone()[0] or 0)
+    last_summary_count, _last_summary_end_time = _summary_state(conn)
+    if processed_count == 0 or processed_count % cadence != 0:
+        return None
+    if last_summary_count >= processed_count:
+        return None
+
+    recent_meta = _load_recent_game_meta_for_summary(conn, cadence)
+    summary_md = _generate_player_summary_markdown(
+        args,
+        processed_count=processed_count,
+        cadence=cadence,
+        stats_path=stats_path,
+        recent_meta=recent_meta,
+    )
+    summary_path = args.out / "player_summary.md"
+    write_text(summary_path, summary_md)
+    _set_summary_state(conn, processed_count, latest_game.end_time)
+
+    if getattr(args, "telegram_bot_token", None) and getattr(args, "telegram_chat_id", None):
+        try:
+            send_telegram_document(
+                bot_token=args.telegram_bot_token,
+                chat_id=args.telegram_chat_id,
+                file_path=summary_path,
+                caption=f"Player summary ready — last {processed_count} games",
+                timeout=args.timeout,
+                disable_notification=getattr(args, "telegram_disable_notification", False),
+            )
+        except Exception as e:
+            print(f"[warn] Telegram summary notification failed: {e}", file=sys.stderr)
+
+    return summary_path
 
 
 # -----------------------------
@@ -616,6 +962,28 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         model=used_model,
         content_hash=h,
     )
+    _record_processed_game_meta(conn, game)
+
+    runtime_sync = sync_game_record_and_traits(
+        player_username=args.username,
+        game_payload={
+            "game_url": game.game_url,
+            "pgn": game.pgn,
+            "end_time": game.end_time,
+            "time_control": game.time_control,
+            "rated": game.rated,
+            "rules": game.rules,
+            "result": game.result,
+            "white_username": game.white_username,
+            "black_username": game.black_username,
+            "white_rating": game.white_rating,
+            "black_rating": game.black_rating,
+            "player_color": game.your_color,
+        },
+    )
+    if not runtime_sync.get("available"):
+        logger.debug("Runtime Postgres sync skipped: %s", runtime_sync.get("reason"))
+
     record_player_rating_for_game(
         player_username=args.username,
         game_url=game.game_url,
@@ -625,6 +993,17 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         time_control=game.time_control,
         rated=game.rated,
     )
+    stats_path = _write_player_stats_markdown(
+        conn,
+        out_dir=args.out,
+        username=args.username,
+        recent_games=max(20, int(args.player_summary_every_n)),
+    )
+    try:
+        _maybe_generate_player_summary(conn, args, latest_game=game, stats_path=stats_path)
+    except Exception as e:
+        # Summary generation is best effort and must not block per-game review output.
+        print(f"[warn] Player summary generation failed: {e}", file=sys.stderr)
 
     if args.update_index:
         update_index(args.out)
@@ -686,6 +1065,16 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     return created
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Chess.com game poller -> LLM coach notes -> Markdown files")
     output_root: Optional[Path]
@@ -745,6 +1134,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--update-index", action="store_true", help="Update index.md after new reviews")
     p.add_argument("--dry-run", action="store_true", help="Detect new games but do not call LLM or write files")
     p.add_argument(
+        "--player-summary-every-n",
+        type=int,
+        default=_env_int("PLAYER_SUMMARY_EVERY_N", 20),
+        help="Generate player_summary.md every N newly processed games (env PLAYER_SUMMARY_EVERY_N, default 20).",
+    )
+    p.add_argument(
         "--no-bootstrap",
         action="store_true",
         help="Disable first-run Postgres bootstrap seeding.",
@@ -783,6 +1178,8 @@ def parse_args() -> argparse.Namespace:
         args.state_db = Path(args.out) / "state.sqlite"
     if args.bootstrap_games is not None and args.bootstrap_games <= 0:
         p.error("--bootstrap-games must be > 0.")
+    if args.player_summary_every_n <= 0:
+        p.error("--player-summary-every-n must be > 0.")
 
     # Normalize rules filter: allow disabling with empty string
     if args.rules_filter is not None:

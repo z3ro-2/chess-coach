@@ -17,6 +17,8 @@ The intended audience is human players (≈800–1600 rating), not engines.
   - `*.md` coaching notes
   - `*.pgn` raw game archive
   - `state.sqlite` (processed-game tracking)
+  - `player_stats.md` (rolling player metrics + traits snapshot)
+  - `player_summary.md` (every-N games summary)
 - Optionally:
   - Sends the Markdown file to Telegram via bot
   - Maintains an `index.md`
@@ -105,6 +107,7 @@ CHESS_OUTPUT_DIR=/data
 DATABASE_URL=postgresql://chess:chess@postgres:5432/chesscoach
 OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_MODEL=llama3.2:latest
+PLAYER_SUMMARY_EVERY_N=20
 
 # Telegram notifications (optional)
 TG_BOT_TOKEN=
@@ -141,6 +144,7 @@ The compose file:
 If `TG_BOT_TOKEN` and `TG_CHAT_ID` are set:
 
 - Each generated `.md` file is sent as a Telegram document
+- `player_summary.md` is also sent every `PLAYER_SUMMARY_EVERY_N` new games
 - Failures do **not** stop processing
 
 Useful for:
@@ -212,6 +216,8 @@ Generated files will appear on the host under `${HOME}/chess`:
 - `pgn/`
 - `state.sqlite*`
 - `index.md`
+- `player_stats.md`
+- `player_summary.md`
 - `trait_books/` (when snapshots are generated)
 
 ---
