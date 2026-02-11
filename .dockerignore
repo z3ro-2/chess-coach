@@ -16,3 +16,4 @@ output/
 chess_reviews/
 *.sqlite
 *.db
+._*
