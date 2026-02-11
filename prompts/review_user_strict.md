@@ -3,9 +3,9 @@ Generate a chess review in valid Markdown using ONLY the structured engine paylo
 You must treat the payload as authoritative truth. You are not allowed to use any chess knowledge beyond what is explicitly contained in the payload fields.
 
 Payload JSON:
-```json
+
 {payload}
-```
+
 
 STRICT OUTPUT RULES:
 
