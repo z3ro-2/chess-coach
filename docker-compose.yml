@@ -28,6 +28,9 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://chess:chess@postgres:5432/chesscoach}
       CHESS_OUTPUT_DIR: ${CHESS_OUTPUT_DIR:-/data}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      ENABLE_ENGINE: ${ENABLE_ENGINE:-true}
+      STOCKFISH_PATH: ${STOCKFISH_PATH:-/usr/bin/stockfish}
+      ENGINE_DEPTH: ${ENGINE_DEPTH:-15}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

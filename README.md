@@ -131,12 +131,16 @@ STATE_DB=/data/state.sqlite
 DATABASE_URL=postgresql://chess:chess@postgres:5432/chesscoach
 OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_MODEL=llama3.2:latest
+ENABLE_ENGINE=true
+STOCKFISH_PATH=/usr/bin/stockfish
+ENGINE_DEPTH=15
 CHESS_BOOTSTRAP_GAMES=100
 PLAYER_SUMMARY_EVERY_N=20
 ```
 
 - `STATE_DB` points to the local SQLite DB (default `/data/state.sqlite`), writable by container user  
 - If `OLLAMA_URL` is unset or localhost, it auto-resolves to `http://host.docker.internal:11434` inside the container
+- If `ENABLE_ENGINE=true`, Stockfish runs first and only structured engine labels are passed to the LLM
 
 ---
 
@@ -145,7 +149,7 @@ PLAYER_SUMMARY_EVERY_N=20
 - SQLite is authoritative for deduplication and cadence  
 - Postgres is optional for long-term analysis  
 - Ollama runs outside Docker to avoid GPU contention  
-- Focused on human coaching, no engine analysis by default  
+- Engine analysis is deterministic and optional via `ENABLE_ENGINE`  
 
 ---
 

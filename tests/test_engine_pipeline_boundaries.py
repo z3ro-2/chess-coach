@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import logging
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+import chess_review
+import analysis_pipeline as pipeline_module
+from analysis_pipeline import run_analysis_pipeline
+from engine.stockfish_oracle import StockfishOracle, _score_to_pawns, classify_move
+from llm.safe_payload import build_llm_safe_payload
+
+
+class _Game:
+    game_url = "https://www.chess.com/game/live/1"
+    pgn = '[Event "Live Chess"]\n[Result "1-0"]\n1. e4 e5 1-0\n'
+    your_color = "white"
+    opponent = "opponent"
+    result = "1-0"
+    time_control = "600"
+    rated = True
+    rules = "chess"
+
+    @property
+    def end_dt_utc(self):
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(1_706_000_000, tz=timezone.utc)
+
+
+def test_classify_move_thresholds() -> None:
+    assert classify_move(eval_before=0.0, played_eval=-0.2, best_eval=0.0, played_is_best_move=False) == "good"
+    assert classify_move(eval_before=0.0, played_eval=-0.7, best_eval=0.0, played_is_best_move=False) == "inaccuracy"
+    assert classify_move(eval_before=0.0, played_eval=-1.8, best_eval=0.0, played_is_best_move=False) == "mistake"
+    assert classify_move(eval_before=0.0, played_eval=-3.0, best_eval=0.0, played_is_best_move=False) == "blunder"
+    assert classify_move(eval_before=-0.5, played_eval=2.0, best_eval=2.0, played_is_best_move=True) == "brilliant"
+    assert classify_move(eval_before=-2.5, played_eval=-1.2, best_eval=-1.1, played_is_best_move=True) == "brilliant"
+
+
+def test_build_llm_safe_payload_strips_engine_eval_fields() -> None:
+    payload = build_llm_safe_payload(
+        {
+            "game_summary": {
+                "result": "1-0",
+                "total_moves": 42,
+                "best_eval": 3.1,
+                "depth": 15,
+            },
+            "key_positions": [
+                {
+                    "move_number": 23,
+                    "player": "White",
+                    "label": "blunder",
+                    "eval_before": 0.3,
+                    "eval_after": -3.2,
+                    "eval_swing": -3.5,
+                    "material_change": -3,
+                    "mate_threat": False,
+                    "forcing": True,
+                    "tactical_flag": "hanging_piece",
+                    "pv": ["Qh5+"],
+                    "multipv": 1,
+                }
+            ],
+        }
+    )
+
+    assert "best_eval" not in payload["game_summary"]
+    assert "depth" not in payload["game_summary"]
+    item = payload["key_positions"][0]
+    assert sorted(item.keys()) == [
+        "forcing",
+        "label",
+        "mate_threat",
+        "material_change",
+        "move_number",
+        "player",
+        "tactical_flag",
+    ]
+    assert "eval_before" not in item
+    assert "eval_after" not in item
+    assert "eval_swing" not in item
+    assert "pv" not in item
+    assert "multipv" not in item
+    assert item["label"] == "blunder"
+    assert item["tactical_flag"] == "hanging_piece"
+
+
+def test_run_analysis_pipeline_engine_disabled_and_filters_illegal_suggestions(monkeypatch) -> None:
+    chess = pytest.importorskip("chess")
+    args = SimpleNamespace(enable_engine=False)
+    game = _Game()
+    board = chess.Board()
+
+    seen_llm_payload = {}
+
+    def _prompt_builder(_game, llm_payload):
+        seen_llm_payload["payload"] = llm_payload
+        return "sys", "user"
+
+    def _llm_runner(_system_msg, _user_msg):
+        return "# Summary\n- Try Nxe5 immediately and e4 if needed\n- Keep king safe"
+
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: board)
+
+    output = run_analysis_pipeline(
+        game=game,
+        args=args,
+        prompt_builder=_prompt_builder,
+        llm_runner=_llm_runner,
+        logger=logging.getLogger("test"),
+    )
+
+    assert seen_llm_payload["payload"] is None
+    assert "Nxe5" not in output
+    assert "e4" in output
+    assert "immediately" in output
+    assert "Keep king safe" in output
+
+
+def test_oracle_uses_single_analyse_call_per_position(monkeypatch) -> None:
+    chess = pytest.importorskip("chess")
+    oracle = StockfishOracle(stockfish_path="/fake/stockfish", depth=10)
+    pgn_text = '[Event "Live Chess"]\n[Result "1/2-1/2"]\n1. e4 e5 1/2-1/2\n'
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return False
+
+        def configure(self, _opts):
+            return None
+
+        def analyse(self, board, _limit, multipv=1):
+            self.calls.append(board.fen())
+            move = next(iter(board.legal_moves))
+            return [
+                {
+                    "score": chess.engine.PovScore(chess.engine.Cp(20), board.turn),
+                    "pv": [move],
+                }
+            ]
+
+    fake_engine = _FakeEngine()
+    monkeypatch.setattr(
+        chess.engine.SimpleEngine,
+        "popen_uci",
+        lambda _path: fake_engine,
+    )
+
+    oracle.analyze_game(pgn_text)
+
+    # 2 plies => 3 unique board positions (initial, after white move, after black move).
+    assert len(fake_engine.calls) == 3
+    assert not hasattr(StockfishOracle, "_best_line_analysis")
+    assert not hasattr(StockfishOracle, "_evaluate_position")
+
+
+def test_mate_scores_prefer_faster_mate() -> None:
+    chess = pytest.importorskip("chess")
+    mate_in_2 = chess.engine.Mate(2)
+    mate_in_10 = chess.engine.Mate(10)
+    assert _score_to_pawns(mate_in_2) > _score_to_pawns(mate_in_10)
+
+
+def test_parse_args_engine_flags_and_values(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("CHESS_USERNAME", "logan")
+    monkeypatch.setenv("CHESS_OUTPUT_DIR", str(tmp_path / "out"))
+    monkeypatch.setenv("ENABLE_ENGINE", "false")
+    monkeypatch.setenv("STOCKFISH_PATH", "/env/stockfish")
+    monkeypatch.setenv("ENGINE_DEPTH", "13")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "chess_review.py",
+            "--once",
+            "--enable-engine",
+            "--stockfish-path",
+            "/cli/stockfish",
+            "--engine-depth",
+            "19",
+        ],
+    )
+    args = chess_review.parse_args()
+    assert args.enable_engine is True
+    assert args.stockfish_path == "/cli/stockfish"
+    assert args.engine_depth == 19
+
+    monkeypatch.setattr(sys, "argv", ["chess_review.py", "--once", "--disable-engine"])
+    args_disabled = chess_review.parse_args()
+    assert args_disabled.enable_engine is False

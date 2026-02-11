@@ -10,6 +10,7 @@ WORKDIR /app
 # System deps (add more here if needed later)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
+    stockfish \
     tzdata \
  && rm -rf /var/lib/apt/lists/*
  

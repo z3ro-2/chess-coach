@@ -53,6 +53,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 
 import requests
+from analysis_pipeline import run_analysis_pipeline
 from src.commands import list_command_names, run_command
 from src.config.output_paths import get_output_root
 from src.db.bootstrap import ensure_bootstrap
@@ -718,7 +719,7 @@ class LLMError(RuntimeError):
     pass
 
 
-def build_prompt(game: GameInfo) -> Tuple[str, str]:
+def build_prompt(game: GameInfo, llm_payload: Optional[Mapping[str, Any]] = None) -> Tuple[str, str]:
     """Return (system_message, user_message)."""
     date_iso = game.end_dt_utc.strftime("%Y-%m-%d")
 
@@ -729,9 +730,37 @@ def build_prompt(game: GameInfo) -> Tuple[str, str]:
         "You are a chess coach. Produce a concise but insightful game review aimed at ~1000-rated players. "
         "Do NOT go move-by-move. Focus only on the critical turning points and plans. "
         "Be concrete: reference move numbers and describe the position/idea in words. "
-        "Assume no engine; prefer human-coachable heuristics and typical tactical motifs. "
         "Avoid filler, be direct."
     )
+
+    if llm_payload is not None:
+        system = (
+            system
+            + " Use the provided engine oracle payload as authoritative truth. "
+            + "Do not infer legality, evaluations, or move quality beyond the payload."
+        )
+
+        user = f"""Analyze this chess game and generate a Markdown review file.
+
+Structured engine oracle payload (JSON):
+```json
+{json.dumps(llm_payload, ensure_ascii=True, separators=(",", ":"))}
+```
+
+Output requirements:
+1) Output VALID Markdown.
+2) Start with YAML front matter (---) including: date_utc, your_color, opponent, result, time_control, rated, url.
+3) Include these sections (with headings):
+   - Summary (2-4 bullets: what decided the game)
+   - Key inflection points (3-7 items). For each: move number, what happened, better alternative, and a "rule of thumb".
+   - What to watch out for next time (patterns, not moves)
+   - Training plan (3-5 drills/tasks you can do this week)
+   - Next-game checklist (short, practical)
+4) Keep tone direct. No fluff.
+5) Use only the oracle payload for move-quality judgments and tactical labels.
+6) Use only fields in game_summary for YAML front matter values.
+"""
+        return system, user
 
     user = f"""Analyze this chess game and generate a Markdown review file.
 
@@ -923,30 +952,18 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
     # Always archive raw PGN first.
     write_pgn_once(pgn_path, game.pgn)
 
-    system_msg, user_msg = build_prompt(game)
-
     used_model = args.ollama_model if args.provider == "ollama" else args.gpt_model
-
-    if args.provider == "gpt":
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not set but --provider gpt was selected.")
-        review_md = call_openai_chat(
-            api_key=api_key,
-            model=args.gpt_model,
+    review_md = run_analysis_pipeline(
+        game=game,
+        args=args,
+        prompt_builder=build_prompt,
+        llm_runner=lambda system_msg, user_msg: _call_selected_llm_backend(
+            args=args,
             system_msg=system_msg,
             user_msg=user_msg,
-            timeout=args.timeout,
-            max_tokens=args.max_tokens,
-        )
-    else:
-        review_md = call_ollama_generate(
-            base_url=args.ollama_url,
-            model=args.ollama_model,
-            system_msg=system_msg,
-            user_msg=user_msg,
-            timeout=args.timeout,
-        )
+        ),
+        logger=logger,
+    )
 
     write_text(md_path, review_md)
 
@@ -1090,6 +1107,40 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _call_selected_llm_backend(*, args: argparse.Namespace, system_msg: str, user_msg: str) -> str:
+    if args.provider == "gpt":
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set but --provider gpt was selected.")
+        return call_openai_chat(
+            api_key=api_key,
+            model=args.gpt_model,
+            system_msg=system_msg,
+            user_msg=user_msg,
+            timeout=args.timeout,
+            max_tokens=args.max_tokens,
+        )
+
+    return call_ollama_generate(
+        base_url=args.ollama_url,
+        model=args.ollama_model,
+        system_msg=system_msg,
+        user_msg=user_msg,
+        timeout=args.timeout,
+    )
+
+
 def _running_in_docker() -> bool:
     return Path("/.dockerenv").exists()
 
@@ -1162,6 +1213,30 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("OLLAMA_MODEL", "llama3.1:8b"),
         help="Ollama model name",
     )
+    p.add_argument(
+        "--enable-engine",
+        dest="enable_engine",
+        action="store_true",
+        default=_env_bool("ENABLE_ENGINE", True),
+        help="Enable deterministic Stockfish oracle analysis (env ENABLE_ENGINE, default true).",
+    )
+    p.add_argument(
+        "--disable-engine",
+        dest="enable_engine",
+        action="store_false",
+        help="Disable Stockfish oracle and use legacy LLM-only flow.",
+    )
+    p.add_argument(
+        "--stockfish-path",
+        default=os.environ.get("STOCKFISH_PATH", "/usr/bin/stockfish"),
+        help="Path to Stockfish binary (env STOCKFISH_PATH).",
+    )
+    p.add_argument(
+        "--engine-depth",
+        type=int,
+        default=_env_int("ENGINE_DEPTH", 15),
+        help="Stockfish analysis depth (env ENGINE_DEPTH, default 15).",
+    )
 
     p.add_argument("--poll-seconds", type=int, default=300, help="Polling interval (seconds)")
     p.add_argument("--once", action="store_true", help="Run one poll cycle then exit")
@@ -1231,6 +1306,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--bootstrap-games must be > 0.")
     if args.player_summary_every_n <= 0:
         p.error("--player-summary-every-n must be > 0.")
+    if args.engine_depth <= 0:
+        p.error("--engine-depth must be > 0.")
 
     # Normalize rules filter: allow disabling with empty string
     if args.rules_filter is not None:
