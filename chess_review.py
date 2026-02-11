@@ -1097,6 +1097,7 @@ def _call_selected_llm_backend(*, args: argparse.Namespace, system_msg: str, use
     if args.provider == "gpt":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
+            logger.error("OPENAI_API_KEY is missing while provider=gpt.")
             raise RuntimeError("OPENAI_API_KEY is not set but --provider gpt was selected.")
         return call_openai_chat(
             api_key=api_key,
@@ -1107,6 +1108,11 @@ def _call_selected_llm_backend(*, args: argparse.Namespace, system_msg: str, use
             max_tokens=args.max_tokens,
         )
 
+    if not str(getattr(args, "ollama_url", "") or "").strip():
+        logger.error("OLLAMA_URL is missing while provider=ollama.")
+        raise RuntimeError("OLLAMA_URL is not set but --provider ollama was selected.")
+
+    _validate_ollama_endpoint(base_url=str(args.ollama_url), timeout=int(args.timeout))
     return call_ollama_generate(
         base_url=args.ollama_url,
         model=args.ollama_model,
@@ -1127,12 +1133,33 @@ def _is_loopback_ollama_url(url: str) -> bool:
 
 def _resolve_ollama_url_for_runtime(raw_url: str) -> str:
     cleaned = (raw_url or "").strip()
-    if _running_in_docker():
-        if not cleaned or _is_loopback_ollama_url(cleaned):
-            return "http://host.docker.internal:11434"
     if not cleaned:
-        return "http://localhost:11434"
+        return ""
+    if _running_in_docker() and _is_loopback_ollama_url(cleaned):
+        return "http://host.docker.internal:11434"
     return cleaned
+
+
+def _validate_ollama_endpoint(*, base_url: str, timeout: int) -> None:
+    url = base_url.rstrip("/") + "/api/tags"
+    try:
+        resp = requests.get(url, timeout=max(1, timeout))
+    except Exception as exc:
+        logger.error("OLLAMA_URL is unreachable: %s (%s)", base_url, exc)
+        raise RuntimeError(f"OLLAMA_URL is unreachable: {base_url}") from exc
+    if resp.status_code >= 400:
+        logger.error("OLLAMA_URL health check failed: %s -> HTTP %s", base_url, resp.status_code)
+        raise RuntimeError(f"OLLAMA_URL health check failed: {base_url} (HTTP {resp.status_code})")
+
+
+def _apply_provider_runtime_fallback(args: argparse.Namespace) -> None:
+    args.provider = str(getattr(args, "provider", "ollama") or "ollama").strip().lower()
+    if args.provider != "ollama":
+        return
+    if str(getattr(args, "ollama_url", "") or "").strip():
+        return
+    logger.warning("PROVIDER=ollama but OLLAMA_URL is not configured; falling back to provider=gpt.")
+    args.provider = "gpt"
 
 
 def _telegram_command_loop(args: argparse.Namespace, stop_event: threading.Event) -> None:
@@ -1174,13 +1201,18 @@ def parse_args() -> argparse.Namespace:
         help="Path to the SQLite state database (default from STATE_DB env or /data/state.sqlite)",
     )
 
-    p.add_argument("--provider", choices=["gpt", "ollama"], default="ollama", help="LLM provider")
+    p.add_argument(
+        "--provider",
+        choices=["gpt", "ollama"],
+        default=os.environ.get("PROVIDER", "ollama"),
+        help="LLM provider: gpt (OpenAI) or ollama (local).",
+    )
     p.add_argument("--gpt-model", default="gpt-4o-mini", help="OpenAI model (provider=gpt)")
     p.add_argument("--max-tokens", type=int, default=1400, help="Max tokens for OpenAI responses")
 
     p.add_argument(
         "--ollama-url",
-        default=os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+        default=os.environ.get("OLLAMA_URL", ""),
         help="Ollama base URL",
     )
     p.add_argument(
@@ -1297,7 +1329,12 @@ def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
     args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
-    logger.info("LLM endpoint resolved to %s", args.ollama_url)
+    _apply_provider_runtime_fallback(args)
+    logger.info("LLM Provider selected: %s", args.provider)
+    if args.provider == "gpt":
+        logger.info("Using OpenAI model: %s", args.gpt_model)
+    else:
+        logger.info("Using Ollama model: %s  URL: %s", args.ollama_model, args.ollama_url)
     args.out = Path(args.out)
     args.state_db = Path(args.state_db)
     logger.info("SQLite state DB path: %s", args.state_db)
