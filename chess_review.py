@@ -721,6 +721,7 @@ class LLMError(RuntimeError):
 
 def build_prompt(game: GameInfo, llm_payload: Optional[Mapping[str, Any]] = None) -> Tuple[str, str]:
     """Return (system_message, user_message)."""
+    _ = llm_payload  # Engine mode prompt templates are loaded in analysis_pipeline.py.
     date_iso = game.end_dt_utc.strftime("%Y-%m-%d")
 
     white_rating = game.white_rating if game.white_rating is not None else "?"
@@ -732,35 +733,6 @@ def build_prompt(game: GameInfo, llm_payload: Optional[Mapping[str, Any]] = None
         "Be concrete: reference move numbers and describe the position/idea in words. "
         "Avoid filler, be direct."
     )
-
-    if llm_payload is not None:
-        system = (
-            system
-            + " Use the provided engine oracle payload as authoritative truth. "
-            + "Do not infer legality, evaluations, or move quality beyond the payload."
-        )
-
-        user = f"""Analyze this chess game and generate a Markdown review file.
-
-Structured engine oracle payload (JSON):
-```json
-{json.dumps(llm_payload, ensure_ascii=True, separators=(",", ":"))}
-```
-
-Output requirements:
-1) Output VALID Markdown.
-2) Start with YAML front matter (---) including: date_utc, your_color, opponent, result, time_control, rated, url.
-3) Include these sections (with headings):
-   - Summary (2-4 bullets: what decided the game)
-   - Key inflection points (3-7 items). For each: move number, what happened, better alternative, and a "rule of thumb".
-   - What to watch out for next time (patterns, not moves)
-   - Training plan (3-5 drills/tasks you can do this week)
-   - Next-game checklist (short, practical)
-4) Keep tone direct. No fluff.
-5) Use only the oracle payload for move-quality judgments and tactical labels.
-6) Use only fields in game_summary for YAML front matter values.
-"""
-        return system, user
 
     user = f"""Analyze this chess game and generate a Markdown review file.
 

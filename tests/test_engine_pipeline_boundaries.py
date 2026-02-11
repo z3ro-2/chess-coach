@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from types import SimpleNamespace
 
@@ -28,6 +29,13 @@ class _Game:
         from datetime import datetime, timezone
 
         return datetime.fromtimestamp(1_706_000_000, tz=timezone.utc)
+
+
+def _san_tokens(text: str) -> set[str]:
+    pattern = re.compile(
+        r"\b(?:O-O-O|O-O|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?|[a-h]x[a-h][1-8](?:=[QRBN])?[+#]?|[a-h][1-8](?:=[QRBN])?[+#]?)\b"
+    )
+    return set(pattern.findall(text))
 
 
 def test_classify_move_thresholds() -> None:
@@ -71,11 +79,13 @@ def test_build_llm_safe_payload_strips_engine_eval_fields() -> None:
     assert "depth" not in payload["game_summary"]
     item = payload["key_positions"][0]
     assert sorted(item.keys()) == [
+        "best_san",
         "forcing",
         "label",
         "mate_threat",
         "material_change",
         "move_number",
+        "played_san",
         "player",
         "tactical_flag",
     ]
@@ -86,6 +96,8 @@ def test_build_llm_safe_payload_strips_engine_eval_fields() -> None:
     assert "multipv" not in item
     assert item["label"] == "blunder"
     assert item["tactical_flag"] == "hanging_piece"
+    assert "played_san" in item
+    assert "best_san" in item
 
 
 def test_run_analysis_pipeline_engine_disabled_and_filters_illegal_suggestions(monkeypatch) -> None:
@@ -198,3 +210,97 @@ def test_parse_args_engine_flags_and_values(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(sys, "argv", ["chess_review.py", "--once", "--disable-engine"])
     args_disabled = chess_review.parse_args()
     assert args_disabled.enable_engine is False
+
+
+def test_strict_prompt_template_contains_required_phrase() -> None:
+    template = pipeline_module.load_prompt_file("review_user_strict.md")
+    assert "Do NOT suggest any move not present in the payload" in template
+
+
+def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch) -> None:
+    args = SimpleNamespace(enable_engine=True)
+    game = _Game()
+    captured = {"system": "", "user": ""}
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "game_summary": {"result": "1-0", "total_moves": 2, "forced_mate_events": 0, "illegal_moves": 0},
+            "key_positions": [
+                {
+                    "move_number": 1,
+                    "player": "White",
+                    "label": "mistake",
+                    "material_change": 0,
+                    "mate_threat": False,
+                    "forcing": False,
+                    "tactical_flag": "tactical_miss",
+                    "played_san": "e4",
+                    "best_san": "Nf3",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: None)
+
+    def _prompt_builder(_game, _llm_payload):
+        raise AssertionError("Legacy prompt builder should not be used in strict engine mode.")
+
+    def _llm_runner(system_msg: str, user_msg: str) -> str:
+        captured["system"] = system_msg
+        captured["user"] = user_msg
+        return "# strict"
+
+    result = run_analysis_pipeline(
+        game=game,
+        args=args,
+        prompt_builder=_prompt_builder,
+        llm_runner=_llm_runner,
+        logger=logging.getLogger("test"),
+    )
+
+    assert result == "# strict"
+    assert "Do NOT suggest any move not present in the payload" in captured["user"]
+    assert '"best_san":"Nf3"' in captured["user"]
+
+
+def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
+    chess = pytest.importorskip("chess")
+    args = SimpleNamespace(enable_engine=True)
+    game = _Game()
+    board = chess.Board()
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "game_summary": {"result": "1-0", "total_moves": 2, "forced_mate_events": 0, "illegal_moves": 0},
+            "key_positions": [
+                {
+                    "move_number": 1,
+                    "player": "White",
+                    "label": "inaccuracy",
+                    "material_change": 0,
+                    "mate_threat": False,
+                    "forcing": False,
+                    "tactical_flag": "none",
+                    "played_san": "d4",
+                    "best_san": "d5",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: board)
+
+    output = run_analysis_pipeline(
+        game=game,
+        args=args,
+        prompt_builder=lambda _game, _payload: ("legacy", "legacy"),
+        llm_runner=lambda _sys, _user: "Play d4, but avoid e4 and consider d5.",
+        logger=logging.getLogger("test"),
+    )
+
+    allowed_sans = {"d4", "d5"}
+    assert "e4" not in output
+    assert _san_tokens(output) <= allowed_sans

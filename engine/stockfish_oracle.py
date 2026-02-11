@@ -86,6 +86,8 @@ class StockfishOracle:
 
                 if move not in board.legal_moves:
                     illegal_moves += 1
+                    best_move = current_analysis.get("best_move")
+                    best_san = _safe_san(board, best_move) if best_move is not None else None
                     key_positions.append(
                         {
                             "move_number": move_number,
@@ -95,6 +97,8 @@ class StockfishOracle:
                             "mate_threat": True,
                             "forcing": False,
                             "tactical_flag": "illegal_move",
+                            "played_san": None,
+                            "best_san": best_san,
                         }
                     )
                     break
@@ -102,6 +106,8 @@ class StockfishOracle:
                 best_move = current_analysis.get("best_move")
                 best_eval = _analysis_eval_for_color(current_analysis, mover_color)
                 eval_before = best_eval
+                played_san = _safe_san(board, move)
+                best_san = _safe_san(board, best_move) if best_move is not None else None
 
                 is_capture = board.is_capture(move)
                 gives_check = board.gives_check(move)
@@ -149,6 +155,8 @@ class StockfishOracle:
                             "mate_threat": mate_threat,
                             "forcing": forcing,
                             "tactical_flag": tactical_flag,
+                            "played_san": played_san,
+                            "best_san": best_san,
                         }
                     )
 
@@ -218,6 +226,15 @@ def _analysis_mate_for_color(analysis: Mapping[str, Any], color: Any) -> Optiona
     if score is None:
         return None
     return score.pov(color).mate()
+
+
+def _safe_san(board: Any, move: Any) -> Optional[str]:
+    if move is None:
+        return None
+    try:
+        return str(board.san(move))
+    except Exception:
+        return None
 
 
 def _material_for_color(board: Any, color: Any) -> int:

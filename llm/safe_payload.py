@@ -45,6 +45,8 @@ def build_llm_safe_payload(
                 "material_change": row.get("material_change"),
                 "mate_threat": row.get("mate_threat"),
                 "forcing": row.get("forcing"),
+                "played_san": row.get("played_san"),
+                "best_san": row.get("best_san"),
             }
         )
 

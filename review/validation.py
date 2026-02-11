@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import Iterable, List, Set
 
 import chess
 
@@ -31,6 +31,27 @@ def validate_suggested_moves(board: chess.Board, text_output: str) -> str:
         cleaned_line = line
         for token in illegal_tokens:
             cleaned_line = _remove_token_from_line(token, cleaned_line)
+        cleaned_line = _normalize_line_spacing(cleaned_line)
+        if _line_has_content(cleaned_line):
+            cleaned_lines.append(cleaned_line)
+    return "\n".join(cleaned_lines)
+
+
+def filter_output_to_allowed_sans(text_output: str, allowed_sans: Iterable[str]) -> str:
+    """Remove SAN tokens that are not present in the allowed SAN set."""
+    if not text_output:
+        return text_output
+
+    allowed: Set[str] = {str(token).strip() for token in allowed_sans if str(token).strip()}
+    if not allowed:
+        return text_output
+
+    cleaned_lines: List[str] = []
+    for line in text_output.splitlines():
+        cleaned_line = line
+        for token in _candidate_san_tokens(cleaned_line):
+            if token not in allowed:
+                cleaned_line = _remove_token_from_line(token, cleaned_line)
         cleaned_line = _normalize_line_spacing(cleaned_line)
         if _line_has_content(cleaned_line):
             cleaned_lines.append(cleaned_line)

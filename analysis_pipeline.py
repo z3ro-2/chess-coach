@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
 from io import StringIO
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Tuple
 
 from llm.safe_payload import build_llm_safe_payload
 
 _ENGINE_DISABLED_WARNED = False
+
+
+def load_prompt_file(name: str) -> str:
+    base_path = Path(__file__).resolve().parent
+    path = base_path / "prompts" / name
+    if not path.exists():
+        path = base_path.parent / "prompts" / name
+    return path.read_text(encoding="utf-8")
 
 
 def run_analysis_pipeline(
@@ -37,15 +47,26 @@ def run_analysis_pipeline(
         else None
     )
 
-    system_msg, user_msg = prompt_builder(game, llm_payload)
-    review_markdown = llm_runner(system_msg, user_msg)
+    if llm_payload is not None:
+        system_template = load_prompt_file("review_system.md")
+        user_template = load_prompt_file("review_user_strict.md")
+        review_markdown = llm_runner(
+            system_template,
+            user_template.format(payload=json.dumps(llm_payload, ensure_ascii=True, separators=(",", ":"))),
+        )
+    else:
+        system_msg, user_msg = prompt_builder(game, None)
+        review_markdown = llm_runner(system_msg, user_msg)
 
     board = _board_from_pgn(getattr(game, "pgn", ""))
     if board is not None:
         try:
-            from review.validation import validate_suggested_moves
+            from review.validation import filter_output_to_allowed_sans, validate_suggested_moves
 
             review_markdown = validate_suggested_moves(board, review_markdown)
+            if llm_payload is not None:
+                allowed_sans = _collect_allowed_sans(llm_payload)
+                review_markdown = filter_output_to_allowed_sans(review_markdown, allowed_sans)
         except Exception:
             logger.debug("Suggested move validation skipped due to validation error.", exc_info=True)
 
@@ -92,3 +113,15 @@ def _board_from_pgn(pgn_text: str) -> Optional[Any]:
         return board
     except Exception:
         return None
+
+
+def _collect_allowed_sans(llm_payload: Mapping[str, Any]) -> set[str]:
+    allowed: set[str] = set()
+    for item in llm_payload.get("key_positions") or []:
+        if not isinstance(item, Mapping):
+            continue
+        for key in ("played_san", "best_san"):
+            token = str(item.get(key) or "").strip()
+            if token:
+                allowed.add(token)
+    return allowed
