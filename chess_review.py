@@ -55,6 +55,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import requests
 from analysis_pipeline import run_analysis_pipeline
 from src.commands import list_command_names, run_command
+from src.config.provider_config import get_provider, set_provider
 from src.config.output_paths import get_output_root
 from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
@@ -510,7 +511,8 @@ def _generate_player_summary_markdown(
         stats_markdown=stats_markdown,
         recent_meta=recent_meta,
     )
-    if args.provider == "gpt":
+    provider = get_provider()
+    if provider == "gpt":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not set but --provider gpt was selected.")
@@ -927,7 +929,8 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
     # Always archive raw PGN first.
     write_pgn_once(pgn_path, game.pgn)
 
-    used_model = args.ollama_model if args.provider == "ollama" else args.gpt_model
+    provider = get_provider()
+    used_model = args.ollama_model if provider == "ollama" else args.gpt_model
     review_md = run_analysis_pipeline(
         game=game,
         args=args,
@@ -958,14 +961,14 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
             # Do not fail the whole pipeline if Telegram is down/misconfigured.
             print(f"[warn] Telegram notification failed: {e}", file=sys.stderr)
 
-    h = compute_content_hash(game, args.provider, used_model)
+    h = compute_content_hash(game, provider, used_model)
     mark_processed(
         conn=conn,
         game_url=game.game_url,
         end_time=game.end_time,
         md_path=md_path,
         pgn_path=pgn_path,
-        provider=args.provider,
+        provider=provider,
         model=used_model,
         content_hash=h,
     )
@@ -1094,7 +1097,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _call_selected_llm_backend(*, args: argparse.Namespace, system_msg: str, user_msg: str) -> str:
-    if args.provider == "gpt":
+    provider = get_provider()
+    if provider == "gpt":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
             logger.error("OPENAI_API_KEY is missing while provider=gpt.")
@@ -1162,6 +1166,24 @@ def _apply_provider_runtime_fallback(args: argparse.Namespace) -> None:
     args.provider = "gpt"
 
 
+def _sync_runtime_provider(args: argparse.Namespace) -> str:
+    runtime_provider = str(get_provider() or "ollama").strip().lower()
+    if runtime_provider not in {"gpt", "ollama"}:
+        logger.warning("Invalid runtime provider '%s'; defaulting to ollama.", runtime_provider)
+        runtime_provider = "ollama"
+        set_provider(runtime_provider)
+    previous_provider = str(getattr(args, "provider", "") or "").strip().lower()
+    args.provider = runtime_provider
+    if args.provider == "ollama":
+        args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
+        _apply_provider_runtime_fallback(args)
+        if args.provider != runtime_provider:
+            set_provider(args.provider)
+    if previous_provider != args.provider:
+        logger.info("Active LLM Provider: %s", args.provider)
+    return args.provider
+
+
 def _telegram_command_loop(args: argparse.Namespace, stop_event: threading.Event) -> None:
     conn = init_db(Path(args.state_db))
     try:
@@ -1175,7 +1197,7 @@ def _telegram_command_loop(args: argparse.Namespace, stop_event: threading.Event
         conn.close()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Chess.com game poller -> LLM coach notes -> Markdown files")
     output_root: Optional[Path]
     try:
@@ -1221,6 +1243,12 @@ def parse_args() -> argparse.Namespace:
         help="Ollama model name",
     )
     p.add_argument(
+        "--timeout",
+        type=int,
+        default=_env_int("LLM_TIMEOUT", 120),
+        help="LLM request timeout in seconds (env LLM_TIMEOUT, default 120).",
+    )
+    p.add_argument(
         "--enable-engine",
         dest="enable_engine",
         action="store_true",
@@ -1257,7 +1285,6 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--timezone", default="America/Chicago", help="Timezone for filenames (IANA)")
 
-    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="HTTP timeout seconds")
     p.add_argument("--retries", type=int, default=3, help="Retries per game when LLM/network fails")
 
     p.add_argument("--update-index", action="store_true", help="Update index.md after new reviews")
@@ -1303,7 +1330,7 @@ def parse_args() -> argparse.Namespace:
         help="Run a command and exit (status, summary, stats, health, help).",
     )
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if not args.username:
         p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
@@ -1315,6 +1342,8 @@ def parse_args() -> argparse.Namespace:
         p.error("--player-summary-every-n must be > 0.")
     if args.engine_depth <= 0:
         p.error("--engine-depth must be > 0.")
+    if args.timeout <= 0:
+        p.error("--timeout must be > 0.")
 
     # Normalize rules filter: allow disabling with empty string
     if args.rules_filter is not None:
@@ -1331,11 +1360,13 @@ def main() -> int:
     if args.provider == "ollama":
         args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
         _apply_provider_runtime_fallback(args)
-    logger.info("LLM Provider selected: %s", args.provider)
-    if args.provider == "gpt":
+    set_provider(args.provider)
+    logger.info("Active LLM Provider: %s", get_provider())
+    if get_provider() == "gpt":
         logger.info("Using OpenAI model: %s", args.gpt_model)
     else:
         logger.info("Using Ollama model: %s (URL: %s)", args.ollama_model, args.ollama_url)
+    logger.info("LLM timeout (seconds): %d", args.timeout)
     args.out = Path(args.out)
     args.state_db = Path(args.state_db)
     logger.info("SQLite state DB path: %s", args.state_db)
@@ -1377,11 +1408,13 @@ def main() -> int:
 
     try:
         if args.once:
+            _sync_runtime_provider(args)
             poll_once(conn, args)
             return 0
 
         while True:
             try:
+                _sync_runtime_provider(args)
                 created = poll_once(conn, args)
                 logger.info("Poll cycle complete: created=%d", created)
                 # if we just created output, poll quickly once more (sometimes games arrive slightly delayed)

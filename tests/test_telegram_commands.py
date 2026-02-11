@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import chess_review
+import pytest
+from src.config.provider_config import get_provider, set_provider
 from src import telegram_commands
 
 
@@ -16,6 +18,13 @@ class _FakeResponse:
 
     def json(self) -> dict:
         return self._payload
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_provider() -> None:
+    set_provider("ollama")
+    yield
+    set_provider("ollama")
 
 
 def test_telegram_command_parsing_and_dispatch(monkeypatch, tmp_path) -> None:
@@ -65,3 +74,201 @@ def test_telegram_command_parsing_and_dispatch(monkeypatch, tmp_path) -> None:
     assert handled == 1
     assert row is not None and int(row[0]) == 102
     assert any(item["url"].endswith("/sendMessage") for item in posted_messages)
+
+
+def test_setprovider_gpt_updates_runtime_provider(monkeypatch, tmp_path) -> None:
+    posted_messages: list[dict] = []
+    set_provider("ollama")
+
+    def _fake_get(url: str, params=None, timeout=0):
+        assert url.endswith("/getUpdates")
+        return _FakeResponse(
+            {
+                "ok": True,
+                "result": [
+                    {"update_id": 201, "message": {"chat": {"id": "42"}, "text": "/setprovider gpt"}},
+                ],
+            }
+        )
+
+    def _fake_post(url: str, data=None, files=None, timeout=0):
+        posted_messages.append({"url": url, "data": data, "files": files, "timeout": timeout})
+        return _FakeResponse({"ok": True, "result": {}})
+
+    monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
+    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = SimpleNamespace(
+            out=tmp_path / "output",
+            username="logan",
+            provider="ollama",
+            timeout=5,
+            player_summary_every_n=20,
+            ollama_url="http://127.0.0.1:11434",
+            ollama_model="llama3.1:8b",
+            gpt_model="gpt-4o-mini",
+            max_tokens=100,
+            telegram_bot_token="token",
+            telegram_chat_id="42",
+            telegram_admin_chat_ids="42",
+        )
+        handled = telegram_commands.poll_telegram_commands(conn, args)
+    finally:
+        conn.close()
+
+    assert handled == 1
+    assert get_provider() == "gpt"
+    assert any("Provider set to gpt" in str(item.get("data", {}).get("text", "")) for item in posted_messages)
+
+
+def test_setprovider_ollama_updates_runtime_provider(monkeypatch, tmp_path) -> None:
+    posted_messages: list[dict] = []
+    set_provider("gpt")
+
+    def _fake_get(url: str, params=None, timeout=0):
+        return _FakeResponse(
+            {
+                "ok": True,
+                "result": [
+                    {"update_id": 251, "message": {"chat": {"id": "42"}, "text": "/setprovider ollama"}},
+                ],
+            }
+        )
+
+    def _fake_post(url: str, data=None, files=None, timeout=0):
+        posted_messages.append({"url": url, "data": data, "files": files, "timeout": timeout})
+        return _FakeResponse({"ok": True, "result": {}})
+
+    monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
+    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = SimpleNamespace(
+            out=tmp_path / "output",
+            username="logan",
+            provider="gpt",
+            timeout=5,
+            player_summary_every_n=20,
+            ollama_url="http://127.0.0.1:11434",
+            ollama_model="llama3.1:8b",
+            gpt_model="gpt-4o-mini",
+            max_tokens=100,
+            telegram_bot_token="token",
+            telegram_chat_id="42",
+            telegram_admin_chat_ids="42",
+        )
+        handled = telegram_commands.poll_telegram_commands(conn, args)
+    finally:
+        conn.close()
+
+    assert handled == 1
+    assert get_provider() == "ollama"
+    assert any("Provider set to ollama" in str(item.get("data", {}).get("text", "")) for item in posted_messages)
+
+
+def test_setprovider_invalid_value_returns_error(monkeypatch, tmp_path) -> None:
+    posted_messages: list[dict] = []
+    set_provider("ollama")
+
+    def _fake_get(url: str, params=None, timeout=0):
+        return _FakeResponse(
+            {
+                "ok": True,
+                "result": [
+                    {"update_id": 301, "message": {"chat": {"id": "42"}, "text": "/setprovider bad"}},
+                ],
+            }
+        )
+
+    def _fake_post(url: str, data=None, files=None, timeout=0):
+        posted_messages.append({"url": url, "data": data, "files": files, "timeout": timeout})
+        return _FakeResponse({"ok": True, "result": {}})
+
+    monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
+    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = SimpleNamespace(
+            out=tmp_path / "output",
+            username="logan",
+            provider="ollama",
+            timeout=5,
+            player_summary_every_n=20,
+            ollama_url="http://127.0.0.1:11434",
+            ollama_model="llama3.1:8b",
+            gpt_model="gpt-4o-mini",
+            max_tokens=100,
+            telegram_bot_token="token",
+            telegram_chat_id="42",
+            telegram_admin_chat_ids="42",
+        )
+        handled = telegram_commands.poll_telegram_commands(conn, args)
+    finally:
+        conn.close()
+
+    assert handled == 1
+    assert get_provider() == "ollama"
+    assert any("Invalid provider" in str(item.get("data", {}).get("text", "")) for item in posted_messages)
+
+
+def test_setprovider_requires_authorized_chat(monkeypatch, tmp_path) -> None:
+    posted_messages: list[dict] = []
+    set_provider("ollama")
+
+    def _fake_get(url: str, params=None, timeout=0):
+        return _FakeResponse(
+            {
+                "ok": True,
+                "result": [
+                    {"update_id": 401, "message": {"chat": {"id": "99"}, "text": "/setprovider gpt"}},
+                ],
+            }
+        )
+
+    def _fake_post(url: str, data=None, files=None, timeout=0):
+        posted_messages.append({"url": url, "data": data, "files": files, "timeout": timeout})
+        return _FakeResponse({"ok": True, "result": {}})
+
+    monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
+    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = SimpleNamespace(
+            out=tmp_path / "output",
+            username="logan",
+            provider="ollama",
+            timeout=5,
+            player_summary_every_n=20,
+            ollama_url="http://127.0.0.1:11434",
+            ollama_model="llama3.1:8b",
+            gpt_model="gpt-4o-mini",
+            max_tokens=100,
+            telegram_bot_token="token",
+            telegram_chat_id="42",
+            telegram_admin_chat_ids="42",
+        )
+        handled = telegram_commands.poll_telegram_commands(conn, args)
+    finally:
+        conn.close()
+
+    assert handled == 1
+    assert get_provider() == "ollama"
+    assert any("Permission denied." in str(item.get("data", {}).get("text", "")) for item in posted_messages)
+
+
+def test_poll_loop_sync_uses_runtime_provider(monkeypatch) -> None:
+    set_provider("gpt")
+    args = SimpleNamespace(
+        provider="ollama",
+        ollama_url="http://127.0.0.1:11434",
+    )
+
+    provider = chess_review._sync_runtime_provider(args)
+
+    assert provider == "gpt"
+    assert args.provider == "gpt"

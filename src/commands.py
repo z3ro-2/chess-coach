@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import requests
 
+from src.config.provider_config import get_provider
 from src.db._pg_utils import _connect_db
 
 CommandResult = dict[str, Any]
@@ -188,7 +189,7 @@ def _resolve_ollama_url_for_health(raw_url: str) -> str:
 
 
 def _llm_status(args: Any) -> str:
-    provider = str(getattr(args, "provider", "ollama"))
+    provider = str(get_provider() or getattr(args, "provider", "ollama"))
     timeout = int(getattr(args, "timeout", 5) or 5)
     if provider == "gpt":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()

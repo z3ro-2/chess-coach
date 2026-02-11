@@ -49,6 +49,7 @@ def _sample_game() -> chess_review.GameInfo:
 def test_process_game_does_not_fail_without_postgres(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(chess_review, "_validate_ollama_endpoint", lambda **_kwargs: None)
     monkeypatch.setattr(chess_review, "call_ollama_generate", lambda **_kwargs: "# review")
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
@@ -65,6 +66,7 @@ def test_process_game_does_not_fail_without_postgres(monkeypatch, tmp_path) -> N
 def test_process_game_does_not_fail_when_postgres_is_down(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/chess")
+    monkeypatch.setattr(chess_review, "_validate_ollama_endpoint", lambda **_kwargs: None)
     monkeypatch.setattr(chess_review, "call_ollama_generate", lambda **_kwargs: "# review")
 
     def _raise_connect(_url):
@@ -107,10 +109,14 @@ def test_poll_once_without_postgres_does_not_crash(monkeypatch, tmp_path) -> Non
 def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(chess_review, "_validate_ollama_endpoint", lambda **_kwargs: None)
 
     calls: list[str] = []
+    expected_timeout: dict[str, int | None] = {"value": None}
 
     def _fake_ollama_generate(**kwargs):
+        if expected_timeout["value"] is not None:
+            assert kwargs.get("timeout") == expected_timeout["value"]
         user_msg = str(kwargs.get("user_msg", ""))
         calls.append(user_msg)
         if "Create a Markdown summary for this player's latest cadence window." in user_msg:
@@ -121,6 +127,7 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
 
     db_path = tmp_path / "state.sqlite"
     args = _base_args(tmp_path)
+    expected_timeout["value"] = args.timeout
     args.player_summary_every_n = 2
     game1 = _sample_game()
     game2 = chess_review.GameInfo(

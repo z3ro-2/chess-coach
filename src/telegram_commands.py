@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import requests
 
 from src.commands import list_command_names, run_command
+from src.config.provider_config import set_provider
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,7 @@ def poll_telegram_commands(conn: sqlite3.Connection, args: Any) -> int:
     configured_chat_id = str(getattr(args, "telegram_chat_id", "") or "").strip()
     if not bot_token or not configured_chat_id:
         return 0
+    admin_chat_ids = _admin_chat_ids(args)
 
     _ensure_telegram_state_table(conn)
     last_update_id = _read_last_update_id(conn)
@@ -46,10 +49,30 @@ def poll_telegram_commands(conn: sqlite3.Connection, args: Any) -> int:
 
         chat = message.get("chat") or {}
         chat_id = str(chat.get("id", "") or "")
+        command_name = text.split()[0].lstrip("/").split("@")[0].strip().lower()
+        if command_name == "setprovider":
+            if chat_id not in admin_chat_ids:
+                _telegram_send_message(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    text="Permission denied.",
+                    timeout=5,
+                )
+                handled += 1
+                continue
+            _handle_setprovider_command(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                text=text,
+                timeout=5,
+                args=args,
+            )
+            handled += 1
+            continue
+
         if chat_id != configured_chat_id:
             continue
 
-        command_name = text.split()[0].lstrip("/").split("@")[0].strip().lower()
         if command_name not in set(list_command_names()):
             continue
 
@@ -77,6 +100,47 @@ def poll_telegram_commands(conn: sqlite3.Connection, args: Any) -> int:
     if max_update_id is not None:
         _write_last_update_id(conn, int(max_update_id))
     return handled
+
+
+def _admin_chat_ids(args: Any) -> set[str]:
+    configured = str(getattr(args, "telegram_chat_id", "") or "").strip()
+    raw_admin = str(getattr(args, "telegram_admin_chat_ids", "") or os.environ.get("TG_ADMIN_CHAT_IDS", "")).strip()
+    ids = {token.strip() for token in raw_admin.split(",") if token.strip()}
+    if configured:
+        ids.add(configured)
+    return ids
+
+
+def _handle_setprovider_command(*, bot_token: str, chat_id: str, text: str, timeout: int, args: Any) -> None:
+    parts = text.split()
+    if len(parts) != 2:
+        _telegram_send_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text="Usage: /setprovider <gpt|ollama>",
+            timeout=timeout,
+        )
+        return
+
+    provider = str(parts[1] or "").strip().lower()
+    if provider not in {"gpt", "ollama"}:
+        _telegram_send_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text="Invalid provider. Use 'gpt' or 'ollama'.",
+            timeout=timeout,
+        )
+        return
+
+    set_provider(provider)
+    setattr(args, "provider", provider)
+    setattr(args, "_provider_changed", True)
+    _telegram_send_message(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        text=f"Provider set to {provider}. Restarting core loop...",
+        timeout=timeout,
+    )
 
 
 def _ensure_telegram_state_table(conn: sqlite3.Connection) -> None:

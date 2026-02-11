@@ -57,8 +57,11 @@ def test_status_command_without_postgres(monkeypatch, tmp_path) -> None:
 def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     calls: list[str] = []
+    expected_timeout: dict[str, int | None] = {"value": None}
 
     def _fake_ollama_generate(**kwargs):
+        if expected_timeout["value"] is not None:
+            assert kwargs.get("timeout") == expected_timeout["value"]
         user_msg = str(kwargs.get("user_msg", ""))
         calls.append(user_msg)
         if "Create a Markdown summary for this player's latest cadence window." in user_msg:
@@ -70,6 +73,7 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
         args = _args(tmp_path)
+        expected_timeout["value"] = args.timeout
         args.out.mkdir(parents=True, exist_ok=True)
         game = _sample_game()
         md_path = args.out / "md" / "g.md"
