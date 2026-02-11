@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Tuple
 
 from llm.safe_payload import build_llm_safe_payload
+from src.utils.timezone import get_display_timezone
 
 _ENGINE_DISABLED_WARNED = False
 
@@ -33,7 +34,7 @@ def run_analysis_pipeline(
         build_llm_safe_payload(
             engine_output,
             game_context={
-                "date_utc": getattr(game, "end_dt_utc").strftime("%Y-%m-%d"),
+                "date_utc": getattr(game, "end_dt_utc").astimezone(get_display_timezone()).strftime("%Y-%m-%d"),
                 "your_color": getattr(game, "your_color", None),
                 "opponent": getattr(game, "opponent", None),
                 "result": getattr(game, "result", None),

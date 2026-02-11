@@ -62,6 +62,7 @@ from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import fetch_player_runtime_snapshot, sync_game_record_and_traits
 from src.db.schema import ensure_postgres_core_schema
 from src.telegram_commands import poll_telegram_commands
+from src.utils.timezone import get_display_timezone
 
 CHESSCOM_GAMES_URL = "https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
 DEFAULT_TIMEOUT = 120  # seconds (local Ollama cold starts can be slow)
@@ -459,9 +460,10 @@ def _build_player_summary_prompt(
         "You are a chess coach writing a concise player-level progress summary in Markdown. "
         "Focus on practical human patterns, momentum, and next-step focus."
     )
+    display_tz = get_display_timezone()
     game_lines: List[str] = []
     for end_time, result, color, rating, game_url in recent_meta:
-        dt = datetime.fromtimestamp(end_time, tz=timezone.utc).strftime("%Y-%m-%d")
+        dt = datetime.fromtimestamp(end_time, tz=timezone.utc).astimezone(display_tz).strftime("%Y-%m-%d")
         rating_text = str(rating) if rating is not None else "?"
         game_lines.append(f"- {dt} | {color} | {result} | rating {rating_text} | {game_url}")
     recent_games_block = "\n".join(game_lines) if game_lines else "- No recent games found."
@@ -722,7 +724,8 @@ class LLMError(RuntimeError):
 def build_prompt(game: GameInfo, llm_payload: Optional[Mapping[str, Any]] = None) -> Tuple[str, str]:
     """Return (system_message, user_message)."""
     _ = llm_payload  # Engine mode prompt templates are loaded in analysis_pipeline.py.
-    date_iso = game.end_dt_utc.strftime("%Y-%m-%d")
+    local_dt = game.end_dt_utc.astimezone(get_display_timezone())
+    date_iso = local_dt.strftime("%Y-%m-%d")
 
     white_rating = game.white_rating if game.white_rating is not None else "?"
     black_rating = game.black_rating if game.black_rating is not None else "?"
@@ -739,7 +742,7 @@ def build_prompt(game: GameInfo, llm_payload: Optional[Mapping[str, Any]] = None
 Context:
 - Player is \"{game.your_color}\" (the user).
 - Opponent: {game.opponent}
-- Date (UTC): {date_iso}
+- Date (display timezone): {date_iso}
 - Ratings (approx): {game.white_username}={white_rating}, {game.black_username}={black_rating}
 - Time control: {game.time_control}
 - Rated: {game.rated}

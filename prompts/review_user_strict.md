@@ -45,6 +45,7 @@ For EACH key position in the payload:
 You MUST NOT:
 - Invent any moves.
 - Mention any move not equal to played_san or best_san.
+- Do NOT suggest any move not present in the payload.
 - Refer to openings, strategy, pawn structure, or positional concepts unless directly implied by tactical_flag or material_change.
 - Paraphrase or reinterpret the label.
 
