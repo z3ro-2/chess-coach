@@ -1328,13 +1328,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
-    args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
-    _apply_provider_runtime_fallback(args)
+    if args.provider == "ollama":
+        args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
+        _apply_provider_runtime_fallback(args)
     logger.info("LLM Provider selected: %s", args.provider)
     if args.provider == "gpt":
         logger.info("Using OpenAI model: %s", args.gpt_model)
     else:
-        logger.info("Using Ollama model: %s  URL: %s", args.ollama_model, args.ollama_url)
+        logger.info("Using Ollama model: %s (URL: %s)", args.ollama_model, args.ollama_url)
     args.out = Path(args.out)
     args.state_db = Path(args.state_db)
     logger.info("SQLite state DB path: %s", args.state_db)
