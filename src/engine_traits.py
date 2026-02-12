@@ -10,6 +10,9 @@ from typing import Any, Dict, Iterable, Mapping, Sequence
 
 NEUTRAL_SCORE = 50
 _LABEL_KEYS = ("good", "inaccuracy", "mistake", "blunder", "brilliant")
+LOW_VOLUME_MOVE_CAP = 50
+LOW_VOLUME_SCORE_MAX = 80
+ERROR_PRESENT_SCORE_MAX = 95
 
 
 @dataclass(frozen=True)
@@ -261,9 +264,16 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         "defensive_resilience": _clamp_score(defensive_raw),
         "blunder_frequency": _clamp_score(blunder_raw),
     }
+    total_errors = int(window.total_inaccuracy + window.total_mistake + window.total_blunder)
+    scores, guardrails = _apply_score_guardrails(
+        scores,
+        total_errors=total_errors,
+        total_moves=int(window.total_moves),
+    )
     components = {
         "coverage": round(coverage, 4),
         "missing_primary_data": bool(window.primary_games < window.payload_count),
+        "guardrails": guardrails,
         "window_totals": {
             "payload_count": int(window.payload_count),
             "primary_games": int(window.primary_games),
@@ -314,6 +324,31 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         },
     }
     return scores, components
+
+
+def _apply_score_guardrails(
+    scores: Mapping[str, int],
+    *,
+    total_errors: int,
+    total_moves: int,
+) -> tuple[Dict[str, int], Dict[str, Any]]:
+    max_allowed = 100
+    if int(total_errors) > 0:
+        max_allowed = min(max_allowed, ERROR_PRESENT_SCORE_MAX)
+    if int(total_moves) < LOW_VOLUME_MOVE_CAP:
+        max_allowed = min(max_allowed, LOW_VOLUME_SCORE_MAX)
+
+    capped_scores: Dict[str, int] = {}
+    for key, value in scores.items():
+        capped_scores[str(key)] = int(min(max_allowed, int(value)))
+    return capped_scores, {
+        "total_errors": int(total_errors),
+        "total_moves": int(total_moves),
+        "low_volume_threshold_moves": int(LOW_VOLUME_MOVE_CAP),
+        "error_cap_applied": bool(int(total_errors) > 0),
+        "low_volume_cap_applied": bool(int(total_moves) < LOW_VOLUME_MOVE_CAP),
+        "max_allowed_score": int(max_allowed),
+    }
 
 
 def _coverage_blend(raw_score: float, coverage: float) -> float:

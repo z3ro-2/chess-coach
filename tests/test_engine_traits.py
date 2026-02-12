@@ -242,3 +242,41 @@ def test_adding_more_blunders_monotonically_decreases_window_scores() -> None:
     assert noisier_scores["tactical_awareness"] < base_scores["tactical_awareness"]
     assert noisier_scores["material_discipline"] < base_scores["material_discipline"]
     assert noisier_scores["blunder_frequency"] < base_scores["blunder_frequency"]
+
+
+def test_errors_present_prevent_perfect_hundred_scores() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=1000,
+            total_plies=2000,
+            label_counts={"good": 999, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+            key_positions=[],
+        )
+    ]
+    scores = compute_engine_trait_scores(payloads)
+    assert max(scores.values()) <= 95
+    assert scores["tactical_awareness"] == 95
+    assert scores["material_discipline"] == 95
+    assert scores["conversion_ability"] == 95
+    assert scores["blunder_frequency"] == 95
+
+
+def test_low_volume_caps_scores_to_eighty() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=40,
+            total_plies=80,
+            label_counts={"good": 40, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+            key_positions=[],
+        )
+    ]
+    scores = compute_engine_trait_scores(payloads)
+    assert max(scores.values()) <= 80
+    assert scores["tactical_awareness"] == 80
+    assert scores["material_discipline"] == 80
+    assert scores["conversion_ability"] == 80
+    assert scores["blunder_frequency"] == 80

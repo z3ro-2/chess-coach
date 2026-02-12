@@ -213,7 +213,7 @@ def test_trait_scoring_logic_correctness_with_fixture(predictable_key_payloads) 
     assert scores == {
         "tactical_awareness": 58,
         "material_discipline": 64,
-        "conversion_ability": 100,
+        "conversion_ability": 95,
         "defensive_resilience": 75,
         "blunder_frequency": 80,
     }
@@ -238,9 +238,9 @@ def test_rolling_window_summary_results_use_expected_window(monkeypatch, tmp_pat
     assert scores == {
         "tactical_awareness": 70,
         "material_discipline": 76,
-        "conversion_ability": 100,
-        "defensive_resilience": 92,
-        "blunder_frequency": 88,
+        "conversion_ability": 80,
+        "defensive_resilience": 80,
+        "blunder_frequency": 80,
     }
 
 
