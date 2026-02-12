@@ -54,6 +54,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import requests
 from analysis_pipeline import run_analysis_pipeline
+from engine.payload_schema import (
+    ENGINE_PAYLOAD_SCHEMA_VERSION,
+    enrich_summary_with_player_fields,
+    validate_engine_payload,
+)
 from src.commands import list_command_names, run_command
 from src.config.provider_config import get_provider, set_provider
 from src.config.output_paths import get_output_root
@@ -298,6 +303,44 @@ def _engine_payload_exists(conn: sqlite3.Connection, game_url: str) -> bool:
     return row is not None
 
 
+def _load_engine_payload(conn: sqlite3.Connection, game_url: str) -> Dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT payload_json FROM engine_payloads WHERE game_url = ?",
+        (str(game_url),),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        loaded = json.loads(str(row[0]))
+    except Exception:
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    return loaded
+
+
+def _stored_engine_payload_is_reusable(conn: sqlite3.Connection, game_url: str) -> bool:
+    loaded = _load_engine_payload(conn, game_url)
+    if loaded is None:
+        return False
+    validation = validate_engine_payload(
+        loaded,
+        require_schema_version=True,
+        require_player_fields=True,
+        require_key_positions=False,
+    )
+    if validation.is_valid:
+        return True
+    logger.warning(
+        "Re-deriving engine payload for %s: schema=%s expected=%s errors=%s",
+        str(game_url),
+        int(validation.schema_version),
+        int(ENGINE_PAYLOAD_SCHEMA_VERSION),
+        ",".join(validation.errors),
+    )
+    return False
+
+
 def _store_engine_payload(
     conn: sqlite3.Connection,
     *,
@@ -516,7 +559,7 @@ def _load_recent_game_reviews_for_traits(
 ) -> List[Dict[str, Any]]:
     cur = conn.execute(
         """
-        SELECT payload_json
+        SELECT game_url, payload_json
         FROM engine_payloads
         ORDER BY end_time DESC, game_url DESC
         LIMIT ?
@@ -524,13 +567,28 @@ def _load_recent_game_reviews_for_traits(
         (max(1, int(limit)),),
     )
     payloads: List[Dict[str, Any]] = []
-    for (payload_json,) in cur.fetchall():
+    for game_url, payload_json in cur.fetchall():
         try:
             loaded = json.loads(str(payload_json))
         except Exception:
             continue
-        if isinstance(loaded, dict):
-            payloads.append(loaded)
+        if not isinstance(loaded, dict):
+            continue
+        validation = validate_engine_payload(
+            loaded,
+            require_schema_version=True,
+            require_player_fields=True,
+            require_key_positions=False,
+        )
+        if not validation.is_valid:
+            logger.error(
+                "Ignoring stale/invalid engine payload for trait window game_url=%s schema=%s errors=%s",
+                str(game_url),
+                int(validation.schema_version),
+                ",".join(validation.errors),
+            )
+            continue
+        payloads.append(loaded)
     return payloads
 
 
@@ -549,13 +607,24 @@ def _analyze_game_with_stockfish(*, game: GameInfo, args: argparse.Namespace) ->
         depth=int(getattr(args, "engine_depth", 15) or 15),
     )
     engine_output = oracle.analyze_game(str(getattr(game, "pgn", "") or ""))
-    game_summary = dict(engine_output.get("game_summary") or {})
-    game_summary["your_color"] = game.your_color
+    game_summary = enrich_summary_with_player_fields(
+        dict(engine_output.get("game_summary") or {}),
+        your_color=str(game.your_color),
+    )
     game_summary["result"] = game.result
-    return {
+    payload = {
         "game_summary": game_summary,
         "key_positions": list(engine_output.get("key_positions") or []),
     }
+    validation = validate_engine_payload(
+        payload,
+        require_schema_version=True,
+        require_player_fields=True,
+        require_key_positions=True,
+    )
+    if not validation.is_valid:
+        raise RuntimeError(f"Stockfish payload invariants failed: {';'.join(validation.errors)}")
+    return payload
 
 
 def _load_engine_payloads_for_trait_window(
@@ -581,6 +650,20 @@ def _payload_total_moves(payload: Mapping[str, Any]) -> int:
     summary = payload.get("game_summary")
     if not isinstance(summary, Mapping):
         return 0
+    player_total_plies = 0
+    try:
+        player_total_plies = int(summary.get("player_total_plies", 0) or 0)
+    except Exception:
+        player_total_plies = 0
+    if player_total_plies > 0:
+        return player_total_plies
+    player_total_moves = 0
+    try:
+        player_total_moves = int(summary.get("player_total_moves", 0) or 0)
+    except Exception:
+        player_total_moves = 0
+    if player_total_moves > 0:
+        return player_total_moves
     total_moves = 0
     try:
         total_moves = int(summary.get("total_moves", 0) or 0)
@@ -1388,7 +1471,7 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         logger.error("Stockfish failure: %s", exc)
         try:
             send_telegram_message(
-                f"❌ Engine failure for {game.game_url}\nStockfish could not produce analysis.",
+                f"❌ Engine failure for {game.game_url}\nStockfish could not produce analysis.\nReason: {str(exc)[:300]}",
                 bot_token=str(getattr(args, "telegram_bot_token", "") or ""),
                 chat_id=str(getattr(args, "telegram_chat_id", "") or ""),
                 timeout=int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
@@ -1498,12 +1581,16 @@ def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str
     games, fetched_count = _select_backfill_games(args)
     processed_games = 0
     engine_analyses = 0
+    stale_payloads_rederived = 0
 
     for game in games:
-        if _engine_payload_exists(conn, game.game_url):
+        payload_reusable = _stored_engine_payload_is_reusable(conn, game.game_url)
+        if payload_reusable:
             _upsert_backfill_processed_records(conn, game=game, args=args)
             processed_games += 1
             continue
+        if _engine_payload_exists(conn, game.game_url):
+            stale_payloads_rederived += 1
         payload = _analyze_game_with_stockfish(game=game, args=args)
         inserted = _store_engine_payload(
             conn,
@@ -1529,6 +1616,7 @@ def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str
         "games_analyzed_with_stockfish": engine_analyses,
         "games_processed": processed_games,
         "engine_analyses": engine_analyses,
+        "stale_payloads_rederived": stale_payloads_rederived,
         "trait_scores": trait_scores,
     }
 

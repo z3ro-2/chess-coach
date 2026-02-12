@@ -12,6 +12,11 @@ from types import SimpleNamespace
 from typing import Any, Dict, Mapping
 
 from analysis_pipeline import _run_stockfish_oracle
+from engine.payload_schema import (
+    ENGINE_PAYLOAD_SCHEMA_VERSION,
+    enrich_summary_with_player_fields,
+    validate_engine_payload,
+)
 from chess_review import fetch_recent_games, parse_game
 
 logger = logging.getLogger(__name__)
@@ -46,8 +51,7 @@ def backfill_recent_games(conn: sqlite3.Connection, username: str, limit: int) -
     engine_analyses = 0
     stored = 0
     for game in selected_games:
-        payload_exists = _engine_payload_exists(conn, game.game_url)
-        if payload_exists:
+        if _stored_engine_payload_is_reusable(conn, game.game_url):
             # Strict idempotency invariant: existing payloads are never re-analyzed.
             _upsert_processed_game(conn, game=game, engine_depth=int(args.engine_depth))
             _upsert_processed_game_meta(conn, game=game)
@@ -55,22 +59,34 @@ def backfill_recent_games(conn: sqlite3.Connection, username: str, limit: int) -
             continue
 
         # Re-check immediately before running Stockfish to guard against accidental
-        # re-analysis if the payload appears between checks.
-        if _engine_payload_exists(conn, game.game_url):
+        # re-analysis if a reusable payload appears between checks.
+        if _stored_engine_payload_is_reusable(conn, game.game_url):
             raise AssertionError(
                 f"Backfill idempotency invariant violated for {game.game_url}: "
-                "engine payload exists before Stockfish invocation."
+                "reusable engine payload exists before Stockfish invocation."
             )
         engine_output = _run_stockfish_oracle(game=game, args=args, logger=logger)
         if engine_output is None:
             raise RuntimeError(f"Stockfish engine failed for game {game.game_url}")
 
         payload = {
-            "game_summary": dict(engine_output.get("game_summary") or {}),
+            "game_summary": enrich_summary_with_player_fields(
+                dict(engine_output.get("game_summary") or {}),
+                your_color=str(game.your_color),
+            ),
             "key_positions": list(engine_output.get("key_positions") or []),
         }
-        payload["game_summary"]["your_color"] = game.your_color
         payload["game_summary"]["result"] = game.result
+        validation = validate_engine_payload(
+            payload,
+            require_schema_version=True,
+            require_player_fields=True,
+            require_key_positions=True,
+        )
+        if not validation.is_valid:
+            raise RuntimeError(
+                f"Stockfish payload invariants failed for {game.game_url}: {';'.join(validation.errors)}"
+            )
 
         _upsert_processed_game(conn, game=game, engine_depth=int(args.engine_depth))
         _upsert_processed_game_meta(conn, game=game)
@@ -163,6 +179,34 @@ def _ensure_backfill_tables(conn: sqlite3.Connection) -> None:
 def _engine_payload_exists(conn: sqlite3.Connection, game_url: str) -> bool:
     row = conn.execute("SELECT 1 FROM engine_payloads WHERE game_url = ?", (str(game_url),)).fetchone()
     return row is not None
+
+
+def _stored_engine_payload_is_reusable(conn: sqlite3.Connection, game_url: str) -> bool:
+    payload_json = _load_engine_payload_json(conn, game_url)
+    if payload_json is None:
+        return False
+    try:
+        payload = json.loads(payload_json)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    validation = validate_engine_payload(
+        payload,
+        require_schema_version=True,
+        require_player_fields=True,
+        require_key_positions=False,
+    )
+    if validation.is_valid:
+        return True
+    logger.warning(
+        "Re-deriving stale engine payload for %s: schema=%s expected=%s errors=%s",
+        str(game_url),
+        int(validation.schema_version),
+        int(ENGINE_PAYLOAD_SCHEMA_VERSION),
+        ",".join(validation.errors),
+    )
+    return False
 
 
 def _load_engine_payload_json(conn: sqlite3.Connection, game_url: str) -> str | None:

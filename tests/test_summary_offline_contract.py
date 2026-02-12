@@ -9,6 +9,7 @@ import pytest
 import chess_review
 from src.config.provider_config import set_provider
 from src.engine_traits import compute_engine_trait_scores
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION
 
 
 def _section_lines(markdown: str, heading: str) -> list[str]:
@@ -55,6 +56,48 @@ def _assert_strict_summary_format(markdown: str) -> None:
     assert len(training_lines) == 3
 
 
+def _payload_v2(
+    *,
+    your_color: str,
+    result: str,
+    total_moves: int,
+    player_label_counts: dict[str, int],
+    key_positions: list[dict],
+) -> dict:
+    total_plies = int(total_moves) * 2
+    player_total_plies = int(total_moves)
+    if sum(int(v) for v in player_label_counts.values()) != player_total_plies:
+        raise AssertionError("player_label_counts must sum to total_moves for fixture payloads")
+    opponent_counts = {
+        "good": player_total_plies,
+        "inaccuracy": 0,
+        "mistake": 0,
+        "blunder": 0,
+        "brilliant": 0,
+    }
+    by_side = (
+        {"white": dict(player_label_counts), "black": opponent_counts}
+        if your_color == "white"
+        else {"white": opponent_counts, "black": dict(player_label_counts)}
+    )
+    merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in player_label_counts}
+    return {
+        "game_summary": {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "your_color": your_color,
+            "result": result,
+            "total_moves": int(total_moves),
+            "total_plies": int(total_plies),
+            "player_total_plies": int(player_total_plies),
+            "player_total_moves": int(player_total_plies),
+            "player_label_counts": dict(player_label_counts),
+            "label_counts_by_side": by_side,
+            "label_counts": merged,
+        },
+        "key_positions": key_positions,
+    }
+
+
 @pytest.fixture
 def known_recent_meta() -> list[tuple[int, str, str, int | None, str]]:
     # 2 wins, 1 loss, 1 draw for white => 50.0 / 25.0 / 25.0
@@ -70,45 +113,36 @@ def known_recent_meta() -> list[tuple[int, str, str, int | None, str]]:
 def predictable_key_payloads() -> list[dict]:
     # Deterministic expected scores with label_counts + total_plies primary signals.
     return [
-        {
-            "game_summary": {
-                "your_color": "white",
-                "result": "1-0",
-                "total_moves": 20,
-                "total_plies": 40,
-                "label_counts": {"good": 14, "inaccuracy": 3, "mistake": 2, "blunder": 1, "brilliant": 0},
-            },
-            "key_positions": [
+        _payload_v2(
+            your_color="white",
+            result="1-0",
+            total_moves=20,
+            player_label_counts={"good": 14, "inaccuracy": 3, "mistake": 2, "blunder": 1, "brilliant": 0},
+            key_positions=[
                 {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 3},
                 {"player": "White", "move_number": 5, "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -2},
                 {"player": "White", "move_number": 6, "label": "mistake", "tactical_flag": "tactical_miss", "material_change": -1},
             ],
-        },
-        {
-            "game_summary": {
-                "your_color": "white",
-                "result": "1/2-1/2",
-                "total_moves": 20,
-                "total_plies": 40,
-                "label_counts": {"good": 17, "inaccuracy": 2, "mistake": 1, "blunder": 0, "brilliant": 0},
-            },
-            "key_positions": [
+        ),
+        _payload_v2(
+            your_color="white",
+            result="1/2-1/2",
+            total_moves=20,
+            player_label_counts={"good": 17, "inaccuracy": 2, "mistake": 1, "blunder": 0, "brilliant": 0},
+            key_positions=[
                 {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 4},
                 {"player": "White", "move_number": 10, "label": "good", "tactical_flag": "none", "material_change": -4},
             ],
-        },
-        {
-            "game_summary": {
-                "your_color": "white",
-                "result": "0-1",
-                "total_moves": 10,
-                "total_plies": 20,
-                "label_counts": {"good": 6, "inaccuracy": 1, "mistake": 2, "blunder": 1, "brilliant": 0},
-            },
-            "key_positions": [
+        ),
+        _payload_v2(
+            your_color="white",
+            result="0-1",
+            total_moves=10,
+            player_label_counts={"good": 6, "inaccuracy": 1, "mistake": 2, "blunder": 1, "brilliant": 0},
+            key_positions=[
                 {"player": "White", "move_number": 3, "label": "blunder", "tactical_flag": "tactical_miss", "material_change": -5},
             ],
-        },
+        ),
     ]
 
 
@@ -211,11 +245,11 @@ def test_player_summary_math_correctness_with_fixture(known_recent_meta) -> None
 def test_trait_scoring_logic_correctness_with_fixture(predictable_key_payloads) -> None:
     scores = compute_engine_trait_scores(predictable_key_payloads)
     assert scores == {
-        "tactical_awareness": 40,
-        "material_discipline": 64,
+        "tactical_awareness": 60,
+        "material_discipline": 74,
         "conversion_ability": 90,
-        "defensive_resilience": 75,
-        "blunder_frequency": 80,
+        "defensive_resilience": 83,
+        "blunder_frequency": 84,
     }
 
 
@@ -236,8 +270,8 @@ def test_rolling_window_summary_results_use_expected_window(monkeypatch, tmp_pat
 
     assert seen["window_size"] == 2
     assert scores == {
-        "tactical_awareness": 59,
-        "material_discipline": 76,
+        "tactical_awareness": 72,
+        "material_discipline": 80,
         "conversion_ability": 80,
         "defensive_resilience": 80,
         "blunder_frequency": 80,

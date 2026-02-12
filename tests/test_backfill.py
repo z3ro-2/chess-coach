@@ -6,6 +6,7 @@ import sqlite3
 import backfill as backfill_module
 import chess_review
 import pytest
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION
 
 
 def _raw_game(*, game_id: int, end_time: int, result: str = "1-0") -> dict:
@@ -24,6 +25,40 @@ def _raw_game(*, game_id: int, end_time: int, result: str = "1-0") -> dict:
         "rules": "chess",
         "white": {"username": "logan", "rating": 1200},
         "black": {"username": "opponent", "rating": 1190},
+    }
+
+
+def _oracle_output_for_game(
+    *,
+    player_color: str = "white",
+    player_counts: dict[str, int] | None = None,
+) -> dict:
+    if player_counts is None:
+        player_counts = {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0}
+    opponent_counts = {"good": 20, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0}
+    side_counts = (
+        {"white": dict(player_counts), "black": dict(opponent_counts)}
+        if player_color == "white"
+        else {"white": dict(opponent_counts), "black": dict(player_counts)}
+    )
+    merged = {k: int(side_counts["white"][k]) + int(side_counts["black"][k]) for k in player_counts}
+    return {
+        "game_summary": {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "engine_depth": 12,
+            "total_plies": 40,
+            "total_moves": 20,
+            "label_counts_by_side": side_counts,
+            "label_counts": merged,
+            "forced_mate_events": 0,
+            "illegal_moves": 0,
+        },
+        "key_positions": [
+            {"move_number": 1, "player": "White", "label": "good", "tactical_flag": "none", "material_change": 0},
+            {"move_number": 1, "player": "Black", "label": "good", "tactical_flag": "none", "material_change": 0},
+            {"move_number": 2, "player": "White", "label": "inaccuracy", "tactical_flag": "none", "material_change": 0},
+            {"move_number": 2, "player": "Black", "label": "good", "tactical_flag": "none", "material_change": 0},
+        ],
     }
 
 
@@ -47,10 +82,7 @@ def test_backfill_adds_expected_records_when_db_initially_empty(monkeypatch, con
     monkeypatch.setattr(
         backfill_module,
         "_run_stockfish_oracle",
-        lambda **kwargs: {
-            "game_summary": {"result": kwargs["game"].result, "total_moves": 20},
-            "key_positions": [{"move_number": 1, "player": "White", "label": "good"}],
-        },
+        lambda **kwargs: _oracle_output_for_game(player_color=kwargs["game"].your_color),
     )
 
     result = backfill_module.backfill_recent_games(conn, username="logan", limit=10)
@@ -83,7 +115,50 @@ def test_backfill_does_not_reanalyze_already_stored_games(monkeypatch, conn) -> 
             1_706_000_200,
             1_706_000_200,
             12,
-            json.dumps({"game_summary": {"result": "1-0"}, "key_positions": []}),
+            json.dumps(
+                {
+                    "game_summary": {
+                        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+                        "your_color": "white",
+                        "result": "1-0",
+                        "total_plies": 40,
+                        "total_moves": 20,
+                        "player_total_plies": 20,
+                        "player_total_moves": 20,
+                        "player_label_counts": {
+                            "good": 15,
+                            "inaccuracy": 3,
+                            "mistake": 1,
+                            "blunder": 1,
+                            "brilliant": 0,
+                        },
+                        "label_counts_by_side": {
+                            "white": {
+                                "good": 15,
+                                "inaccuracy": 3,
+                                "mistake": 1,
+                                "blunder": 1,
+                                "brilliant": 0,
+                            },
+                            "black": {
+                                "good": 20,
+                                "inaccuracy": 0,
+                                "mistake": 0,
+                                "blunder": 0,
+                                "brilliant": 0,
+                            },
+                        },
+                        "label_counts": {
+                            "good": 35,
+                            "inaccuracy": 3,
+                            "mistake": 1,
+                            "blunder": 1,
+                            "brilliant": 0,
+                        },
+                    },
+                    "key_positions": [],
+                }
+            ),
         ),
     )
     conn.commit()
@@ -100,7 +175,7 @@ def test_backfill_does_not_reanalyze_already_stored_games(monkeypatch, conn) -> 
 
     def _fake_oracle(**_kwargs):
         calls["count"] += 1
-        return {"game_summary": {"result": "1-0", "total_moves": 20}, "key_positions": []}
+        return _oracle_output_for_game(player_color="white")
 
     monkeypatch.setattr(backfill_module, "_run_stockfish_oracle", _fake_oracle)
 
@@ -133,7 +208,7 @@ def test_backfill_raises_when_engine_fails(monkeypatch, conn) -> None:
         calls["count"] += 1
         # First game succeeds and should commit; second fails and should raise.
         if kwargs["game"].game_url.endswith("/2"):
-            return {"game_summary": {"result": "1-0", "total_moves": 20}, "key_positions": []}
+            return _oracle_output_for_game(player_color=kwargs["game"].your_color)
         return None
 
     monkeypatch.setattr(backfill_module, "_run_stockfish_oracle", _failing_oracle)
@@ -167,7 +242,7 @@ def test_backfill_respects_limit(monkeypatch, conn) -> None:
 
     def _fake_oracle(**_kwargs):
         calls["count"] += 1
-        return {"game_summary": {"result": "1-0", "total_moves": 20}, "key_positions": []}
+        return _oracle_output_for_game(player_color="white")
 
     monkeypatch.setattr(backfill_module, "_run_stockfish_oracle", _fake_oracle)
 
@@ -200,10 +275,7 @@ def test_backfill_rerun_does_not_duplicate_rows(monkeypatch, conn) -> None:
 
     def _fake_oracle(**kwargs):
         calls["count"] += 1
-        return {
-            "game_summary": {"result": kwargs["game"].result, "total_moves": 20},
-            "key_positions": [{"move_number": 1, "player": "White", "label": "good"}],
-        }
+        return _oracle_output_for_game(player_color=kwargs["game"].your_color)
 
     monkeypatch.setattr(backfill_module, "_run_stockfish_oracle", _fake_oracle)
 
@@ -310,7 +382,21 @@ def test_print_backfill_summary_uses_run_backfill_counts(monkeypatch, tmp_path, 
         chess_review,
         "_analyze_game_with_stockfish",
         lambda **kwargs: {
-            "game_summary": {"your_color": kwargs["game"].your_color, "result": kwargs["game"].result, "total_moves": 20},
+            "game_summary": {
+                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+                "your_color": kwargs["game"].your_color,
+                "result": kwargs["game"].result,
+                "total_plies": 40,
+                "total_moves": 20,
+                "player_total_plies": 20,
+                "player_total_moves": 20,
+                "player_label_counts": {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                "label_counts_by_side": {
+                    "white": {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                    "black": {"good": 20, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+                },
+                "label_counts": {"good": 35, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+            },
             "key_positions": [],
         },
     )

@@ -5,6 +5,8 @@ from __future__ import annotations
 from io import StringIO
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION, empty_label_counts
+
 try:
     import chess
     import chess.engine
@@ -73,6 +75,10 @@ class StockfishOracle:
             "mistake": 0,
             "blunder": 0,
         }
+        label_counts_by_side: Dict[str, Dict[str, int]] = {
+            "white": empty_label_counts(),
+            "black": empty_label_counts(),
+        }
         forced_mate_events = 0
         illegal_moves = 0
 
@@ -136,6 +142,8 @@ class StockfishOracle:
                     played_is_best_move=bool(best_move == move),
                 )
                 label_counts[label] = label_counts.get(label, 0) + 1
+                side_key = "white" if mover_color == chess.WHITE else "black"
+                label_counts_by_side[side_key][label] = int(label_counts_by_side[side_key].get(label, 0)) + 1
                 abs_eval_swing = abs(eval_after - eval_before)
 
                 forcing = bool(is_capture or gives_check or is_promotion or mate_threat)
@@ -172,11 +180,13 @@ class StockfishOracle:
 
         return {
             "game_summary": {
+                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
                 "result": game.headers.get("Result", "*"),
                 "engine_depth": self._depth,
                 "total_plies": len(mainline_moves),
                 "total_moves": (len(mainline_moves) + 1) // 2,
                 "label_counts": label_counts,
+                "label_counts_by_side": label_counts_by_side,
                 "forced_mate_events": forced_mate_events,
                 "illegal_moves": illegal_moves,
             },

@@ -5,11 +5,16 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 SAFE_GAME_SUMMARY_KEYS: Sequence[str] = (
+    "schema_version",
     "engine_depth",
     "result",
     "total_plies",
     "total_moves",
+    "player_total_plies",
+    "player_total_moves",
     "label_counts",
+    "player_label_counts",
+    "label_counts_by_side",
     "forced_mate_events",
     "illegal_moves",
     "date_utc",
@@ -27,6 +32,11 @@ def build_llm_safe_payload(
     game_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     raw_summary = dict(engine_output.get("game_summary") or {})
+    # For review text, expose only player-scoped counts under `label_counts`.
+    player_label_counts = raw_summary.get("player_label_counts")
+    if isinstance(player_label_counts, Mapping):
+        raw_summary["label_counts"] = dict(player_label_counts)
+
     game_summary = {key: raw_summary.get(key) for key in SAFE_GAME_SUMMARY_KEYS if key in raw_summary}
     if game_context:
         for key in SAFE_GAME_SUMMARY_KEYS:

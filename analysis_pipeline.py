@@ -7,6 +7,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from engine.payload_schema import enrich_summary_with_player_fields, validate_engine_payload
 from llm.safe_payload import build_llm_safe_payload
 from src.utils.timezone import get_display_timezone
 
@@ -29,6 +30,26 @@ def run_analysis_pipeline(
     engine_output = _run_stockfish_oracle(game=game, args=args, logger=logger)
     if engine_output is None:
         raise RuntimeError("Stockfish engine failed or produced no output.")
+
+    summary = dict(engine_output.get("game_summary") or {})
+    summary = enrich_summary_with_player_fields(
+        summary,
+        your_color=str(getattr(game, "your_color", "") or ""),
+    )
+    summary["result"] = getattr(game, "result", None)
+    engine_output = {
+        "game_summary": summary,
+        "key_positions": list(engine_output.get("key_positions") or []),
+    }
+    validation = validate_engine_payload(
+        engine_output,
+        require_schema_version=True,
+        require_player_fields=True,
+        require_key_positions=True,
+    )
+    if not validation.is_valid:
+        detail = ";".join(validation.errors)
+        raise RuntimeError(f"Stockfish payload invariants failed: {detail}")
 
     llm_payload = build_llm_safe_payload(
         engine_output,

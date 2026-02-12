@@ -10,6 +10,7 @@ import pytest
 import chess_review
 import analysis_pipeline as pipeline_module
 from analysis_pipeline import run_analysis_pipeline
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION
 from engine.stockfish_oracle import StockfishOracle, _score_to_pawns, classify_move
 from llm.safe_payload import build_llm_safe_payload
 
@@ -269,9 +270,16 @@ def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch)
         "_run_stockfish_oracle",
         lambda **_kwargs: {
             "game_summary": {
+                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
                 "engine_depth": 15,
                 "result": "1-0",
+                "total_plies": 4,
                 "total_moves": 2,
+                "label_counts_by_side": {
+                    "white": {"good": 1, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+                    "black": {"good": 2, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+                },
+                "label_counts": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
                 "forced_mate_events": 0,
                 "illegal_moves": 0,
             },
@@ -309,9 +317,16 @@ def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
         "_run_stockfish_oracle",
         lambda **_kwargs: {
             "game_summary": {
+                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
                 "engine_depth": 15,
                 "result": "1-0",
+                "total_plies": 4,
                 "total_moves": 2,
+                "label_counts_by_side": {
+                    "white": {"good": 1, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+                    "black": {"good": 2, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+                },
+                "label_counts": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
                 "forced_mate_events": 0,
                 "illegal_moves": 0,
             },

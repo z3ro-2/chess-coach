@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import chess_review
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION
 from src.engine_traits import compute_engine_trait_scores
 
 
@@ -15,6 +16,44 @@ def _backfill_args(tmp_path) -> SimpleNamespace:
         state_db=tmp_path / "state.sqlite",
         out=tmp_path / "output",
     )
+
+
+def _payload_v2(
+    *,
+    your_color: str,
+    result: str,
+    total_moves: int,
+    player_label_counts: dict[str, int],
+) -> dict:
+    total_plies = int(total_moves) * 2
+    opponent_counts = {
+        "good": int(total_moves),
+        "inaccuracy": 0,
+        "mistake": 0,
+        "blunder": 0,
+        "brilliant": 0,
+    }
+    by_side = (
+        {"white": dict(player_label_counts), "black": opponent_counts}
+        if your_color == "white"
+        else {"white": opponent_counts, "black": dict(player_label_counts)}
+    )
+    merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in player_label_counts}
+    return {
+        "game_summary": {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "your_color": your_color,
+            "result": result,
+            "total_moves": int(total_moves),
+            "total_plies": int(total_plies),
+            "player_total_plies": int(total_moves),
+            "player_total_moves": int(total_moves),
+            "player_label_counts": dict(player_label_counts),
+            "label_counts_by_side": by_side,
+            "label_counts": merged,
+        },
+        "key_positions": [],
+    }
 
 
 def test_backfill_mode_never_calls_llm_polling_telegram_or_markdown(monkeypatch, tmp_path, capsys) -> None:
@@ -79,16 +118,12 @@ def test_trait_window_recompute_uses_only_stored_payloads(monkeypatch, tmp_path)
             game_url="https://www.chess.com/game/live/999",
             end_time=1_706_000_999,
             engine_depth=15,
-            payload={
-                "game_summary": {
-                    "your_color": "white",
-                    "result": "1-0",
-                    "total_moves": 60,
-                    "total_plies": 120,
-                    "label_counts": {"good": 56, "inaccuracy": 2, "mistake": 1, "blunder": 1, "brilliant": 0},
-                },
-                "key_positions": [],
-            },
+            payload=_payload_v2(
+                your_color="white",
+                result="1-0",
+                total_moves=60,
+                player_label_counts={"good": 56, "inaccuracy": 2, "mistake": 1, "blunder": 1, "brilliant": 0},
+            ),
         )
         monkeypatch.setattr(
             chess_review,
@@ -106,26 +141,18 @@ def test_trait_window_recompute_uses_only_stored_payloads(monkeypatch, tmp_path)
 def test_trait_scores_respect_global_caps_and_non_negative_bounds() -> None:
     scores = compute_engine_trait_scores(
         [
-            {
-                "game_summary": {
-                    "your_color": "white",
-                    "result": "1-0",
-                    "total_moves": 40,
-                    "total_plies": 80,
-                    "label_counts": {"good": 40, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
-                },
-                "key_positions": [],
-            },
-            {
-                "game_summary": {
-                    "your_color": "white",
-                    "result": "0-1",
-                    "total_moves": 1000,
-                    "total_plies": 2000,
-                    "label_counts": {"good": 940, "inaccuracy": 20, "mistake": 30, "blunder": 10, "brilliant": 0},
-                },
-                "key_positions": [],
-            },
+            _payload_v2(
+                your_color="white",
+                result="1-0",
+                total_moves=40,
+                player_label_counts={"good": 40, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+            ),
+            _payload_v2(
+                your_color="white",
+                result="0-1",
+                total_moves=1000,
+                player_label_counts={"good": 940, "inaccuracy": 20, "mistake": 30, "blunder": 10, "brilliant": 0},
+            ),
         ]
     )
 

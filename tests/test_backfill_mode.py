@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import chess_review
 import pytest
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION
 
 
 def _raw_game(*, game_id: int, end_time: int, result: str = "1-0") -> dict:
@@ -50,6 +51,32 @@ def _parsed_games(raw_games: list[dict]) -> list[chess_review.GameInfo]:
     return parsed
 
 
+def _backfill_payload_for_game(game: chess_review.GameInfo) -> dict:
+    player_counts = {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0}
+    opponent_counts = {"good": 20, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0}
+    by_side = (
+        {"white": dict(player_counts), "black": dict(opponent_counts)}
+        if game.your_color == "white"
+        else {"white": dict(opponent_counts), "black": dict(player_counts)}
+    )
+    merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in player_counts}
+    return {
+        "game_summary": {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "your_color": game.your_color,
+            "result": game.result,
+            "total_plies": 40,
+            "total_moves": 20,
+            "player_total_plies": 20,
+            "player_total_moves": 20,
+            "player_label_counts": player_counts,
+            "label_counts_by_side": by_side,
+            "label_counts": merged,
+        },
+        "key_positions": [],
+    }
+
+
 def test_backfill_runs_without_llm_calls(monkeypatch, tmp_path) -> None:
     args = _args(tmp_path, backfill=2)
     raw_games = [
@@ -64,10 +91,7 @@ def test_backfill_runs_without_llm_calls(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         chess_review,
         "_analyze_game_with_stockfish",
-        lambda **_kwargs: {
-            "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
-            "key_positions": [],
-        },
+        lambda **kwargs: _backfill_payload_for_game(kwargs["game"]),
     )
     monkeypatch.setattr(
         chess_review,
@@ -116,11 +140,9 @@ def test_backfill_invokes_engine_once_per_game_and_stores_payloads(monkeypatch, 
 
     def _fake_analyze(**kwargs):
         calls["count"] += 1
-        game = kwargs["game"]
-        return {
-            "game_summary": {"your_color": game.your_color, "result": game.result, "total_moves": 20},
-            "key_positions": [{"player": "White", "label": "good", "tactical_flag": "none", "material_change": 0}],
-        }
+        payload = _backfill_payload_for_game(kwargs["game"])
+        payload["key_positions"] = [{"player": "White", "label": "good", "tactical_flag": "none", "material_change": 0}]
+        return payload
 
     monkeypatch.setattr(chess_review, "_analyze_game_with_stockfish", _fake_analyze)
 
@@ -157,10 +179,7 @@ def test_backfill_respects_n_when_fewer_games_exist(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(
         chess_review,
         "_analyze_game_with_stockfish",
-        lambda **_kwargs: {
-            "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
-            "key_positions": [],
-        },
+        lambda **kwargs: _backfill_payload_for_game(kwargs["game"]),
     )
 
     conn = chess_review.init_db(args.state_db)
@@ -265,10 +284,7 @@ def test_run_backfill_reports_sane_considered_count_with_large_archives(monkeypa
     monkeypatch.setattr(
         chess_review,
         "_analyze_game_with_stockfish",
-        lambda **kwargs: {
-            "game_summary": {"your_color": kwargs["game"].your_color, "result": kwargs["game"].result, "total_moves": 20},
-            "key_positions": [],
-        },
+        lambda **kwargs: _backfill_payload_for_game(kwargs["game"]),
     )
 
     conn = chess_review.init_db(args.state_db)

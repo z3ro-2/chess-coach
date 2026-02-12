@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import chess_review
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION
 
 
 def _payload(
@@ -13,13 +14,35 @@ def _payload(
     label_counts: dict[str, int],
     key_positions: list[dict],
 ) -> dict:
+    total_plies = int(total_moves) * 2
+    player_total_plies = int(total_moves)
+    if sum(int(v) for v in label_counts.values()) != player_total_plies:
+        raise AssertionError("label_counts must sum to player_total_plies in test payloads")
+    opponent_counts = {
+        "good": player_total_plies,
+        "inaccuracy": 0,
+        "mistake": 0,
+        "blunder": 0,
+        "brilliant": 0,
+    }
+    by_side = (
+        {"white": dict(label_counts), "black": opponent_counts}
+        if your_color == "white"
+        else {"white": opponent_counts, "black": dict(label_counts)}
+    )
+    merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in label_counts}
     return {
         "game_summary": {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "your_color": your_color,
             "result": result,
             "total_moves": total_moves,
-            "total_plies": total_moves * 2,
-            "label_counts": label_counts,
+            "total_plies": total_plies,
+            "player_total_plies": player_total_plies,
+            "player_total_moves": player_total_plies,
+            "player_label_counts": label_counts,
+            "label_counts_by_side": by_side,
+            "label_counts": merged,
         },
         "key_positions": key_positions,
     }
@@ -318,7 +341,7 @@ def test_load_recent_game_reviews_for_traits_has_stable_tiebreak_order(tmp_path)
     assert [str(item["game_summary"]["marker"]) for item in loaded] == ["game-2", "game-1"]
 
 
-def test_trait_window_with_missing_payload_slot_blends_to_neutral_without_reanalysis(monkeypatch, tmp_path) -> None:
+def test_trait_window_with_old_schema_payload_ignores_invalid_row_without_reanalysis(monkeypatch, tmp_path) -> None:
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     monkeypatch.setattr(
         chess_review,
@@ -352,9 +375,9 @@ def test_trait_window_with_missing_payload_slot_blends_to_neutral_without_reanal
         conn.close()
 
     assert scores == {
-        "tactical_awareness": 75,
-        "material_discipline": 75,
-        "conversion_ability": 75,
+        "tactical_awareness": 100,
+        "material_discipline": 100,
+        "conversion_ability": 50,
         "defensive_resilience": 50,
-        "blunder_frequency": 75,
+        "blunder_frequency": 100,
     }
