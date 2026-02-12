@@ -272,3 +272,56 @@ def test_poll_loop_sync_uses_runtime_provider(monkeypatch) -> None:
 
     assert provider == "gpt"
     assert args.provider == "gpt"
+
+
+def test_summary_command_message_includes_trait_scores(monkeypatch, tmp_path) -> None:
+    posted_messages: list[dict] = []
+
+    def _fake_get(url: str, params=None, timeout=0):
+        assert url.endswith("/getUpdates")
+        return _FakeResponse(
+            {
+                "ok": True,
+                "result": [
+                    {"update_id": 501, "message": {"chat": {"id": "42"}, "text": "/summary"}},
+                ],
+            }
+        )
+
+    def _fake_post(url: str, data=None, files=None, timeout=0):
+        posted_messages.append({"url": url, "data": data, "files": files, "timeout": timeout})
+        return _FakeResponse({"ok": True, "result": {}})
+
+    monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
+    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+    monkeypatch.setattr(
+        telegram_commands,
+        "run_command",
+        lambda *_args, **_kwargs: {
+            "text": "Summary generated: /tmp/player_summary.md\nTrait scores (last 20 games): tactical_awareness=90",
+            "file": None,
+        },
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = SimpleNamespace(
+            out=tmp_path / "output",
+            username="logan",
+            provider="ollama",
+            timeout=5,
+            player_summary_every_n=20,
+            player_trait_window=20,
+            ollama_url="http://127.0.0.1:11434",
+            ollama_model="llama3.1:8b",
+            gpt_model="gpt-4o-mini",
+            max_tokens=100,
+            telegram_bot_token="token",
+            telegram_chat_id="42",
+        )
+        handled = telegram_commands.poll_telegram_commands(conn, args)
+    finally:
+        conn.close()
+
+    assert handled == 1
+    assert any("Trait scores" in str(item.get("data", {}).get("text", "")) for item in posted_messages)

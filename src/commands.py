@@ -101,6 +101,7 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         return {"text": "No processed games yet; summary not generated.", "file": None}
 
     cadence = max(1, int(args.player_summary_every_n))
+    trait_window = max(1, int(getattr(args, "player_trait_window", 20) or 20))
     stats_path = app._write_player_stats_markdown(
         conn,
         out_dir=Path(args.out),
@@ -108,18 +109,31 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         recent_games=max(20, cadence),
     )
     recent_meta = app._load_recent_game_meta_for_summary(conn, cadence)
+    trait_scores = app._compute_trait_scores_for_window(conn, args, window_size=trait_window)
+    summary_context = app._load_latest_summary_context(conn)
     summary_md = app._generate_player_summary_markdown(
         args,
         processed_count=processed_count,
         cadence=cadence,
         stats_path=stats_path,
         recent_meta=recent_meta,
+        trait_scores=trait_scores,
+        trait_window_size=trait_window,
+        summary_context=summary_context,
     )
     summary_path = Path(args.out) / "player_summary.md"
     app.write_text(summary_path, summary_md)
     latest_end_time = int(recent_meta[0][0]) if recent_meta else int(time.time())
     app._set_summary_state(conn, processed_count, latest_end_time)
-    return {"text": f"Summary generated: {summary_path}", "file": summary_path}
+    score_line = (
+        f"tactical_awareness={int(trait_scores.get('tactical_awareness', 100) or 100)}, "
+        f"material_discipline={int(trait_scores.get('material_discipline', 100) or 100)}, "
+        f"conversion_ability={int(trait_scores.get('conversion_ability', 100) or 100)}, "
+        f"defensive_resilience={int(trait_scores.get('defensive_resilience', 100) or 100)}, "
+        f"blunder_frequency={int(trait_scores.get('blunder_frequency', 100) or 100)}"
+    )
+    text = f"Summary generated: {summary_path}\nTrait scores (last {trait_window} games): {score_line}"
+    return {"text": text, "file": summary_path}
 
 
 def _health_command(conn: sqlite3.Connection, args: Any) -> CommandResult:

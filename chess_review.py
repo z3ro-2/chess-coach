@@ -450,6 +450,169 @@ def _load_recent_game_meta_for_summary(conn: sqlite3.Connection, limit: int) -> 
     ]
 
 
+def _load_recent_game_reviews_for_traits(
+    conn: sqlite3.Connection,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    cur = conn.execute(
+        """
+        SELECT
+            pg.game_url,
+            pg.end_time,
+            pg.pgn_path,
+            pg.md_path,
+            COALESCE(meta.result, '*') AS result,
+            COALESCE(meta.player_color, '') AS player_color
+        FROM processed_games AS pg
+        LEFT JOIN processed_game_meta AS meta ON meta.game_url = pg.game_url
+        ORDER BY pg.end_time DESC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    rows = cur.fetchall()
+    return [
+        {
+            "game_url": str(r[0]),
+            "end_time": int(r[1]),
+            "pgn_path": str(r[2]),
+            "md_path": str(r[3]),
+            "result": str(r[4]),
+            "player_color": str(r[5]),
+        }
+        for r in rows
+    ]
+
+
+def _load_engine_payloads_for_trait_window(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    *,
+    window_size: int,
+) -> List[Dict[str, Any]]:
+    from engine.stockfish_oracle import StockfishOracle
+
+    reviews = _load_recent_game_reviews_for_traits(conn, window_size)
+    if not reviews:
+        return []
+
+    oracle = StockfishOracle(
+        stockfish_path=str(getattr(args, "stockfish_path", "") or ""),
+        depth=int(getattr(args, "engine_depth", 15) or 15),
+    )
+
+    payloads: List[Dict[str, Any]] = []
+    for review in reviews:
+        pgn_path = Path(str(review.get("pgn_path", "") or ""))
+        if not pgn_path.exists():
+            continue
+        pgn_text = pgn_path.read_text(encoding="utf-8")
+        engine_output = oracle.analyze_game(pgn_text)
+        game_summary = dict(engine_output.get("game_summary") or {})
+        player_color = str(review.get("player_color", "") or "").strip().lower()
+        if player_color in {"white", "black"}:
+            game_summary["your_color"] = player_color
+        result = str(review.get("result", "") or "").strip()
+        if result:
+            game_summary["result"] = result
+        payloads.append(
+            {
+                "game_summary": game_summary,
+                "key_positions": list(engine_output.get("key_positions") or []),
+            }
+        )
+    return payloads
+
+
+def _compute_trait_scores_for_window(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    *,
+    window_size: int,
+) -> Dict[str, int]:
+    from src.engine_traits import compute_engine_trait_scores
+
+    payloads = _load_engine_payloads_for_trait_window(conn, args, window_size=window_size)
+    return compute_engine_trait_scores(payloads)
+
+
+def _load_latest_summary_context(conn: sqlite3.Connection) -> Dict[str, str]:
+    cur = conn.execute(
+        """
+        SELECT
+            pg.end_time,
+            COALESCE(meta.player_color, '') AS player_color,
+            COALESCE(meta.result, '*') AS result,
+            pg.pgn_path
+        FROM processed_games AS pg
+        LEFT JOIN processed_game_meta AS meta ON meta.game_url = pg.game_url
+        ORDER BY pg.end_time DESC
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    if row is None:
+        return {
+            "date_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "your_color": "unknown",
+            "opponent": "unknown",
+            "result": "*",
+        }
+
+    end_time = int(row[0] or int(time.time()))
+    your_color = str(row[1] or "").strip().lower()
+    if your_color not in {"white", "black"}:
+        your_color = "unknown"
+    result = str(row[2] or "*").strip() or "*"
+    opponent = "unknown"
+
+    pgn_path = Path(str(row[3] or "").strip())
+    if pgn_path.exists():
+        try:
+            pgn_text = pgn_path.read_text(encoding="utf-8")
+            white_name = _normalize_username(str(extract_pgn_header(pgn_text, "White") or ""))
+            black_name = _normalize_username(str(extract_pgn_header(pgn_text, "Black") or ""))
+            if your_color == "white" and black_name:
+                opponent = black_name
+            elif your_color == "black" and white_name:
+                opponent = white_name
+        except Exception:
+            pass
+
+    return {
+        "date_utc": datetime.fromtimestamp(end_time, tz=timezone.utc).strftime("%Y-%m-%d"),
+        "your_color": your_color,
+        "opponent": opponent,
+        "result": result,
+    }
+
+
+def _primary_weakness_from_trait_scores(trait_scores: Mapping[str, Any]) -> Dict[str, Any]:
+    keys = [
+        "tactical_awareness",
+        "material_discipline",
+        "conversion_ability",
+        "defensive_resilience",
+        "blunder_frequency",
+    ]
+    labels = {
+        "tactical_awareness": "Tactical Awareness",
+        "material_discipline": "Material Discipline",
+        "conversion_ability": "Conversion Ability",
+        "defensive_resilience": "Defensive Resilience",
+        "blunder_frequency": "Blunder Frequency",
+    }
+    scored = [(key, int(trait_scores.get(key, 100) or 100)) for key in keys]
+    scored.sort(key=lambda item: (item[1], keys.index(item[0])))
+    weakest_key, weakest_score = scored[0]
+    return {
+        "trait_key": weakest_key,
+        "trait_name": labels[weakest_key],
+        "score": weakest_score,
+        "reason": f"Lowest deterministic engine-derived score in the rolling window ({weakest_score}/100).",
+    }
+
+
 def _summary_state(conn: sqlite3.Connection) -> Tuple[int, Optional[int]]:
     cur = conn.execute(
         "SELECT last_summary_processed_count, last_summary_end_time FROM summary_state WHERE id = 1"
@@ -481,48 +644,154 @@ def _set_summary_state(conn: sqlite3.Connection, processed_count: int, last_end_
     conn.commit()
 
 
+def _build_performance_summary(
+    recent_meta: List[Tuple[int, str, str, Optional[int], str]],
+) -> Dict[str, Any]:
+    rows = [(str(result), str(color)) for _, result, color, _, _ in recent_meta]
+    wins, losses, draws = _performance_counts_from_rows(rows)
+    total_games = wins + losses + draws
+    if total_games <= 0:
+        return {
+            "total_games": 0,
+            "wins": wins,
+            "losses": losses,
+            "draws": draws,
+            "win_pct": 0.0,
+            "loss_pct": 0.0,
+            "draw_pct": 0.0,
+        }
+
+    return {
+        "total_games": total_games,
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "win_pct": round(wins / total_games * 100, 1),
+        "loss_pct": round(losses / total_games * 100, 1),
+        "draw_pct": round(draws / total_games * 100, 1),
+    }
+
+
 def _build_player_summary_prompt(
     *,
-    username: str,
-    cadence: int,
-    processed_count: int,
-    stats_markdown: str,
-    recent_meta: List[Tuple[int, str, str, Optional[int], str]],
+    summary_context: Mapping[str, Any],
+    performance_summary: Mapping[str, Any],
+    trait_scores: Mapping[str, Any],
+    primary_weakness: Mapping[str, Any],
 ) -> Tuple[str, str]:
     system_msg = (
-        "You are a chess coach writing a concise player-level progress summary in Markdown. "
-        "Focus on practical human patterns, momentum, and next-step focus."
+        "You are a strict chess summary formatter. "
+        "Use only provided JSON values and return Markdown in the exact requested structure."
     )
-    display_tz = get_display_timezone()
-    game_lines: List[str] = []
-    for end_time, result, color, rating, game_url in recent_meta:
-        dt = datetime.fromtimestamp(end_time, tz=timezone.utc).astimezone(display_tz).strftime("%Y-%m-%d")
-        rating_text = str(rating) if rating is not None else "?"
-        game_lines.append(f"- {dt} | {color} | {result} | rating {rating_text} | {game_url}")
-    recent_games_block = "\n".join(game_lines) if game_lines else "- No recent games found."
+    summary_context_json = json.dumps(
+        {
+            "date_utc": str(summary_context.get("date_utc", "unknown") or "unknown"),
+            "your_color": str(summary_context.get("your_color", "unknown") or "unknown"),
+            "opponent": str(summary_context.get("opponent", "unknown") or "unknown"),
+            "result": str(summary_context.get("result", "*") or "*"),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    performance_summary_json = json.dumps(
+        {
+            "total_games": int(performance_summary.get("total_games", 0) or 0),
+            "wins": int(performance_summary.get("wins", 0) or 0),
+            "losses": int(performance_summary.get("losses", 0) or 0),
+            "draws": int(performance_summary.get("draws", 0) or 0),
+            "win_pct": float(performance_summary.get("win_pct", 0.0) or 0.0),
+            "loss_pct": float(performance_summary.get("loss_pct", 0.0) or 0.0),
+            "draw_pct": float(performance_summary.get("draw_pct", 0.0) or 0.0),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    trait_scores_json = json.dumps(
+        {
+            "tactical_awareness": int(trait_scores.get("tactical_awareness", 100) or 100),
+            "material_discipline": int(trait_scores.get("material_discipline", 100) or 100),
+            "conversion_ability": int(trait_scores.get("conversion_ability", 100) or 100),
+            "defensive_resilience": int(trait_scores.get("defensive_resilience", 100) or 100),
+            "blunder_frequency": int(trait_scores.get("blunder_frequency", 100) or 100),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    primary_weakness_json = json.dumps(
+        {
+            "trait_name": str(primary_weakness.get("trait_name", "Unknown trait") or "Unknown trait"),
+            "score": int(primary_weakness.get("score", 100) or 100),
+            "reason": str(primary_weakness.get("reason", "") or ""),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
-    user_msg = f"""Create a Markdown summary for this player's latest cadence window.
+    user_msg = f"""Format the deterministic player summary.
 
-Player: {username}
-Window size: {cadence}
-Total processed games: {processed_count}
-
-Current stats snapshot:
-```markdown
-{stats_markdown}
+Authoritative summary_context JSON (use exact values):
+```json
+{summary_context_json}
 ```
 
-Recent games:
-{recent_games_block}
+Authoritative performance_summary JSON (use exact values):
+```json
+{performance_summary_json}
+```
 
-Output requirements:
-1) Return Markdown only.
-2) Include sections:
-   - Snapshot
-   - Trends
-   - Focus for Next {cadence} Games
-3) Keep it practical, concise, and coach-like.
-4) No engine scores or centipawn language.
+Authoritative trait_scores JSON (use exact values):
+```json
+{trait_scores_json}
+```
+
+Authoritative primary_weakness JSON (use exact values):
+```json
+{primary_weakness_json}
+```
+
+Output constraints:
+- Return Markdown only.
+- Use exactly this YAML + section structure and headings.
+- Do not add any headings besides:
+  - `## Snapshot`
+  - `## Engine-Derived Traits`
+  - `## Primary Weaknesses`
+  - `## Training Priority`
+- Do not compute, infer, or recompute any metric.
+- Do not do arithmetic, percentages, ranking, or score derivation.
+- Copy numeric values exactly from provided JSON.
+
+Use this exact template:
+
+---
+date_utc: <summary_context.date_utc>
+your_color: <summary_context.your_color>
+opponent: <summary_context.opponent>
+result: <summary_context.result>
+win_pct: <performance_summary.win_pct>
+loss_pct: <performance_summary.loss_pct>
+draw_pct: <performance_summary.draw_pct>
+---
+
+## Snapshot
+- Total games: <performance_summary.total_games>
+- Record: <performance_summary.wins>–<performance_summary.losses>–<performance_summary.draws>
+- Win rate: <performance_summary.win_pct>%
+
+## Engine-Derived Traits
+- Tactical Awareness: <trait_scores.tactical_awareness>
+- Material Discipline: <trait_scores.material_discipline>
+- Conversion Ability: <trait_scores.conversion_ability>
+- Defensive Resilience: <trait_scores.defensive_resilience>
+- Blunder Frequency: <trait_scores.blunder_frequency>
+
+## Primary Weaknesses
+- <primary_weakness.trait_name>: <primary_weakness.reason>
+
+## Training Priority
+- <action 1>
+- <action 2>
+- <action 3>
 """
     return system_msg, user_msg
 
@@ -534,14 +803,22 @@ def _generate_player_summary_markdown(
     cadence: int,
     stats_path: Path,
     recent_meta: List[Tuple[int, str, str, Optional[int], str]],
+    trait_scores: Mapping[str, Any],
+    trait_window_size: int,
+    summary_context: Mapping[str, Any],
 ) -> str:
-    stats_markdown = stats_path.read_text(encoding="utf-8") if stats_path.exists() else ""
+    _ = processed_count
+    _ = cadence
+    _ = stats_path
+    _ = recent_meta
+    _ = trait_window_size
+    performance_summary = _build_performance_summary(recent_meta)
+    primary_weakness = _primary_weakness_from_trait_scores(trait_scores)
     system_msg, user_msg = _build_player_summary_prompt(
-        username=args.username,
-        cadence=cadence,
-        processed_count=processed_count,
-        stats_markdown=stats_markdown,
-        recent_meta=recent_meta,
+        summary_context=summary_context,
+        performance_summary=performance_summary,
+        trait_scores=trait_scores,
+        primary_weakness=primary_weakness,
     )
     provider = get_provider()
     if provider == "gpt":
@@ -582,12 +859,18 @@ def _maybe_generate_player_summary(
         return None
 
     recent_meta = _load_recent_game_meta_for_summary(conn, cadence)
+    trait_window_size = max(1, int(getattr(args, "player_trait_window", 20) or 20))
+    trait_scores = _compute_trait_scores_for_window(conn, args, window_size=trait_window_size)
+    summary_context = _load_latest_summary_context(conn)
     summary_md = _generate_player_summary_markdown(
         args,
         processed_count=processed_count,
         cadence=cadence,
         stats_path=stats_path,
         recent_meta=recent_meta,
+        trait_scores=trait_scores,
+        trait_window_size=trait_window_size,
+        summary_context=summary_context,
     )
     summary_path = args.out / "player_summary.md"
     write_text(summary_path, summary_md)
@@ -1291,6 +1574,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Generate player_summary.md every N newly processed games (env PLAYER_SUMMARY_EVERY_N, default 20).",
     )
     p.add_argument(
+        "--player-trait-window",
+        type=int,
+        default=_env_int("PLAYER_TRAIT_WINDOW", 20),
+        help="Rolling window size used to recompute deterministic engine traits for player summary (env PLAYER_TRAIT_WINDOW, default 20).",
+    )
+    p.add_argument(
         "--no-bootstrap",
         action="store_true",
         help="Disable first-run Postgres bootstrap seeding.",
@@ -1335,6 +1624,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         p.error("--bootstrap-games must be > 0.")
     if args.player_summary_every_n <= 0:
         p.error("--player-summary-every-n must be > 0.")
+    if args.player_trait_window <= 0:
+        p.error("--player-trait-window must be > 0.")
     if args.engine_depth <= 0:
         p.error("--engine-depth must be > 0.")
     if args.timeout <= 0:

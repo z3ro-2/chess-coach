@@ -29,6 +29,7 @@ def _base_args(tmp_path):
         telegram_disable_notification=False,
         username="logan",
         player_summary_every_n=20,
+        player_trait_window=20,
     )
 
 
@@ -150,6 +151,17 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
     ingest_check_module.close_ingest_db_check()
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# game review")
+    monkeypatch.setattr(
+        chess_review,
+        "_compute_trait_scores_for_window",
+        lambda *_args, **_kwargs: {
+            "tactical_awareness": 90,
+            "material_discipline": 85,
+            "conversion_ability": 80,
+            "defensive_resilience": 75,
+            "blunder_frequency": 95,
+        },
+    )
 
     calls: list[str] = []
     expected_timeout: dict[str, int | None] = {"value": None}
@@ -159,7 +171,7 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
             assert kwargs.get("timeout") == expected_timeout["value"]
         user_msg = str(kwargs.get("user_msg", ""))
         calls.append(user_msg)
-        if "Create a Markdown summary for this player's latest cadence window." in user_msg:
+        if "Format the deterministic player summary." in user_msg:
             return "# player summary"
         return "# summary fallback"
 

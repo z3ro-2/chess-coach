@@ -12,6 +12,7 @@ def _args(tmp_path: Path) -> SimpleNamespace:
         out=tmp_path / "output",
         username="logan",
         player_summary_every_n=1,
+        player_trait_window=20,
         provider="ollama",
         ollama_url="http://127.0.0.1:11434",
         ollama_model="llama3.1:8b",
@@ -58,22 +59,36 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
     monkeypatch.delenv("DATABASE_URL", raising=False)
     calls: list[str] = []
     expected_timeout: dict[str, int | None] = {"value": None}
+    trait_scores = {
+        "tactical_awareness": 91,
+        "material_discipline": 88,
+        "conversion_ability": 79,
+        "defensive_resilience": 84,
+        "blunder_frequency": 95,
+    }
 
     def _fake_ollama_generate(**kwargs):
         if expected_timeout["value"] is not None:
             assert kwargs.get("timeout") == expected_timeout["value"]
         user_msg = str(kwargs.get("user_msg", ""))
         calls.append(user_msg)
-        if "Create a Markdown summary for this player's latest cadence window." in user_msg:
+        if "Format the deterministic player summary." in user_msg:
             return "# forced summary"
         return "# review"
 
     monkeypatch.setattr(chess_review, "call_ollama_generate", _fake_ollama_generate)
 
+    def _fake_trait_scores(_conn, _args, *, window_size: int):
+        assert window_size == 7
+        return trait_scores
+
+    monkeypatch.setattr(chess_review, "_compute_trait_scores_for_window", _fake_trait_scores)
+
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
         args = _args(tmp_path)
         expected_timeout["value"] = args.timeout
+        args.player_trait_window = 7
         args.out.mkdir(parents=True, exist_ok=True)
         game = _sample_game()
         md_path = args.out / "md" / "g.md"
@@ -93,6 +108,7 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
         chess_review._record_processed_game_meta(conn, game)
         result = run_command("summary", conn, args)
         assert Path(result["file"]).exists()
+        assert "Trait scores (last 7 games):" in str(result["text"])
     finally:
         conn.close()
 
