@@ -236,6 +236,16 @@ CREATE TABLE IF NOT EXISTS summary_state (
 
 INSERT OR IGNORE INTO summary_state (id, last_summary_processed_count, last_summary_end_time, updated_at)
 VALUES (1, 0, NULL, strftime('%s','now'));
+
+CREATE TABLE IF NOT EXISTS engine_payloads (
+  game_url TEXT PRIMARY KEY,
+  end_time INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  engine_depth INTEGER NOT NULL,
+  payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_engine_payloads_end_time ON engine_payloads(end_time);
 """
 
 
@@ -281,6 +291,56 @@ def mark_processed(
         (game_url, end_time, now, str(md_path), str(pgn_path), provider, model, content_hash),
     )
     conn.commit()
+
+
+def _engine_payload_exists(conn: sqlite3.Connection, game_url: str) -> bool:
+    row = conn.execute("SELECT 1 FROM engine_payloads WHERE game_url = ?", (game_url,)).fetchone()
+    return row is not None
+
+
+def _store_engine_payload(
+    conn: sqlite3.Connection,
+    *,
+    game_url: str,
+    end_time: int,
+    engine_depth: int,
+    payload: Mapping[str, Any],
+) -> bool:
+    payload_json = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    existing_row = conn.execute(
+        "SELECT payload_json FROM engine_payloads WHERE game_url = ?",
+        (str(game_url),),
+    ).fetchone()
+    if existing_row is not None and str(existing_row[0]) == payload_json:
+        conn.commit()
+        return False
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO engine_payloads
+          (game_url, end_time, created_at, engine_depth, payload_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (game_url, int(end_time), int(time.time()), int(engine_depth), payload_json),
+    )
+    conn.commit()
+    return True
+
+
+def _upsert_backfill_processed_records(conn: sqlite3.Connection, *, game: GameInfo, args: argparse.Namespace) -> None:
+    provider = "stockfish"
+    model = f"stockfish-depth-{int(getattr(args, 'engine_depth', 15) or 15)}"
+    h = compute_content_hash(game, provider, model)
+    mark_processed(
+        conn=conn,
+        game_url=game.game_url,
+        end_time=game.end_time,
+        md_path=Path("__backfill__/no_markdown.md"),
+        pgn_path=Path("__backfill__/inline_pgn"),
+        provider=provider,
+        model=model,
+        content_hash=h,
+    )
+    _record_processed_game_meta(conn, game)
 
 
 def _player_rating_for_game(game: GameInfo) -> Optional[int]:
@@ -456,32 +516,46 @@ def _load_recent_game_reviews_for_traits(
 ) -> List[Dict[str, Any]]:
     cur = conn.execute(
         """
-        SELECT
-            pg.game_url,
-            pg.end_time,
-            pg.pgn_path,
-            pg.md_path,
-            COALESCE(meta.result, '*') AS result,
-            COALESCE(meta.player_color, '') AS player_color
-        FROM processed_games AS pg
-        LEFT JOIN processed_game_meta AS meta ON meta.game_url = pg.game_url
-        ORDER BY pg.end_time DESC
+        SELECT payload_json
+        FROM engine_payloads
+        ORDER BY end_time DESC
         LIMIT ?
         """,
         (max(1, int(limit)),),
     )
-    rows = cur.fetchall()
-    return [
-        {
-            "game_url": str(r[0]),
-            "end_time": int(r[1]),
-            "pgn_path": str(r[2]),
-            "md_path": str(r[3]),
-            "result": str(r[4]),
-            "player_color": str(r[5]),
-        }
-        for r in rows
-    ]
+    payloads: List[Dict[str, Any]] = []
+    for (payload_json,) in cur.fetchall():
+        try:
+            loaded = json.loads(str(payload_json))
+        except Exception:
+            continue
+        if isinstance(loaded, dict):
+            payloads.append(loaded)
+    return payloads
+
+
+def _load_recent_engine_payloads_from_db(
+    conn: sqlite3.Connection,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    return _load_recent_game_reviews_for_traits(conn, limit)
+
+
+def _analyze_game_with_stockfish(*, game: GameInfo, args: argparse.Namespace) -> Dict[str, Any]:
+    from engine.stockfish_oracle import StockfishOracle
+
+    oracle = StockfishOracle(
+        stockfish_path=str(getattr(args, "stockfish_path", "") or ""),
+        depth=int(getattr(args, "engine_depth", 15) or 15),
+    )
+    engine_output = oracle.analyze_game(str(getattr(game, "pgn", "") or ""))
+    game_summary = dict(engine_output.get("game_summary") or {})
+    game_summary["your_color"] = game.your_color
+    game_summary["result"] = game.result
+    return {
+        "game_summary": game_summary,
+        "key_positions": list(engine_output.get("key_positions") or []),
+    }
 
 
 def _load_engine_payloads_for_trait_window(
@@ -490,38 +564,8 @@ def _load_engine_payloads_for_trait_window(
     *,
     window_size: int,
 ) -> List[Dict[str, Any]]:
-    from engine.stockfish_oracle import StockfishOracle
-
-    reviews = _load_recent_game_reviews_for_traits(conn, window_size)
-    if not reviews:
-        return []
-
-    oracle = StockfishOracle(
-        stockfish_path=str(getattr(args, "stockfish_path", "") or ""),
-        depth=int(getattr(args, "engine_depth", 15) or 15),
-    )
-
-    payloads: List[Dict[str, Any]] = []
-    for review in reviews:
-        pgn_path = Path(str(review.get("pgn_path", "") or ""))
-        if not pgn_path.exists():
-            continue
-        pgn_text = pgn_path.read_text(encoding="utf-8")
-        engine_output = oracle.analyze_game(pgn_text)
-        game_summary = dict(engine_output.get("game_summary") or {})
-        player_color = str(review.get("player_color", "") or "").strip().lower()
-        if player_color in {"white", "black"}:
-            game_summary["your_color"] = player_color
-        result = str(review.get("result", "") or "").strip()
-        if result:
-            game_summary["result"] = result
-        payloads.append(
-            {
-                "game_summary": game_summary,
-                "key_positions": list(engine_output.get("key_positions") or []),
-            }
-        )
-    return payloads
+    _ = args
+    return _load_recent_game_reviews_for_traits(conn, window_size)
 
 
 def _compute_trait_scores_for_window(
@@ -1299,6 +1343,82 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
     return md_path
 
 
+def _select_backfill_games(args: argparse.Namespace) -> Tuple[List[GameInfo], int]:
+    lookback_days = max(int(getattr(args, "lookback_days", 10) or 10), 3650)
+    raw_games = fetch_recent_games(args.username, lookback_days)
+    fetched_count = len(raw_games)
+
+    parsed: List[GameInfo] = []
+    for raw in raw_games:
+        game = parse_game(raw, args.username)
+        if game is None:
+            continue
+        if args.rules_filter and game.rules != args.rules_filter:
+            continue
+        parsed.append(game)
+
+    parsed.sort(key=lambda g: g.end_time, reverse=True)
+    backfill_n = max(1, int(getattr(args, "backfill", 0) or 0))
+    return parsed[:backfill_n], fetched_count
+
+
+def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str, Any]:
+    requested_count = max(1, int(getattr(args, "backfill", 0) or 0))
+    if requested_count > 200:
+        raise ValueError("Backfill limit exceeded: max 200 games at once.")
+
+    games, fetched_count = _select_backfill_games(args)
+    processed_games = 0
+    engine_analyses = 0
+
+    for game in games:
+        if _engine_payload_exists(conn, game.game_url):
+            _upsert_backfill_processed_records(conn, game=game, args=args)
+            processed_games += 1
+            continue
+        payload = _analyze_game_with_stockfish(game=game, args=args)
+        inserted = _store_engine_payload(
+            conn,
+            game_url=game.game_url,
+            end_time=game.end_time,
+            engine_depth=int(getattr(args, "engine_depth", 15) or 15),
+            payload=payload,
+        )
+        _upsert_backfill_processed_records(conn, game=game, args=args)
+        processed_games += 1
+        engine_analyses += 1
+        if not inserted:
+            logger.debug("Engine payload already present with identical content for %s", game.game_url)
+
+    trait_scores = _compute_trait_scores_for_window(
+        conn,
+        args,
+        window_size=max(1, int(getattr(args, "player_trait_window", 20) or 20)),
+    )
+    return {
+        "total_games_requested": requested_count,
+        "games_fetched_from_chess_com": fetched_count,
+        "games_analyzed_with_stockfish": engine_analyses,
+        "games_processed": processed_games,
+        "engine_analyses": engine_analyses,
+        "trait_scores": trait_scores,
+    }
+
+
+def _print_backfill_summary(result: Mapping[str, Any]) -> None:
+    scores = dict(result.get("trait_scores") or {})
+    print("Backfill Summary:")
+    print(f"- total games requested: {int(result.get('total_games_requested', 0) or 0)}")
+    print(f"- games fetched from chess.com: {int(result.get('games_fetched_from_chess_com', 0) or 0)}")
+    print(f"- games analyzed with Stockfish: {int(result.get('games_analyzed_with_stockfish', 0) or 0)}")
+    print("- traits (post-backfill):")
+    print(f"  tactical_awareness: {int(scores.get('tactical_awareness', 100) or 100)}")
+    print(f"  material_discipline: {int(scores.get('material_discipline', 100) or 100)}")
+    print(f"  conversion_ability: {int(scores.get('conversion_ability', 100) or 100)}")
+    print(f"  defensive_resilience: {int(scores.get('defensive_resilience', 100) or 100)}")
+    print(f"  blunder_frequency: {int(scores.get('blunder_frequency', 100) or 100)}")
+
+
 def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     raw_games = fetch_recent_games(args.username, args.lookback_days)
 
@@ -1553,6 +1673,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     p.add_argument("--poll-seconds", type=int, default=300, help="Polling interval (seconds)")
     p.add_argument("--once", action="store_true", help="Run one poll cycle then exit")
+    p.add_argument(
+        "--backfill",
+        type=int,
+        default=0,
+        help="Backfill last N games with strict Stockfish engine payloads only (no LLM/polling/Telegram).",
+    )
     p.add_argument("--lookback-days", type=int, default=10, help="How far back to scan for unprocessed games")
 
     p.add_argument(
@@ -1630,6 +1756,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         p.error("--engine-depth must be > 0.")
     if args.timeout <= 0:
         p.error("--timeout must be > 0.")
+    if args.backfill < 0:
+        p.error("--backfill must be >= 0.")
 
     # Normalize rules filter: allow disabling with empty string
     if args.rules_filter is not None:
@@ -1645,6 +1773,24 @@ def main() -> int:
     args = parse_args()
     if not bool(getattr(args, "enable_engine", False)):
         raise RuntimeError("Engine cannot be disabled in strict mode.")
+    args.out = Path(args.out)
+    args.state_db = Path(args.state_db)
+
+    if int(getattr(args, "backfill", 0) or 0) > 0:
+        logger.info("Running backfill mode for last %d games.", int(args.backfill))
+        conn = init_db(args.state_db)
+        try:
+            try:
+                result = run_backfill(conn, args)
+            except Exception as exc:
+                logger.error("Backfill failed: %s", exc)
+                return 1
+            _print_backfill_summary(result)
+            return 0
+        finally:
+            conn.close()
+            close_ingest_db_check()
+
     if args.provider == "ollama":
         args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
         _apply_provider_runtime_fallback(args)
@@ -1655,8 +1801,6 @@ def main() -> int:
     else:
         logger.info("Using Ollama model: %s (URL: %s)", args.ollama_model, args.ollama_url)
     logger.info("LLM timeout (seconds): %d", args.timeout)
-    args.out = Path(args.out)
-    args.state_db = Path(args.state_db)
     logger.info("SQLite state DB path: %s", args.state_db)
 
     conn = init_db(args.state_db)

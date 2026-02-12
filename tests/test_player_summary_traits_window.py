@@ -1,103 +1,243 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import chess_review
 
 
-def _build_game(*, url: str, end_time: int, result: str, your_color: str) -> chess_review.GameInfo:
-    return chess_review.GameInfo(
-        game_url=url,
-        pgn=f'[Event "Live Chess"]\n[Result "{result}"]\n1. e4 e5 {result}\n',
+def _payload(*, your_color: str, result: str, total_moves: int, key_positions: list[dict]) -> dict:
+    return {
+        "game_summary": {
+            "your_color": your_color,
+            "result": result,
+            "total_moves": total_moves,
+        },
+        "key_positions": key_positions,
+    }
+
+
+def _insert_payload(conn, *, game_id: int, end_time: int, payload: dict) -> None:
+    chess_review._store_engine_payload(
+        conn,
+        game_url=f"https://www.chess.com/game/live/{game_id}",
         end_time=end_time,
-        time_control="600",
-        rated=True,
-        rules="chess",
-        white_username="logan" if your_color == "white" else "opponent",
-        black_username="opponent" if your_color == "white" else "logan",
-        white_rating=1200,
-        black_rating=1200,
-        result=result,
-        your_color=your_color,
-        opponent="opponent",
+        engine_depth=15,
+        payload=payload,
     )
 
 
-def test_load_recent_game_reviews_for_traits_uses_rolling_window_order(monkeypatch, tmp_path) -> None:
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+def test_load_recent_game_reviews_for_traits_includes_backfill_and_respects_limit(tmp_path) -> None:
     conn = chess_review.init_db(tmp_path / "state.sqlite")
-    out = Path(tmp_path) / "output"
-    out.mkdir(parents=True, exist_ok=True)
-
     try:
-        games = [
-            _build_game(url="https://www.chess.com/game/live/1", end_time=1_706_000_100, result="1-0", your_color="white"),
-            _build_game(url="https://www.chess.com/game/live/2", end_time=1_706_000_200, result="0-1", your_color="white"),
-            _build_game(url="https://www.chess.com/game/live/3", end_time=1_706_000_300, result="1/2-1/2", your_color="white"),
-        ]
-        for idx, game in enumerate(games, start=1):
-            md_path = out / "md" / f"g{idx}.md"
-            pgn_path = out / "pgn" / f"g{idx}.pgn"
-            chess_review.write_text(md_path, "# review")
-            chess_review.write_text(pgn_path, game.pgn)
-            chess_review.mark_processed(
-                conn=conn,
-                game_url=game.game_url,
-                end_time=game.end_time,
-                md_path=md_path,
-                pgn_path=pgn_path,
-                provider="ollama",
-                model="llama3.1:8b",
-                content_hash=f"h{idx}",
-            )
-            chess_review._record_processed_game_meta(conn, game)
-
-        rows = chess_review._load_recent_game_reviews_for_traits(conn, 2)
+        _insert_payload(
+            conn,
+            game_id=1,
+            end_time=1_706_000_100,
+            payload=_payload(your_color="white", result="1-0", total_moves=10, key_positions=[]),
+        )
+        _insert_payload(
+            conn,
+            game_id=2,
+            end_time=1_706_000_200,
+            payload=_payload(your_color="white", result="1-0", total_moves=20, key_positions=[]),
+        )
+        _insert_payload(
+            conn,
+            game_id=3,
+            end_time=1_706_000_300,
+            payload=_payload(your_color="white", result="1-0", total_moves=30, key_positions=[]),
+        )
+        payloads = chess_review._load_recent_game_reviews_for_traits(conn, 2)
     finally:
         conn.close()
 
-    assert [row["game_url"] for row in rows] == [
-        "https://www.chess.com/game/live/3",
-        "https://www.chess.com/game/live/2",
-    ]
+    assert [int(p["game_summary"]["total_moves"]) for p in payloads] == [30, 20]
 
 
-def test_compute_trait_scores_for_window_known_dataset(monkeypatch, tmp_path) -> None:
-    payloads = [
-        {
-            "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
-            "key_positions": [
-                {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 3},
-                {"player": "White", "move_number": 5, "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -2},
-                {"player": "White", "move_number": 6, "label": "mistake", "tactical_flag": "tactical_miss", "material_change": -1},
-            ],
-        },
-        {
-            "game_summary": {"your_color": "white", "result": "1/2-1/2", "total_moves": 20},
-            "key_positions": [
-                {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 4},
-                {"player": "White", "move_number": 10, "label": "good", "tactical_flag": "none", "material_change": -4},
-            ],
-        },
-    ]
-    monkeypatch.setattr(chess_review, "_load_engine_payloads_for_trait_window", lambda *_args, **_kwargs: payloads)
-
+def test_compute_trait_scores_for_window_includes_backfill_payloads(monkeypatch, tmp_path) -> None:
     conn = chess_review.init_db(tmp_path / "state.sqlite")
+    monkeypatch.setattr(
+        chess_review,
+        "_analyze_game_with_stockfish",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("Trait recompute must use stored payloads only.")),
+    )
     try:
-        scores = chess_review._compute_trait_scores_for_window(
+        _insert_payload(
             conn,
-            SimpleNamespace(),
-            window_size=20,
+            game_id=101,
+            end_time=1_706_000_100,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 3},
+                    {"player": "White", "move_number": 5, "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -2},
+                ],
+            },
         )
+        _insert_payload(
+            conn,
+            game_id=102,
+            end_time=1_706_000_200,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1/2-1/2", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 4},
+                    {"player": "White", "move_number": 10, "label": "good", "tactical_flag": "none", "material_change": -4},
+                ],
+            },
+        )
+        _insert_payload(
+            conn,
+            game_id=103,
+            end_time=1_706_000_300,
+            payload={
+                "game_summary": {"your_color": "white", "result": "0-1", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 3, "label": "good", "tactical_flag": "none", "material_change": 3},
+                    {"player": "White", "move_number": 6, "label": "blunder", "tactical_flag": "tactical_miss", "material_change": -3},
+                    {"player": "White", "move_number": 8, "label": "mistake", "tactical_flag": "hanging_piece", "material_change": -1},
+                ],
+            },
+        )
+        scores = chess_review._compute_trait_scores_for_window(conn, SimpleNamespace(), window_size=3)
     finally:
         conn.close()
 
     assert scores == {
-        "tactical_awareness": 82,
-        "material_discipline": 79,
-        "conversion_ability": 50,
+        "tactical_awareness": 68,
+        "material_discipline": 70,
+        "conversion_ability": 33,
+        "defensive_resilience": 50,
+        "blunder_frequency": 97,
+    }
+
+
+def test_compute_trait_scores_for_window_respects_limit_n(tmp_path) -> None:
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        _insert_payload(
+            conn,
+            game_id=1,
+            end_time=1_706_000_100,
+            payload={
+                "game_summary": {"your_color": "white", "result": "0-1", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 2, "label": "good", "tactical_flag": "none", "material_change": 3},
+                    {"player": "White", "move_number": 4, "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -5},
+                    {"player": "White", "move_number": 5, "label": "blunder", "tactical_flag": "tactical_miss", "material_change": -3},
+                ],
+            },
+        )
+        _insert_payload(
+            conn,
+            game_id=2,
+            end_time=1_706_000_200,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
+                "key_positions": [{"player": "White", "move_number": 3, "label": "good", "tactical_flag": "none", "material_change": 3}],
+            },
+        )
+        _insert_payload(
+            conn,
+            game_id=3,
+            end_time=1_706_000_300,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
+                "key_positions": [{"player": "White", "move_number": 3, "label": "good", "tactical_flag": "none", "material_change": 3}],
+            },
+        )
+        scores_latest_two = chess_review._compute_trait_scores_for_window(conn, SimpleNamespace(), window_size=2)
+        scores_latest_three = chess_review._compute_trait_scores_for_window(conn, SimpleNamespace(), window_size=3)
+    finally:
+        conn.close()
+
+    assert scores_latest_two == {
+        "tactical_awareness": 100,
+        "material_discipline": 100,
+        "conversion_ability": 100,
+        "defensive_resilience": 100,
+        "blunder_frequency": 100,
+    }
+    assert scores_latest_three == {
+        "tactical_awareness": 74,
+        "material_discipline": 76,
+        "conversion_ability": 67,
+        "defensive_resilience": 0,
+        "blunder_frequency": 97,
+    }
+
+
+def test_traits_change_when_backfill_payload_changes(tmp_path) -> None:
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        _insert_payload(
+            conn,
+            game_id=201,
+            end_time=1_706_000_100,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 3},
+                    {"player": "White", "move_number": 5, "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -2},
+                ],
+            },
+        )
+        _insert_payload(
+            conn,
+            game_id=202,
+            end_time=1_706_000_200,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1/2-1/2", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 4},
+                    {"player": "White", "move_number": 10, "label": "good", "tactical_flag": "none", "material_change": -4},
+                ],
+            },
+        )
+        _insert_payload(
+            conn,
+            game_id=203,
+            end_time=1_706_000_300,
+            payload={
+                "game_summary": {"your_color": "white", "result": "0-1", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 3, "label": "good", "tactical_flag": "none", "material_change": 3},
+                    {"player": "White", "move_number": 6, "label": "blunder", "tactical_flag": "tactical_miss", "material_change": -3},
+                    {"player": "White", "move_number": 8, "label": "mistake", "tactical_flag": "hanging_piece", "material_change": -1},
+                ],
+            },
+        )
+        before = chess_review._compute_trait_scores_for_window(conn, SimpleNamespace(), window_size=3)
+
+        _insert_payload(
+            conn,
+            game_id=203,
+            end_time=1_706_000_300,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
+                "key_positions": [
+                    {"player": "White", "move_number": 3, "label": "good", "tactical_flag": "none", "material_change": 3},
+                    {"player": "White", "move_number": 6, "label": "good", "tactical_flag": "none", "material_change": 0},
+                    {"player": "White", "move_number": 8, "label": "good", "tactical_flag": "none", "material_change": 0},
+                ],
+            },
+        )
+        after = chess_review._compute_trait_scores_for_window(conn, SimpleNamespace(), window_size=3)
+    finally:
+        conn.close()
+
+    assert before == {
+        "tactical_awareness": 68,
+        "material_discipline": 70,
+        "conversion_ability": 33,
+        "defensive_resilience": 50,
+        "blunder_frequency": 97,
+    }
+    assert after == {
+        "tactical_awareness": 86,
+        "material_discipline": 82,
+        "conversion_ability": 67,
         "defensive_resilience": 100,
         "blunder_frequency": 98,
     }
-
+    assert after != before

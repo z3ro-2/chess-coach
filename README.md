@@ -122,6 +122,80 @@ Responses include text and attached Markdown files when applicable.
 
 ---
 
+### Backfill Mode
+
+Usage:
+
+```bash
+python3 chess_review.py --backfill 50
+```
+
+If `CHESS_USERNAME` is not set in your environment, provide it explicitly:
+
+```bash
+python3 chess_review.py --username your_chesscom_username --backfill 50
+```
+
+This mode:
+
+- fetches up to `N` recent games for your configured username
+- runs strict Stockfish analysis on each
+- persists engine payloads
+- recomputes trait scores
+- prints a deterministic summary
+
+Constraints:
+
+- No Telegram notifications
+- No LLM calls
+- max limit = 200
+- exit code `0` on success
+- exit with error if engine fails
+
+If `N > 200`, backfill aborts with:
+
+```text
+ValueError("Backfill limit exceeded: max 200 games at once.")
+```
+
+Expected stdout summary format:
+
+```text
+Backfill Summary:
+- total games requested: <N>
+- games fetched from chess.com: <M>
+- games analyzed with Stockfish: <P>
+- traits (post-backfill):
+  tactical_awareness: <int>
+  material_discipline: <int>
+  conversion_ability: <int>
+  defensive_resilience: <int>
+  blunder_frequency: <int>
+```
+
+Example:
+
+```bash
+python3 chess_review.py --username your_chesscom_username --backfill 20
+```
+
+Example output:
+
+```text
+Backfill Summary:
+- total games requested: 20
+- games fetched from chess.com: 36
+- games analyzed with Stockfish: 20
+- traits (post-backfill):
+  tactical_awareness: 86
+  material_discipline: 81
+  conversion_ability: 67
+  defensive_resilience: 74
+  blunder_frequency: 95
+```
+
+---
+
 ## Configuration Highlights
 
 ```env
