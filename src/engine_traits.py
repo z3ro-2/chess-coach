@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import json
+import os
+import sys
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
 
 def compute_engine_trait_scores(payloads: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     """Compute all deterministic engine-trait scores."""
-    return {
+    scores = {
         "tactical_awareness": tactical_awareness(payloads),
         "material_discipline": material_discipline(payloads),
         "conversion_ability": conversion_ability(payloads),
         "defensive_resilience": defensive_resilience(payloads),
         "blunder_frequency": blunder_frequency(payloads),
     }
+    if _traits_debug_enabled():
+        _emit_traits_debug(payloads, scores)
+    return scores
 
 
 def tactical_awareness(payloads: Sequence[Mapping[str, Any]]) -> int:
@@ -172,3 +178,149 @@ def _clamp_score(value: float) -> int:
         return 100
     return int(round(value))
 
+
+def _traits_debug_enabled() -> bool:
+    return str(os.environ.get("TRAITS_DEBUG", "")).strip() == "1"
+
+
+def _emit_traits_debug(payloads: Sequence[Mapping[str, Any]], scores: Mapping[str, int]) -> None:
+    tactical_blunders = 0
+    tactical_misses = 0
+    hanging_pieces = 0
+    material_loss_total = 0
+    opportunities = 0
+    conversions = 0
+    pressure_games = 0
+    resilient_games = 0
+    total_blunders = 0
+    total_moves = 0
+
+    for idx, payload in enumerate(payloads, start=1):
+        summary = _game_summary(payload)
+        key_positions_raw = payload.get("key_positions") or []
+        key_positions_count = len(key_positions_raw) if isinstance(key_positions_raw, Sequence) else 0
+        total_plies = _as_int(summary.get("total_plies", 0))
+        payload_total_moves = max(0, _as_int(summary.get("total_moves", 0)))
+        total_moves += payload_total_moves
+        label_counts = summary.get("label_counts")
+        if not isinstance(label_counts, Mapping):
+            label_counts = {}
+
+        player_positions = list(_iter_player_positions(payload))
+        payload_blunders = 0
+        payload_tactical_misses = 0
+        payload_hanging_pieces = 0
+        payload_material_loss = 0
+        payload_material_swing = 0
+
+        for position in player_positions:
+            label = str(position.get("label", "")).strip().lower()
+            tactical_flag = str(position.get("tactical_flag", "")).strip().lower()
+            material_change = _as_int(position.get("material_change", 0))
+            if label == "blunder":
+                payload_blunders += 1
+            if tactical_flag == "tactical_miss":
+                payload_tactical_misses += 1
+            if tactical_flag == "hanging_piece":
+                payload_hanging_pieces += 1
+            if material_change < 0:
+                payload_material_loss += abs(material_change)
+                payload_material_swing += material_change
+
+        tactical_blunders += payload_blunders
+        tactical_misses += payload_tactical_misses
+        hanging_pieces += payload_hanging_pieces
+        material_loss_total += payload_material_loss
+        total_blunders += payload_blunders
+
+        cutoff_move = max(6, max(1, payload_total_moves) // 3)
+        had_early_advantage = False
+        for position in player_positions:
+            move_number = _as_int(position.get("move_number", 0))
+            material_change = _as_int(position.get("material_change", 0))
+            if move_number <= cutoff_move and material_change >= 3:
+                had_early_advantage = True
+                break
+
+        converted = had_early_advantage and _is_player_win(summary)
+        if had_early_advantage:
+            opportunities += 1
+            if converted:
+                conversions += 1
+
+        under_pressure = payload_material_swing < -3
+        resilient = under_pressure and not _is_player_loss(summary)
+        if under_pressure:
+            pressure_games += 1
+            if resilient:
+                resilient_games += 1
+
+        payload_debug = {
+            "payload_index": idx,
+            "total_plies": total_plies,
+            "total_moves": payload_total_moves,
+            "label_counts": dict(label_counts),
+            "key_positions_count": key_positions_count,
+            "player_key_positions_count": len(player_positions),
+            "tactical_awareness_components": {
+                "blunders": payload_blunders,
+                "tactical_misses": payload_tactical_misses,
+                "hanging_pieces": payload_hanging_pieces,
+                "raw_before_clamp": 100 - ((payload_blunders * 8) + (payload_tactical_misses * 4) + (payload_hanging_pieces * 6)),
+            },
+            "material_discipline_components": {
+                "material_loss_total": payload_material_loss,
+                "raw_before_clamp": 100 - (payload_material_loss * 3),
+            },
+            "conversion_ability_components": {
+                "cutoff_move": cutoff_move,
+                "had_early_advantage": had_early_advantage,
+                "converted": converted,
+                "raw_before_clamp": 100.0 if not had_early_advantage else (100.0 if converted else 0.0),
+            },
+            "defensive_resilience_components": {
+                "material_swing": payload_material_swing,
+                "under_pressure": under_pressure,
+                "resilient": resilient,
+                "raw_before_clamp": 100.0 if not under_pressure else (100.0 if resilient else 0.0),
+            },
+            "blunder_frequency_components": {
+                "blunders": payload_blunders,
+                "total_moves": payload_total_moves,
+                "raw_before_clamp": 100.0 if payload_total_moves <= 0 else (1.0 - (payload_blunders / payload_total_moves)) * 100.0,
+            },
+        }
+        print(f"[traits-debug] {json.dumps(payload_debug, ensure_ascii=True, sort_keys=True)}", file=sys.stderr)
+
+    aggregate_debug = {
+        "aggregate": {
+            "payload_count": len(payloads),
+            "tactical_awareness_components": {
+                "blunders": tactical_blunders,
+                "tactical_misses": tactical_misses,
+                "hanging_pieces": hanging_pieces,
+                "raw_before_clamp": 100 - ((tactical_blunders * 8) + (tactical_misses * 4) + (hanging_pieces * 6)),
+            },
+            "material_discipline_components": {
+                "material_loss_total": material_loss_total,
+                "raw_before_clamp": 100 - (material_loss_total * 3),
+            },
+            "conversion_ability_components": {
+                "opportunities": opportunities,
+                "conversions": conversions,
+                "raw_before_clamp": 100.0 if opportunities <= 0 else (conversions / opportunities) * 100.0,
+            },
+            "defensive_resilience_components": {
+                "pressure_games": pressure_games,
+                "resilient_games": resilient_games,
+                "raw_before_clamp": 100.0 if pressure_games <= 0 else (resilient_games / pressure_games) * 100.0,
+            },
+            "blunder_frequency_components": {
+                "total_blunders": total_blunders,
+                "total_moves": total_moves,
+                "raw_before_clamp": 100.0 if total_moves <= 0 else (1.0 - (total_blunders / total_moves)) * 100.0,
+            },
+            "scores_after_clamp": dict(scores),
+        }
+    }
+    print(f"[traits-debug] {json.dumps(aggregate_debug, ensure_ascii=True, sort_keys=True)}", file=sys.stderr)
