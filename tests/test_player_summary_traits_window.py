@@ -287,3 +287,74 @@ def test_trait_window_metrics_include_moves_and_confidence_tier(tmp_path) -> Non
     assert metrics["trait_window_games"] == 20
     assert metrics["trait_window_moves"] == 260
     assert metrics["confidence"] == "MEDIUM"
+
+
+def test_load_recent_game_reviews_for_traits_has_stable_tiebreak_order(tmp_path) -> None:
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        first = _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=24,
+            label_counts={"good": 20, "inaccuracy": 2, "mistake": 2, "blunder": 0, "brilliant": 0},
+            key_positions=[],
+        )
+        first["game_summary"]["marker"] = "game-1"
+        second = _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=24,
+            label_counts={"good": 20, "inaccuracy": 2, "mistake": 2, "blunder": 0, "brilliant": 0},
+            key_positions=[],
+        )
+        second["game_summary"]["marker"] = "game-2"
+
+        _insert_payload(conn, game_id=1, end_time=1_706_111_111, payload=first)
+        _insert_payload(conn, game_id=2, end_time=1_706_111_111, payload=second)
+        loaded = chess_review._load_recent_game_reviews_for_traits(conn, 2)
+    finally:
+        conn.close()
+
+    assert [str(item["game_summary"]["marker"]) for item in loaded] == ["game-2", "game-1"]
+
+
+def test_trait_window_with_missing_payload_slot_blends_to_neutral_without_reanalysis(monkeypatch, tmp_path) -> None:
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    monkeypatch.setattr(
+        chess_review,
+        "_analyze_game_with_stockfish",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("Trait recompute must not run engine analysis.")),
+    )
+    try:
+        _insert_payload(
+            conn,
+            game_id=401,
+            end_time=1_706_000_100,
+            payload=_payload(
+                your_color="white",
+                result="1-0",
+                total_moves=60,
+                label_counts={"good": 60, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+                key_positions=[],
+            ),
+        )
+        _insert_payload(
+            conn,
+            game_id=402,
+            end_time=1_706_000_200,
+            payload={
+                "game_summary": {"your_color": "white", "result": "1-0"},
+                "key_positions": [],
+            },
+        )
+        scores = chess_review._compute_trait_scores_for_window(conn, SimpleNamespace(), window_size=2)
+    finally:
+        conn.close()
+
+    assert scores == {
+        "tactical_awareness": 75,
+        "material_discipline": 75,
+        "conversion_ability": 75,
+        "defensive_resilience": 50,
+        "blunder_frequency": 75,
+    }

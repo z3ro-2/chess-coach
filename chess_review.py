@@ -518,7 +518,7 @@ def _load_recent_game_reviews_for_traits(
         """
         SELECT payload_json
         FROM engine_payloads
-        ORDER BY end_time DESC
+        ORDER BY end_time DESC, game_url DESC
         LIMIT ?
         """,
         (max(1, int(limit)),),

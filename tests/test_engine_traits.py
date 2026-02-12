@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from src.engine_traits import (
+    _WindowAggregates,
+    _compute_window_scores,
     blunder_frequency,
     compute_engine_trait_scores,
     conversion_ability,
@@ -107,7 +109,7 @@ def test_clean_games_produce_high_scores() -> None:
     assert scores["material_discipline"] >= 85
     assert scores["conversion_ability"] >= 70
     assert scores["defensive_resilience"] >= 70
-    assert scores["blunder_frequency"] >= 95
+    assert scores["blunder_frequency"] >= 90
 
 
 def test_missing_primary_fields_returns_neutral_scores() -> None:
@@ -280,3 +282,39 @@ def test_low_volume_caps_scores_to_eighty() -> None:
     assert scores["material_discipline"] == 80
     assert scores["conversion_ability"] == 80
     assert scores["blunder_frequency"] == 80
+
+
+def test_strict_error_rate_cap_blocks_ninety_plus_scores() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=1000,
+            total_plies=2000,
+            label_counts={"good": 947, "inaccuracy": 10, "mistake": 40, "blunder": 3, "brilliant": 0},
+            key_positions=[],
+        )
+    ]
+    scores = compute_engine_trait_scores(payloads)
+    assert scores["tactical_awareness"] < 90
+
+
+def test_malformed_window_integrity_returns_neutral_scores(caplog) -> None:
+    window = _WindowAggregates(
+        payload_count=3,
+        primary_games=5,
+        total_moves=4,
+    )
+
+    with caplog.at_level("ERROR"):
+        scores, components = _compute_window_scores(window)
+
+    assert scores == {
+        "tactical_awareness": 50,
+        "material_discipline": 50,
+        "conversion_ability": 50,
+        "defensive_resilience": 50,
+        "blunder_frequency": 50,
+    }
+    assert components["integrity_violation"] is True
+    assert "Trait window integrity violation" in caplog.text

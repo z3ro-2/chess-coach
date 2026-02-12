@@ -196,17 +196,21 @@ def test_backfill_rerun_does_not_duplicate_rows(monkeypatch, conn) -> None:
             _raw_game(game_id=2, end_time=1_706_000_200),
         ],
     )
-    monkeypatch.setattr(
-        backfill_module,
-        "_run_stockfish_oracle",
-        lambda **kwargs: {
+    calls = {"count": 0}
+
+    def _fake_oracle(**kwargs):
+        calls["count"] += 1
+        return {
             "game_summary": {"result": kwargs["game"].result, "total_moves": 20},
             "key_positions": [{"move_number": 1, "player": "White", "label": "good"}],
-        },
-    )
+        }
+
+    monkeypatch.setattr(backfill_module, "_run_stockfish_oracle", _fake_oracle)
 
     first = backfill_module.backfill_recent_games(conn, username="logan", limit=10)
+    first_calls = calls["count"]
     second = backfill_module.backfill_recent_games(conn, username="logan", limit=10)
+    second_calls = calls["count"] - first_calls
 
     payload_count = int(conn.execute("SELECT COUNT(*) FROM engine_payloads").fetchone()[0])
     game_count = int(conn.execute("SELECT COUNT(*) FROM processed_games").fetchone()[0])
@@ -215,9 +219,22 @@ def test_backfill_rerun_does_not_duplicate_rows(monkeypatch, conn) -> None:
     assert first["stored"] == 2
     assert second["stored"] == 0
     assert second["engine_analyses"] == 0
+    assert first_calls == 2
+    assert second_calls == 0
     assert payload_count == 2
     assert game_count == 2
     assert meta_count == 2
+
+
+def test_backfill_engine_payloads_have_unique_game_url_index(conn) -> None:
+    backfill_module._ensure_backfill_tables(conn)
+    indexes = conn.execute("PRAGMA index_list('engine_payloads')").fetchall()
+    index_names = {str(row[1]) for row in indexes}
+    unique_index_rows = [row for row in indexes if str(row[1]) == "idx_engine_payloads_game_url_unique"]
+
+    assert "idx_engine_payloads_game_url_unique" in index_names
+    assert unique_index_rows
+    assert int(unique_index_rows[0][2]) == 1
 
 
 def test_backfill_raises_when_limit_exceeds_two_hundred(monkeypatch, conn) -> None:

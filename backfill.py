@@ -46,12 +46,21 @@ def backfill_recent_games(conn: sqlite3.Connection, username: str, limit: int) -
     engine_analyses = 0
     stored = 0
     for game in selected_games:
-        if _engine_payload_exists(conn, game.game_url):
+        payload_exists = _engine_payload_exists(conn, game.game_url)
+        if payload_exists:
+            # Strict idempotency invariant: existing payloads are never re-analyzed.
             _upsert_processed_game(conn, game=game, engine_depth=int(args.engine_depth))
             _upsert_processed_game_meta(conn, game=game)
             conn.commit()
             continue
 
+        # Re-check immediately before running Stockfish to guard against accidental
+        # re-analysis if the payload appears between checks.
+        if _engine_payload_exists(conn, game.game_url):
+            raise AssertionError(
+                f"Backfill idempotency invariant violated for {game.game_url}: "
+                "engine payload exists before Stockfish invocation."
+            )
         engine_output = _run_stockfish_oracle(game=game, args=args, logger=logger)
         if engine_output is None:
             raise RuntimeError(f"Stockfish engine failed for game {game.game_url}")
@@ -141,6 +150,12 @@ def _ensure_backfill_tables(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_engine_payloads_end_time
         ON engine_payloads(end_time)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_engine_payloads_game_url_unique
+        ON engine_payloads(game_url)
         """
     )
 

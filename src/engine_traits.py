@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ _LABEL_KEYS = ("good", "inaccuracy", "mistake", "blunder", "brilliant")
 LOW_VOLUME_MOVE_CAP = 50
 LOW_VOLUME_SCORE_MAX = 80
 ERROR_PRESENT_SCORE_MAX = 95
+ERROR_RATE_STRICT_CAP_THRESHOLD = 0.02
+ERROR_RATE_STRICT_CAP_MAX = 90
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -180,11 +184,40 @@ def _accumulate_window(window: _WindowAggregates, signals: _GameSignals) -> None
 
 
 def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], Dict[str, Any]]:
+    try:
+        assert int(window.total_moves) >= int(window.primary_games)
+    except AssertionError:
+        logger.error(
+            "Trait window integrity violation: total_moves=%s primary_games=%s",
+            int(window.total_moves),
+            int(window.primary_games),
+        )
+        scores = _neutral_scores()
+        return scores, {
+            "coverage": 0.0,
+            "integrity_violation": True,
+            "missing_primary_data": True,
+            "primary_games": int(window.primary_games),
+            "total_moves": int(window.total_moves),
+            "total_errors": 0,
+            "max_allowed_score": int(NEUTRAL_SCORE),
+            "tactical_awareness_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
+            "material_discipline_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
+            "conversion_ability_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
+            "defensive_resilience_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
+            "blunder_frequency_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
+        }
+
     if window.primary_games <= 0 or window.total_moves <= 0:
         scores = _neutral_scores()
         return scores, {
             "coverage": 0.0,
+            "integrity_violation": False,
             "missing_primary_data": True,
+            "primary_games": int(window.primary_games),
+            "total_moves": int(window.total_moves),
+            "total_errors": 0,
+            "max_allowed_score": int(NEUTRAL_SCORE),
             "tactical_awareness_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
             "material_discipline_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
             "conversion_ability_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
@@ -272,7 +305,12 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
     )
     components = {
         "coverage": round(coverage, 4),
+        "integrity_violation": False,
         "missing_primary_data": bool(window.primary_games < window.payload_count),
+        "primary_games": int(window.primary_games),
+        "total_moves": int(window.total_moves),
+        "total_errors": int(total_errors),
+        "max_allowed_score": int(guardrails.get("max_allowed_score", 100)),
         "guardrails": guardrails,
         "window_totals": {
             "payload_count": int(window.payload_count),
@@ -333,8 +371,11 @@ def _apply_score_guardrails(
     total_moves: int,
 ) -> tuple[Dict[str, int], Dict[str, Any]]:
     max_allowed = 100
+    error_rate = float(total_errors) / float(max(1, total_moves))
     if int(total_errors) > 0:
         max_allowed = min(max_allowed, ERROR_PRESENT_SCORE_MAX)
+    if int(total_errors) > 0 and float(error_rate) > ERROR_RATE_STRICT_CAP_THRESHOLD:
+        max_allowed = min(max_allowed, ERROR_RATE_STRICT_CAP_MAX)
     if int(total_moves) < LOW_VOLUME_MOVE_CAP:
         max_allowed = min(max_allowed, LOW_VOLUME_SCORE_MAX)
 
@@ -344,8 +385,11 @@ def _apply_score_guardrails(
     return capped_scores, {
         "total_errors": int(total_errors),
         "total_moves": int(total_moves),
+        "error_rate": round(error_rate, 6),
+        "error_rate_strict_cap_threshold": float(ERROR_RATE_STRICT_CAP_THRESHOLD),
         "low_volume_threshold_moves": int(LOW_VOLUME_MOVE_CAP),
         "error_cap_applied": bool(int(total_errors) > 0),
+        "error_rate_strict_cap_applied": bool(int(total_errors) > 0 and float(error_rate) > ERROR_RATE_STRICT_CAP_THRESHOLD),
         "low_volume_cap_applied": bool(int(total_moves) < LOW_VOLUME_MOVE_CAP),
         "max_allowed_score": int(max_allowed),
     }

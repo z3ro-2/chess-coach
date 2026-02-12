@@ -68,3 +68,8 @@ def test_traits_debug_output_emits_components_when_enabled(monkeypatch, capsys) 
     assert '"conversion_ability_components"' in captured.err
     assert '"defensive_resilience_components"' in captured.err
     assert '"blunder_frequency_components"' in captured.err
+    assert '"coverage":' in captured.err
+    assert '"total_errors":' in captured.err
+    assert '"primary_games":' in captured.err
+    assert '"total_moves":' in captured.err
+    assert '"max_allowed_score":' in captured.err

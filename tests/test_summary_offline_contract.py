@@ -213,7 +213,7 @@ def test_trait_scoring_logic_correctness_with_fixture(predictable_key_payloads) 
     assert scores == {
         "tactical_awareness": 58,
         "material_discipline": 64,
-        "conversion_ability": 95,
+        "conversion_ability": 90,
         "defensive_resilience": 75,
         "blunder_frequency": 80,
     }
