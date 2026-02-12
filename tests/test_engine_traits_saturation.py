@@ -38,7 +38,7 @@ def test_saturation_repro_with_label_counts_and_four_positions() -> None:
     scores = compute_engine_trait_scores([payload])
 
     assert scores == {
-        "tactical_awareness": 63,
+        "tactical_awareness": 41,
         "material_discipline": 65,
         "conversion_ability": 50,
         "defensive_resilience": 74,

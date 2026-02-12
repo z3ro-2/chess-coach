@@ -234,8 +234,9 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
     severe_material_rate = float(window.severe_material_events) / float(max(1, window.primary_games))
     mate_threat_rate = float(window.mate_threat_events) / float(max(1, window.primary_games))
 
-    tactical_base = _score_from_error_rate(mistake_rate + blunder_rate)
-    tactical_raw = tactical_base + min(6.0, brilliant_rate * 200.0) - min(10.0, mate_threat_rate * 4.0)
+    error_signal = (mistake_rate * 1.0) + (blunder_rate * 2.5)
+    tactical_base = _score_from_error_rate(error_signal)
+    tactical_raw = tactical_base + min(3.0, brilliant_rate * 100.0) - min(12.0, mate_threat_rate * 5.0)
 
     weighted_material_error = (blunder_rate * 1.8) + (mistake_rate * 0.4)
     material_base = _score_from_error_rate(weighted_material_error)

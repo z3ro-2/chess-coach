@@ -77,7 +77,7 @@ def test_average_player_payload_produces_mid_scores() -> None:
     ]
 
     scores = compute_engine_trait_scores(payloads)
-    assert 40 <= scores["tactical_awareness"] <= 70
+    assert 20 <= scores["tactical_awareness"] <= 40
     assert 40 <= scores["material_discipline"] <= 70
     assert 50 <= scores["defensive_resilience"] <= 80
     assert 60 <= scores["blunder_frequency"] <= 85
@@ -318,3 +318,65 @@ def test_malformed_window_integrity_returns_neutral_scores(caplog) -> None:
     }
     assert components["integrity_violation"] is True
     assert "Trait window integrity violation" in caplog.text
+
+
+def test_tactical_awareness_is_low_with_high_blunder_rate() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="0-1",
+            total_moves=100,
+            total_plies=200,
+            label_counts={"good": 65, "inaccuracy": 10, "mistake": 5, "blunder": 20, "brilliant": 0},
+            key_positions=[],
+        )
+    ]
+    scores = compute_engine_trait_scores(payloads)
+    assert scores["tactical_awareness"] <= 25
+
+
+def test_tactical_awareness_is_mid_with_moderate_mistake_and_blunder_rates() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="1/2-1/2",
+            total_moves=100,
+            total_plies=200,
+            label_counts={"good": 82, "inaccuracy": 7, "mistake": 8, "blunder": 3, "brilliant": 0},
+            key_positions=[],
+        )
+    ]
+    scores = compute_engine_trait_scores(payloads)
+    assert 40 <= scores["tactical_awareness"] <= 70
+
+
+def test_tactical_awareness_is_high_but_not_inflated_for_brilliant_only_payload() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=120,
+            total_plies=240,
+            label_counts={"good": 117, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 3},
+            key_positions=[],
+        )
+    ]
+    scores = compute_engine_trait_scores(payloads)
+    assert 95 <= scores["tactical_awareness"] <= 100
+
+
+def test_tactical_awareness_never_exceeds_guardrail_max_allowed_score() -> None:
+    window = _WindowAggregates(
+        payload_count=1,
+        primary_games=1,
+        total_moves=40,
+        total_good=40,
+        total_inaccuracy=0,
+        total_mistake=0,
+        total_blunder=0,
+        total_brilliant=0,
+        win_games=1,
+        win_moves=40,
+    )
+    scores, components = _compute_window_scores(window)
+    assert scores["tactical_awareness"] <= int(components["max_allowed_score"])

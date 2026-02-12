@@ -211,7 +211,7 @@ def test_player_summary_math_correctness_with_fixture(known_recent_meta) -> None
 def test_trait_scoring_logic_correctness_with_fixture(predictable_key_payloads) -> None:
     scores = compute_engine_trait_scores(predictable_key_payloads)
     assert scores == {
-        "tactical_awareness": 58,
+        "tactical_awareness": 40,
         "material_discipline": 64,
         "conversion_ability": 90,
         "defensive_resilience": 75,
@@ -236,7 +236,7 @@ def test_rolling_window_summary_results_use_expected_window(monkeypatch, tmp_pat
 
     assert seen["window_size"] == 2
     assert scores == {
-        "tactical_awareness": 70,
+        "tactical_awareness": 59,
         "material_discipline": 76,
         "conversion_ability": 80,
         "defensive_resilience": 80,
