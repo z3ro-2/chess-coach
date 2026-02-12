@@ -279,12 +279,15 @@ def test_print_backfill_summary_uses_run_backfill_counts(monkeypatch, tmp_path, 
     )
     monkeypatch.setattr(
         chess_review,
-        "fetch_recent_games",
-        lambda *_args, **_kwargs: [
-            _raw_game(game_id=1, end_time=1_706_000_100),
-            _raw_game(game_id=2, end_time=1_706_000_200),
-            _raw_game(game_id=3, end_time=1_706_000_300),
-        ],
+        "_fetch_backfill_candidates",
+        lambda **_kwargs: (
+            [
+                chess_review.parse_game(_raw_game(game_id=1, end_time=1_706_000_100), "logan"),
+                chess_review.parse_game(_raw_game(game_id=2, end_time=1_706_000_200), "logan"),
+                chess_review.parse_game(_raw_game(game_id=3, end_time=1_706_000_300), "logan"),
+            ],
+            3,
+        ),
     )
     monkeypatch.setattr(
         chess_review,

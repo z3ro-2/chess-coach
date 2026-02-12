@@ -988,6 +988,55 @@ def fetch_recent_games(username: str, lookback_days: int) -> List[Dict[str, Any]
     return games
 
 
+def _fetch_backfill_candidates(
+    *,
+    username: str,
+    lookback_days: int,
+    rules_filter: Optional[str],
+    target_valid_games: int,
+) -> Tuple[List[GameInfo], int]:
+    """
+    Fetch candidate games for backfill, stopping once enough valid games are collected.
+
+    Returns:
+      - parsed candidate games passing username/rules filters
+      - number of valid games considered before final top-N selection
+    """
+    now_utc = datetime.now(timezone.utc)
+    months = _month_range_for_lookback(now_utc, lookback_days)
+    valid_games_target = max(1, int(target_valid_games))
+
+    parsed: List[GameInfo] = []
+    considered_count = 0
+    for y, m in reversed(months):
+        url = CHESSCOM_GAMES_URL.format(username=username.lower(), year=y, month=m)
+        try:
+            data = _http_get_json(url)
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 404:
+                continue
+            raise ChessComError(f"Chess.com API error for {url}: {e}")
+
+        month_games = data.get("games", [])
+        if not isinstance(month_games, list):
+            continue
+
+        for raw in month_games:
+            game = parse_game(raw, username)
+            if game is None:
+                continue
+            if rules_filter and game.rules != rules_filter:
+                continue
+            parsed.append(game)
+            considered_count += 1
+
+        # Stop only after finishing the current month to keep month-level determinism.
+        if considered_count >= valid_games_target:
+            break
+
+    return parsed, considered_count
+
+
 def _normalize_username(u: str) -> str:
     return (u or "").strip().lower()
 
@@ -1345,21 +1394,16 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
 
 def _select_backfill_games(args: argparse.Namespace) -> Tuple[List[GameInfo], int]:
     lookback_days = max(int(getattr(args, "lookback_days", 10) or 10), 3650)
-    raw_games = fetch_recent_games(args.username, lookback_days)
-    fetched_count = len(raw_games)
-
-    parsed: List[GameInfo] = []
-    for raw in raw_games:
-        game = parse_game(raw, args.username)
-        if game is None:
-            continue
-        if args.rules_filter and game.rules != args.rules_filter:
-            continue
-        parsed.append(game)
-
-    parsed.sort(key=lambda g: g.end_time, reverse=True)
     backfill_n = max(1, int(getattr(args, "backfill", 0) or 0))
-    return parsed[:backfill_n], fetched_count
+    scan_target = backfill_n + 25
+    parsed, considered_count = _fetch_backfill_candidates(
+        username=str(args.username),
+        lookback_days=lookback_days,
+        rules_filter=str(args.rules_filter) if getattr(args, "rules_filter", None) else None,
+        target_valid_games=scan_target,
+    )
+    parsed.sort(key=lambda g: (g.end_time, g.game_url), reverse=True)
+    return parsed[:backfill_n], considered_count
 
 
 def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str, Any]:

@@ -151,6 +151,7 @@ Constraints:
 - max limit = 200
 - exit code `0` on success
 - exit with error if engine fails
+- `games fetched from chess.com` means valid games parsed and considered before final top-`N` selection
 
 If `N > 200`, backfill aborts with:
 
