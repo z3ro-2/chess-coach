@@ -109,7 +109,10 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         recent_games=max(20, cadence),
     )
     recent_meta = app._load_recent_game_meta_for_summary(conn, cadence)
-    trait_scores = app._compute_trait_scores_for_window(conn, args, window_size=trait_window)
+    trait_window_metrics = app._compute_trait_scores_and_window_metrics(conn, args, window_size=trait_window)
+    trait_scores = dict(trait_window_metrics.get("scores") or {})
+    trait_window_moves = int(trait_window_metrics.get("trait_window_moves", 0) or 0)
+    trait_confidence = str(trait_window_metrics.get("confidence", "LOW") or "LOW")
     summary_context = app._load_latest_summary_context(conn)
     summary_md = app._generate_player_summary_markdown(
         args,
@@ -119,6 +122,8 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         recent_meta=recent_meta,
         trait_scores=trait_scores,
         trait_window_size=trait_window,
+        trait_window_moves=trait_window_moves,
+        trait_confidence=trait_confidence,
         summary_context=summary_context,
     )
     summary_path = Path(args.out) / "player_summary.md"

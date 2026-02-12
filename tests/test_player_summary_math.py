@@ -89,6 +89,8 @@ def test_generate_player_summary_prompt_uses_precomputed_percentages(monkeypatch
         recent_meta=recent_meta,
         trait_scores=trait_scores,
         trait_window_size=20,
+        trait_window_moves=420,
+        trait_confidence="MEDIUM",
         summary_context=summary_context,
     )
 
@@ -98,6 +100,7 @@ def test_generate_player_summary_prompt_uses_precomputed_percentages(monkeypatch
     assert "Authoritative summary_context JSON" in user_msg
     assert "Authoritative performance_summary JSON" in user_msg
     assert "Authoritative trait_scores JSON" in user_msg
+    assert "Authoritative trait_window JSON" in user_msg
     assert "Do not compute, infer, or recompute any metric." in user_msg
     assert "Do not do arithmetic, percentages, ranking, or score derivation." in user_msg
     assert "## Snapshot" in user_msg
@@ -109,11 +112,12 @@ def test_generate_player_summary_prompt_uses_precomputed_percentages(monkeypatch
     assert "round(" not in user_msg
 
     matches = re.findall(r"```json\n(.*?)\n```", user_msg, flags=re.DOTALL)
-    assert len(matches) >= 4
+    assert len(matches) >= 5
     context_summary = json.loads(matches[0])
     performance_summary = json.loads(matches[1])
     trait_summary = json.loads(matches[2])
-    weakness_summary = json.loads(matches[3])
+    trait_window = json.loads(matches[3])
+    weakness_summary = json.loads(matches[4])
     assert context_summary == summary_context
     assert performance_summary == {
         "total_games": 3,
@@ -125,5 +129,18 @@ def test_generate_player_summary_prompt_uses_precomputed_percentages(monkeypatch
         "draw_pct": 33.3,
     }
     assert trait_summary == trait_scores
+    assert trait_window == {
+        "trait_window_games": 20,
+        "trait_window_moves": 420,
+        "confidence": "MEDIUM",
+    }
     assert weakness_summary["trait_name"] == "Conversion Ability"
     assert weakness_summary["score"] == 78
+
+
+def test_trait_confidence_tiers_are_deterministic() -> None:
+    assert chess_review._trait_confidence_from_moves(0) == "LOW"
+    assert chess_review._trait_confidence_from_moves(199) == "LOW"
+    assert chess_review._trait_confidence_from_moves(200) == "MEDIUM"
+    assert chess_review._trait_confidence_from_moves(599) == "MEDIUM"
+    assert chess_review._trait_confidence_from_moves(600) == "HIGH"

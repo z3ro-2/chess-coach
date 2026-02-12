@@ -574,10 +574,56 @@ def _compute_trait_scores_for_window(
     *,
     window_size: int,
 ) -> Dict[str, int]:
+    return dict(_compute_trait_scores_and_window_metrics(conn, args, window_size=window_size)["scores"])
+
+
+def _payload_total_moves(payload: Mapping[str, Any]) -> int:
+    summary = payload.get("game_summary")
+    if not isinstance(summary, Mapping):
+        return 0
+    total_moves = 0
+    try:
+        total_moves = int(summary.get("total_moves", 0) or 0)
+    except Exception:
+        total_moves = 0
+    if total_moves > 0:
+        return total_moves
+    total_plies = 0
+    try:
+        total_plies = int(summary.get("total_plies", 0) or 0)
+    except Exception:
+        total_plies = 0
+    if total_plies > 0:
+        return max(1, int(round(total_plies / 2.0)))
+    return 0
+
+
+def _trait_confidence_from_moves(total_moves: int) -> str:
+    moves = max(0, int(total_moves or 0))
+    if moves >= 600:
+        return "HIGH"
+    if moves >= 200:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _compute_trait_scores_and_window_metrics(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    *,
+    window_size: int,
+) -> Dict[str, Any]:
     from src.engine_traits import compute_engine_trait_scores
 
     payloads = _load_engine_payloads_for_trait_window(conn, args, window_size=window_size)
-    return compute_engine_trait_scores(payloads)
+    total_moves = sum(_payload_total_moves(payload) for payload in payloads)
+    scores = compute_engine_trait_scores(payloads)
+    return {
+        "scores": dict(scores),
+        "trait_window_games": max(1, int(window_size)),
+        "trait_window_moves": max(0, int(total_moves)),
+        "confidence": _trait_confidence_from_moves(total_moves),
+    }
 
 
 def _load_latest_summary_context(conn: sqlite3.Connection) -> Dict[str, str]:
@@ -721,6 +767,7 @@ def _build_player_summary_prompt(
     summary_context: Mapping[str, Any],
     performance_summary: Mapping[str, Any],
     trait_scores: Mapping[str, Any],
+    trait_window: Mapping[str, Any],
     primary_weakness: Mapping[str, Any],
 ) -> Tuple[str, str]:
     system_msg = (
@@ -761,6 +808,15 @@ def _build_player_summary_prompt(
         ensure_ascii=True,
         separators=(",", ":"),
     )
+    trait_window_json = json.dumps(
+        {
+            "trait_window_games": int(trait_window.get("trait_window_games", 0) or 0),
+            "trait_window_moves": int(trait_window.get("trait_window_moves", 0) or 0),
+            "confidence": str(trait_window.get("confidence", "LOW") or "LOW"),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
     primary_weakness_json = json.dumps(
         {
             "trait_name": str(primary_weakness.get("trait_name", "Unknown trait") or "Unknown trait"),
@@ -786,6 +842,11 @@ Authoritative performance_summary JSON (use exact values):
 Authoritative trait_scores JSON (use exact values):
 ```json
 {trait_scores_json}
+```
+
+Authoritative trait_window JSON (use exact values):
+```json
+{trait_window_json}
 ```
 
 Authoritative primary_weakness JSON (use exact values):
@@ -815,12 +876,18 @@ result: <summary_context.result>
 win_pct: <performance_summary.win_pct>
 loss_pct: <performance_summary.loss_pct>
 draw_pct: <performance_summary.draw_pct>
+trait_window_games: <trait_window.trait_window_games>
+trait_window_moves: <trait_window.trait_window_moves>
+confidence: <trait_window.confidence>
 ---
 
 ## Snapshot
 - Total games: <performance_summary.total_games>
 - Record: <performance_summary.wins>–<performance_summary.losses>–<performance_summary.draws>
 - Win rate: <performance_summary.win_pct>%
+- Trait window games: <trait_window.trait_window_games>
+- Trait window moves analyzed: <trait_window.trait_window_moves>
+- Confidence: <trait_window.confidence>
 
 ## Engine-Derived Traits
 - Tactical Awareness: <trait_scores.tactical_awareness>
@@ -849,6 +916,8 @@ def _generate_player_summary_markdown(
     recent_meta: List[Tuple[int, str, str, Optional[int], str]],
     trait_scores: Mapping[str, Any],
     trait_window_size: int,
+    trait_window_moves: int,
+    trait_confidence: str,
     summary_context: Mapping[str, Any],
 ) -> str:
     _ = processed_count
@@ -858,10 +927,16 @@ def _generate_player_summary_markdown(
     _ = trait_window_size
     performance_summary = _build_performance_summary(recent_meta)
     primary_weakness = _primary_weakness_from_trait_scores(trait_scores)
+    trait_window = {
+        "trait_window_games": int(trait_window_size),
+        "trait_window_moves": int(trait_window_moves),
+        "confidence": str(trait_confidence),
+    }
     system_msg, user_msg = _build_player_summary_prompt(
         summary_context=summary_context,
         performance_summary=performance_summary,
         trait_scores=trait_scores,
+        trait_window=trait_window,
         primary_weakness=primary_weakness,
     )
     provider = get_provider()
@@ -904,7 +979,14 @@ def _maybe_generate_player_summary(
 
     recent_meta = _load_recent_game_meta_for_summary(conn, cadence)
     trait_window_size = max(1, int(getattr(args, "player_trait_window", 20) or 20))
-    trait_scores = _compute_trait_scores_for_window(conn, args, window_size=trait_window_size)
+    trait_window_metrics = _compute_trait_scores_and_window_metrics(
+        conn,
+        args,
+        window_size=trait_window_size,
+    )
+    trait_scores = dict(trait_window_metrics.get("scores") or {})
+    trait_window_moves = int(trait_window_metrics.get("trait_window_moves", 0) or 0)
+    trait_confidence = str(trait_window_metrics.get("confidence", "LOW") or "LOW")
     summary_context = _load_latest_summary_context(conn)
     summary_md = _generate_player_summary_markdown(
         args,
@@ -914,6 +996,8 @@ def _maybe_generate_player_summary(
         recent_meta=recent_meta,
         trait_scores=trait_scores,
         trait_window_size=trait_window_size,
+        trait_window_moves=trait_window_moves,
+        trait_confidence=trait_confidence,
         summary_context=summary_context,
     )
     summary_path = args.out / "player_summary.md"

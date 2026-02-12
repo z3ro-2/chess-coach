@@ -247,3 +247,43 @@ def test_traits_change_when_backfill_payload_changes(tmp_path) -> None:
     assert after["material_discipline"] > before["material_discipline"]
     assert after["blunder_frequency"] > before["blunder_frequency"]
     assert after != before
+
+
+def test_trait_window_metrics_include_moves_and_confidence_tier(tmp_path) -> None:
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        _insert_payload(
+            conn,
+            game_id=301,
+            end_time=1_706_000_100,
+            payload=_payload(
+                your_color="white",
+                result="1-0",
+                total_moves=120,
+                label_counts={"good": 100, "inaccuracy": 10, "mistake": 8, "blunder": 2, "brilliant": 0},
+                key_positions=[],
+            ),
+        )
+        _insert_payload(
+            conn,
+            game_id=302,
+            end_time=1_706_000_200,
+            payload=_payload(
+                your_color="white",
+                result="1/2-1/2",
+                total_moves=140,
+                label_counts={"good": 114, "inaccuracy": 12, "mistake": 10, "blunder": 4, "brilliant": 0},
+                key_positions=[],
+            ),
+        )
+        metrics = chess_review._compute_trait_scores_and_window_metrics(
+            conn,
+            SimpleNamespace(),
+            window_size=20,
+        )
+    finally:
+        conn.close()
+
+    assert metrics["trait_window_games"] == 20
+    assert metrics["trait_window_moves"] == 260
+    assert metrics["confidence"] == "MEDIUM"

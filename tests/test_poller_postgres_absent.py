@@ -153,13 +153,18 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
     monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# game review")
     monkeypatch.setattr(
         chess_review,
-        "_compute_trait_scores_for_window",
+        "_compute_trait_scores_and_window_metrics",
         lambda *_args, **_kwargs: {
-            "tactical_awareness": 90,
-            "material_discipline": 85,
-            "conversion_ability": 80,
-            "defensive_resilience": 75,
-            "blunder_frequency": 95,
+            "scores": {
+                "tactical_awareness": 90,
+                "material_discipline": 85,
+                "conversion_ability": 80,
+                "defensive_resilience": 75,
+                "blunder_frequency": 95,
+            },
+            "trait_window_games": 20,
+            "trait_window_moves": 320,
+            "confidence": "MEDIUM",
         },
     )
 

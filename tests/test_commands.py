@@ -78,11 +78,16 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
 
     monkeypatch.setattr(chess_review, "call_ollama_generate", _fake_ollama_generate)
 
-    def _fake_trait_scores(_conn, _args, *, window_size: int):
+    def _fake_trait_window_metrics(_conn, _args, *, window_size: int):
         assert window_size == 7
-        return trait_scores
+        return {
+            "scores": trait_scores,
+            "trait_window_games": 7,
+            "trait_window_moves": 350,
+            "confidence": "MEDIUM",
+        }
 
-    monkeypatch.setattr(chess_review, "_compute_trait_scores_for_window", _fake_trait_scores)
+    monkeypatch.setattr(chess_review, "_compute_trait_scores_and_window_metrics", _fake_trait_window_metrics)
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
