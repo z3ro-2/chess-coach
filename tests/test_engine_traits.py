@@ -171,3 +171,74 @@ def test_scores_are_integers_and_clamped() -> None:
     for value in scores.values():
         assert isinstance(value, int)
         assert 0 <= value <= 100
+
+
+def test_window_of_twenty_mixed_games_produces_non_perfect_scores() -> None:
+    payloads: list[dict] = []
+    for idx in range(20):
+        is_win = idx % 3 == 0
+        result = "1-0" if is_win else ("1/2-1/2" if idx % 2 == 0 else "0-1")
+        label_counts = {
+            "good": 26,
+            "inaccuracy": 7,
+            "mistake": 4,
+            "blunder": 3,
+            "brilliant": 0,
+        }
+        key_positions = [
+            {"player": "White", "move_number": 32, "label": "mistake", "tactical_flag": "mate_threat", "material_change": -3},
+            {"player": "White", "move_number": 36, "label": "blunder", "tactical_flag": "none", "material_change": -4},
+        ]
+        payloads.append(
+            _payload(
+                your_color="white",
+                result=result,
+                total_moves=40,
+                total_plies=80,
+                label_counts=label_counts,
+                key_positions=key_positions,
+            )
+        )
+
+    scores = compute_engine_trait_scores(payloads)
+    assert scores["tactical_awareness"] < 100
+    assert scores["material_discipline"] < 100
+    assert scores["conversion_ability"] < 100
+    assert scores["defensive_resilience"] < 100
+    assert scores["blunder_frequency"] < 100
+
+
+def test_adding_more_blunders_monotonically_decreases_window_scores() -> None:
+    base_payloads: list[dict] = []
+    for idx in range(20):
+        result = "1-0" if idx % 2 == 0 else "1/2-1/2"
+        base_payloads.append(
+            _payload(
+                your_color="white",
+                result=result,
+                total_moves=40,
+                total_plies=80,
+                label_counts={"good": 31, "inaccuracy": 5, "mistake": 3, "blunder": 1, "brilliant": 0},
+                key_positions=[{"player": "White", "move_number": 35, "label": "mistake", "tactical_flag": "none", "material_change": -2}],
+            )
+        )
+
+    noisier_payloads = list(base_payloads)
+    for _ in range(5):
+        noisier_payloads.append(
+            _payload(
+                your_color="white",
+                result="0-1",
+                total_moves=40,
+                total_plies=80,
+                label_counts={"good": 20, "inaccuracy": 6, "mistake": 7, "blunder": 7, "brilliant": 0},
+                key_positions=[{"player": "White", "move_number": 34, "label": "blunder", "tactical_flag": "mate_threat", "material_change": -5}],
+            )
+        )
+
+    base_scores = compute_engine_trait_scores(base_payloads)
+    noisier_scores = compute_engine_trait_scores(noisier_payloads)
+
+    assert noisier_scores["tactical_awareness"] < base_scores["tactical_awareness"]
+    assert noisier_scores["material_discipline"] < base_scores["material_discipline"]
+    assert noisier_scores["blunder_frequency"] < base_scores["blunder_frequency"]
