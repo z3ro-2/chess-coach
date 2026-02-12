@@ -14,130 +14,143 @@ def _payload(
     *,
     your_color: str,
     result: str,
-    total_moves: int,
+    total_moves: int | None,
+    total_plies: int | None,
+    label_counts: dict | None,
     key_positions: list[dict],
 ) -> dict:
+    summary: dict = {
+        "your_color": your_color,
+        "result": result,
+    }
+    if total_moves is not None:
+        summary["total_moves"] = total_moves
+    if total_plies is not None:
+        summary["total_plies"] = total_plies
+    if label_counts is not None:
+        summary["label_counts"] = label_counts
     return {
-        "game_summary": {
-            "your_color": your_color,
-            "result": result,
-            "total_moves": total_moves,
-        },
+        "game_summary": summary,
         "key_positions": key_positions,
     }
 
 
-def test_tactical_awareness_uses_deterministic_penalties() -> None:
+def test_bad_player_payload_produces_low_scores() -> None:
     payloads = [
-        _payload(
-            your_color="white",
-            result="1-0",
-            total_moves=30,
-            key_positions=[
-                {"player": "White", "label": "blunder", "tactical_flag": "hanging_piece"},
-                {"player": "White", "label": "mistake", "tactical_flag": "tactical_miss"},
-                {"player": "Black", "label": "blunder", "tactical_flag": "hanging_piece"},
-            ],
-        )
-    ]
-
-    # 100 - 8 (blunder) - 6 (hanging_piece) - 4 (tactical_miss) = 82
-    assert tactical_awareness(payloads) == 82
-
-
-def test_material_discipline_uses_negative_material_change_only() -> None:
-    payloads = [
-        _payload(
-            your_color="white",
-            result="1-0",
-            total_moves=30,
-            key_positions=[
-                {"player": "White", "material_change": -2},
-                {"player": "White", "material_change": -3},
-                {"player": "White", "material_change": 1},
-                {"player": "Black", "material_change": -9},
-            ],
-        )
-    ]
-
-    # material_loss_total = 5 -> 100 - (5*3) = 85
-    assert material_discipline(payloads) == 85
-
-
-def test_conversion_ability_penalizes_non_win_after_early_plus_three() -> None:
-    payloads = [
-        _payload(
-            your_color="white",
-            result="1-0",
-            total_moves=30,
-            key_positions=[{"player": "White", "move_number": 4, "material_change": 3}],
-        ),
-        _payload(
-            your_color="white",
-            result="1/2-1/2",
-            total_moves=30,
-            key_positions=[{"player": "White", "move_number": 5, "material_change": 4}],
-        ),
         _payload(
             your_color="white",
             result="0-1",
-            total_moves=30,
-            key_positions=[{"player": "White", "move_number": 20, "material_change": 5}],
-        ),
+            total_moves=40,
+            total_plies=80,
+            label_counts={"good": 18, "inaccuracy": 8, "mistake": 6, "blunder": 5, "brilliant": 0},
+            key_positions=[
+                {"player": "White", "move_number": 30, "label": "blunder", "tactical_flag": "mate_threat", "material_change": -4},
+                {"player": "White", "move_number": 36, "label": "mistake", "tactical_flag": "mate_threat", "material_change": -3},
+            ],
+        )
     ]
 
-    # 2 opportunities (early +3+) and 1 conversion -> 50
-    assert conversion_ability(payloads) == 50
+    scores = compute_engine_trait_scores(payloads)
+    assert scores["tactical_awareness"] <= 20
+    assert scores["material_discipline"] <= 20
+    assert scores["defensive_resilience"] <= 40
+    assert scores["blunder_frequency"] <= 40
+    # Non-win games are neutral for conversion_ability by definition.
+    assert scores["conversion_ability"] == 50
 
 
-def test_defensive_resilience_rewards_non_losses_under_material_pressure() -> None:
+def test_average_player_payload_produces_mid_scores() -> None:
     payloads = [
         _payload(
             your_color="white",
             result="1/2-1/2",
             total_moves=40,
+            total_plies=80,
+            label_counts={"good": 25, "inaccuracy": 7, "mistake": 5, "blunder": 2, "brilliant": 1},
             key_positions=[
-                {"player": "White", "material_change": -4},
+                {"player": "White", "move_number": 28, "label": "mistake", "tactical_flag": "none", "material_change": -3},
+                {"player": "White", "move_number": 34, "label": "mistake", "tactical_flag": "mate_threat", "material_change": -1},
             ],
-        ),
-        _payload(
-            your_color="white",
-            result="0-1",
-            total_moves=40,
-            key_positions=[
-                {"player": "White", "material_change": -5},
-            ],
-        ),
+        )
     ]
 
-    # 2 pressure games, 1 resilient game -> 50
-    assert defensive_resilience(payloads) == 50
+    scores = compute_engine_trait_scores(payloads)
+    assert 40 <= scores["tactical_awareness"] <= 70
+    assert 40 <= scores["material_discipline"] <= 70
+    assert 50 <= scores["defensive_resilience"] <= 80
+    assert 60 <= scores["blunder_frequency"] <= 85
+    assert scores["conversion_ability"] == 50
 
 
-def test_blunder_frequency_transforms_ratio_to_zero_to_hundred() -> None:
+def test_clean_games_produce_high_scores() -> None:
     payloads = [
         _payload(
             your_color="white",
             result="1-0",
-            total_moves=20,
-            key_positions=[
-                {"player": "White", "label": "blunder"},
-                {"player": "White", "label": "mistake"},
-            ],
+            total_moves=50,
+            total_plies=100,
+            label_counts={"good": 45, "inaccuracy": 3, "mistake": 1, "blunder": 0, "brilliant": 1},
+            key_positions=[{"player": "White", "move_number": 45, "label": "good", "tactical_flag": "none", "material_change": 0}],
         ),
         _payload(
             your_color="white",
-            result="0-1",
-            total_moves=20,
-            key_positions=[
-                {"player": "White", "label": "blunder"},
-                {"player": "Black", "label": "blunder"},
-            ],
+            result="1/2-1/2",
+            total_moves=48,
+            total_plies=96,
+            label_counts={"good": 42, "inaccuracy": 4, "mistake": 1, "blunder": 0, "brilliant": 1},
+            key_positions=[{"player": "White", "move_number": 40, "label": "good", "tactical_flag": "none", "material_change": 0}],
         ),
     ]
 
-    # total_blunders = 2, total_moves = 40 -> 1 - 0.05 = 0.95 -> 95
-    assert blunder_frequency(payloads) == 95
+    scores = compute_engine_trait_scores(payloads)
+    assert scores["tactical_awareness"] >= 85
+    assert scores["material_discipline"] >= 85
+    assert scores["conversion_ability"] >= 70
+    assert scores["defensive_resilience"] >= 70
+    assert scores["blunder_frequency"] >= 95
+
+
+def test_missing_primary_fields_returns_neutral_scores() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="0-1",
+            total_moves=None,
+            total_plies=None,
+            label_counts=None,
+            key_positions=[
+                {"player": "White", "move_number": 24, "label": "blunder", "tactical_flag": "mate_threat", "material_change": -9}
+            ],
+        )
+    ]
+
+    scores = compute_engine_trait_scores(payloads)
+    assert scores == {
+        "tactical_awareness": 50,
+        "material_discipline": 50,
+        "conversion_ability": 50,
+        "defensive_resilience": 50,
+        "blunder_frequency": 50,
+    }
+
+
+def test_individual_trait_functions_match_aggregate_output() -> None:
+    payloads = [
+        _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=32,
+            total_plies=64,
+            label_counts={"good": 23, "inaccuracy": 5, "mistake": 3, "blunder": 1, "brilliant": 0},
+            key_positions=[{"player": "White", "move_number": 26, "label": "mistake", "tactical_flag": "none", "material_change": -2}],
+        )
+    ]
+    scores = compute_engine_trait_scores(payloads)
+    assert tactical_awareness(payloads) == scores["tactical_awareness"]
+    assert material_discipline(payloads) == scores["material_discipline"]
+    assert conversion_ability(payloads) == scores["conversion_ability"]
+    assert defensive_resilience(payloads) == scores["defensive_resilience"]
+    assert blunder_frequency(payloads) == scores["blunder_frequency"]
 
 
 def test_scores_are_integers_and_clamped() -> None:
@@ -145,17 +158,16 @@ def test_scores_are_integers_and_clamped() -> None:
         _payload(
             your_color="white",
             result="0-1",
-            total_moves=1,
+            total_moves=10,
+            total_plies=20,
+            label_counts={"good": 0, "inaccuracy": 0, "mistake": 3, "blunder": 7, "brilliant": 0},
             key_positions=[
-                {"player": "White", "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -20},
-                {"player": "White", "label": "blunder", "tactical_flag": "tactical_miss", "material_change": -20},
-                {"player": "White", "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -20},
+                {"player": "White", "move_number": 7, "label": "blunder", "tactical_flag": "mate_threat", "material_change": -9},
+                {"player": "White", "move_number": 8, "label": "blunder", "tactical_flag": "mate_threat", "material_change": -9},
             ],
         )
     ]
-
     scores = compute_engine_trait_scores(payloads)
     for value in scores.values():
         assert isinstance(value, int)
         assert 0 <= value <= 100
-

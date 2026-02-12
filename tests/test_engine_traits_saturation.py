@@ -37,9 +37,13 @@ def test_saturation_repro_with_label_counts_and_four_positions() -> None:
 
     scores = compute_engine_trait_scores([payload])
 
-    # This intentionally fails on current scoring to document saturation:
-    # all metrics remain 100 despite non-zero label counts and long game length.
-    assert any(value < 100 for value in scores.values())
+    assert scores == {
+        "tactical_awareness": 63,
+        "material_discipline": 65,
+        "conversion_ability": 50,
+        "defensive_resilience": 74,
+        "blunder_frequency": 76,
+    }
 
 
 def test_traits_debug_output_is_disabled_by_default(monkeypatch, capsys) -> None:
@@ -57,7 +61,7 @@ def test_traits_debug_output_emits_components_when_enabled(monkeypatch, capsys) 
     assert "[traits-debug]" in captured.err
     assert '"total_plies": 82' in captured.err
     assert '"total_moves": 41' in captured.err
-    assert '"label_counts": {"blunder": 2, "inaccuracy": 6, "mistake": 3}' in captured.err
+    assert '"label_counts": {"blunder": 2, "brilliant": 0, "good": 0, "inaccuracy": 6, "mistake": 3}' in captured.err
     assert '"key_positions_count": 4' in captured.err
     assert '"tactical_awareness_components"' in captured.err
     assert '"material_discipline_components"' in captured.err

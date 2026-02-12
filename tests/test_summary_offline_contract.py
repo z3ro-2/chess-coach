@@ -65,12 +65,16 @@ def known_recent_meta() -> list[tuple[int, str, str, int | None, str]]:
 
 @pytest.fixture
 def predictable_key_payloads() -> list[dict]:
-    # Deterministic expected scores:
-    # tactical_awareness=70, material_discipline=64, conversion_ability=50,
-    # defensive_resilience=50, blunder_frequency=96
+    # Deterministic expected scores with label_counts + total_plies primary signals.
     return [
         {
-            "game_summary": {"your_color": "white", "result": "1-0", "total_moves": 20},
+            "game_summary": {
+                "your_color": "white",
+                "result": "1-0",
+                "total_moves": 20,
+                "total_plies": 40,
+                "label_counts": {"good": 14, "inaccuracy": 3, "mistake": 2, "blunder": 1, "brilliant": 0},
+            },
             "key_positions": [
                 {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 3},
                 {"player": "White", "move_number": 5, "label": "blunder", "tactical_flag": "hanging_piece", "material_change": -2},
@@ -78,14 +82,26 @@ def predictable_key_payloads() -> list[dict]:
             ],
         },
         {
-            "game_summary": {"your_color": "white", "result": "1/2-1/2", "total_moves": 20},
+            "game_summary": {
+                "your_color": "white",
+                "result": "1/2-1/2",
+                "total_moves": 20,
+                "total_plies": 40,
+                "label_counts": {"good": 17, "inaccuracy": 2, "mistake": 1, "blunder": 0, "brilliant": 0},
+            },
             "key_positions": [
                 {"player": "White", "move_number": 4, "label": "good", "tactical_flag": "none", "material_change": 4},
                 {"player": "White", "move_number": 10, "label": "good", "tactical_flag": "none", "material_change": -4},
             ],
         },
         {
-            "game_summary": {"your_color": "white", "result": "0-1", "total_moves": 10},
+            "game_summary": {
+                "your_color": "white",
+                "result": "0-1",
+                "total_moves": 10,
+                "total_plies": 20,
+                "label_counts": {"good": 6, "inaccuracy": 1, "mistake": 2, "blunder": 1, "brilliant": 0},
+            },
             "key_positions": [
                 {"player": "White", "move_number": 3, "label": "blunder", "tactical_flag": "tactical_miss", "material_change": -5},
             ],
@@ -186,11 +202,11 @@ def test_player_summary_math_correctness_with_fixture(known_recent_meta) -> None
 def test_trait_scoring_logic_correctness_with_fixture(predictable_key_payloads) -> None:
     scores = compute_engine_trait_scores(predictable_key_payloads)
     assert scores == {
-        "tactical_awareness": 70,
-        "material_discipline": 64,
-        "conversion_ability": 50,
-        "defensive_resilience": 50,
-        "blunder_frequency": 96,
+        "tactical_awareness": 50,
+        "material_discipline": 56,
+        "conversion_ability": 67,
+        "defensive_resilience": 61,
+        "blunder_frequency": 75,
     }
 
 
@@ -211,11 +227,11 @@ def test_rolling_window_summary_results_use_expected_window(monkeypatch, tmp_pat
 
     assert seen["window_size"] == 2
     assert scores == {
-        "tactical_awareness": 82,
-        "material_discipline": 79,
-        "conversion_ability": 50,
-        "defensive_resilience": 100,
-        "blunder_frequency": 98,
+        "tactical_awareness": 70,
+        "material_discipline": 76,
+        "conversion_ability": 75,
+        "defensive_resilience": 71,
+        "blunder_frequency": 88,
     }
 
 
@@ -307,4 +323,3 @@ def test_engine_failure_aborts_pipeline_and_sends_telegram(
     assert llm_called["value"] is False
     assert len(telegram_calls) == 1
     assert "Engine failure" in telegram_calls[0]
-

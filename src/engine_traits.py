@@ -5,116 +5,405 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Sequence
+
+NEUTRAL_SCORE = 50
+_LABEL_KEYS = ("good", "inaccuracy", "mistake", "blunder", "brilliant")
+
+
+@dataclass(frozen=True)
+class _GameSignals:
+    summary: Mapping[str, Any]
+    moves: int | None
+    label_counts: Mapping[str, int] | None
+    inaccuracy_rate: float | None
+    mistake_rate: float | None
+    blunder_rate: float | None
+    non_good_rate: float | None
+    brilliant_rate: float | None
+    key_positions_count: int
+    player_key_positions_count: int
+    severe_material_events: int
+    mate_threat_events: int
+    late_error_events: int
+    is_win: bool
+    is_loss: bool
 
 
 def compute_engine_trait_scores(payloads: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     """Compute all deterministic engine-trait scores."""
+    if not payloads:
+        scores = _neutral_scores()
+        if _traits_debug_enabled():
+            _emit_empty_traits_debug(scores)
+        return scores
+
+    tactical_scores: list[int] = []
+    material_scores: list[int] = []
+    conversion_scores: list[int] = []
+    defensive_scores: list[int] = []
+    blunder_scores: list[int] = []
+    debug_rows: list[Dict[str, Any]] = []
+
+    for idx, payload in enumerate(payloads, start=1):
+        signals = _collect_game_signals(payload)
+
+        tactical_score, tactical_components = _tactical_awareness_components(signals)
+        material_score, material_components = _material_discipline_components(signals)
+        conversion_score, conversion_components = _conversion_ability_components(signals)
+        defensive_score, defensive_components = _defensive_resilience_components(signals)
+        blunder_score, blunder_components = _blunder_frequency_components(signals)
+
+        tactical_scores.append(tactical_score)
+        material_scores.append(material_score)
+        conversion_scores.append(conversion_score)
+        defensive_scores.append(defensive_score)
+        blunder_scores.append(blunder_score)
+
+        debug_rows.append(
+            {
+                "payload_index": idx,
+                "total_plies": _as_int(signals.summary.get("total_plies", 0)),
+                "total_moves": int(signals.moves or 0),
+                "label_counts": dict(signals.label_counts or {}),
+                "key_positions_count": signals.key_positions_count,
+                "player_key_positions_count": signals.player_key_positions_count,
+                "tactical_awareness_components": tactical_components,
+                "material_discipline_components": material_components,
+                "conversion_ability_components": conversion_components,
+                "defensive_resilience_components": defensive_components,
+                "blunder_frequency_components": blunder_components,
+            }
+        )
+
     scores = {
-        "tactical_awareness": tactical_awareness(payloads),
-        "material_discipline": material_discipline(payloads),
-        "conversion_ability": conversion_ability(payloads),
-        "defensive_resilience": defensive_resilience(payloads),
-        "blunder_frequency": blunder_frequency(payloads),
+        "tactical_awareness": _aggregate_scores(tactical_scores),
+        "material_discipline": _aggregate_scores(material_scores),
+        "conversion_ability": _aggregate_scores(conversion_scores),
+        "defensive_resilience": _aggregate_scores(defensive_scores),
+        "blunder_frequency": _aggregate_scores(blunder_scores),
     }
     if _traits_debug_enabled():
-        _emit_traits_debug(payloads, scores)
+        _emit_traits_debug(debug_rows, scores)
     return scores
 
 
 def tactical_awareness(payloads: Sequence[Mapping[str, Any]]) -> int:
-    score = 100
-    for payload in payloads:
-        for position in _iter_player_positions(payload):
-            label = str(position.get("label", "")).strip().lower()
-            tactical_flag = str(position.get("tactical_flag", "")).strip().lower()
-            if label == "blunder":
-                score -= 8
-            if tactical_flag == "tactical_miss":
-                score -= 4
-            if tactical_flag == "hanging_piece":
-                score -= 6
-    return _clamp_score(score)
+    return int(compute_engine_trait_scores(payloads)["tactical_awareness"])
 
 
 def material_discipline(payloads: Sequence[Mapping[str, Any]]) -> int:
-    material_loss_total = 0
-    for payload in payloads:
-        for position in _iter_player_positions(payload):
-            material_change = _as_int(position.get("material_change", 0))
-            if material_change < 0:
-                material_loss_total += abs(material_change)
-    return _clamp_score(100 - (material_loss_total * 3))
+    return int(compute_engine_trait_scores(payloads)["material_discipline"])
 
 
 def conversion_ability(payloads: Sequence[Mapping[str, Any]]) -> int:
-    opportunities = 0
-    conversions = 0
-
-    for payload in payloads:
-        summary = _game_summary(payload)
-        total_moves = max(1, _as_int(summary.get("total_moves", 0)))
-        cutoff_move = max(6, total_moves // 3)
-        had_early_advantage = False
-
-        for position in _iter_player_positions(payload):
-            move_number = _as_int(position.get("move_number", 0))
-            material_change = _as_int(position.get("material_change", 0))
-            if move_number <= cutoff_move and material_change >= 3:
-                had_early_advantage = True
-                break
-
-        if not had_early_advantage:
-            continue
-
-        opportunities += 1
-        if _is_player_win(summary):
-            conversions += 1
-
-    if opportunities <= 0:
-        return 100
-    return _clamp_score((conversions / opportunities) * 100.0)
+    return int(compute_engine_trait_scores(payloads)["conversion_ability"])
 
 
 def defensive_resilience(payloads: Sequence[Mapping[str, Any]]) -> int:
-    pressure_games = 0
-    resilient_games = 0
-
-    for payload in payloads:
-        summary = _game_summary(payload)
-        material_swing = 0
-        for position in _iter_player_positions(payload):
-            material_change = _as_int(position.get("material_change", 0))
-            if material_change < 0:
-                material_swing += material_change
-
-        if material_swing < -3:
-            pressure_games += 1
-            if not _is_player_loss(summary):
-                resilient_games += 1
-
-    if pressure_games <= 0:
-        return 100
-    return _clamp_score((resilient_games / pressure_games) * 100.0)
+    return int(compute_engine_trait_scores(payloads)["defensive_resilience"])
 
 
 def blunder_frequency(payloads: Sequence[Mapping[str, Any]]) -> int:
-    total_blunders = 0
-    total_moves = 0
+    return int(compute_engine_trait_scores(payloads)["blunder_frequency"])
 
-    for payload in payloads:
-        summary = _game_summary(payload)
-        total_moves += max(0, _as_int(summary.get("total_moves", 0)))
-        for position in _iter_player_positions(payload):
-            label = str(position.get("label", "")).strip().lower()
-            if label == "blunder":
-                total_blunders += 1
 
-    if total_moves <= 0:
-        return 100
+def _collect_game_signals(payload: Mapping[str, Any]) -> _GameSignals:
+    summary = _game_summary(payload)
+    moves = _effective_moves(summary)
+    label_counts = _normalized_label_counts(summary)
 
-    blunder_ratio = total_blunders / total_moves
-    return _clamp_score((1.0 - blunder_ratio) * 100.0)
+    if moves is not None and label_counts is not None:
+        denom = float(max(1, moves))
+        inaccuracy_rate = float(label_counts["inaccuracy"]) / denom
+        mistake_rate = float(label_counts["mistake"]) / denom
+        blunder_rate = float(label_counts["blunder"]) / denom
+        non_good_rate = float(label_counts["inaccuracy"] + label_counts["mistake"] + label_counts["blunder"]) / denom
+        brilliant_rate = float(label_counts["brilliant"]) / denom
+    else:
+        inaccuracy_rate = None
+        mistake_rate = None
+        blunder_rate = None
+        non_good_rate = None
+        brilliant_rate = None
+
+    player_positions = list(_iter_player_positions(payload))
+    key_positions_count = len(payload.get("key_positions") or [])
+    player_key_positions_count = len(player_positions)
+    severe_material_events = 0
+    mate_threat_events = 0
+    late_error_events = 0
+    late_threshold = max(1, int((moves or 0) * 0.7))
+
+    for position in player_positions:
+        material_change = _as_int(position.get("material_change", 0))
+        tactical_flag = str(position.get("tactical_flag", "")).strip().lower()
+        label = str(position.get("label", "")).strip().lower()
+        move_number = _as_int(position.get("move_number", 0))
+        if material_change <= -3:
+            severe_material_events += 1
+        if tactical_flag == "mate_threat":
+            mate_threat_events += 1
+        if move_number >= late_threshold and label in {"mistake", "blunder"}:
+            late_error_events += 1
+
+    return _GameSignals(
+        summary=summary,
+        moves=moves,
+        label_counts=label_counts,
+        inaccuracy_rate=inaccuracy_rate,
+        mistake_rate=mistake_rate,
+        blunder_rate=blunder_rate,
+        non_good_rate=non_good_rate,
+        brilliant_rate=brilliant_rate,
+        key_positions_count=key_positions_count,
+        player_key_positions_count=player_key_positions_count,
+        severe_material_events=severe_material_events,
+        mate_threat_events=mate_threat_events,
+        late_error_events=late_error_events,
+        is_win=_is_player_win(summary),
+        is_loss=_is_player_loss(summary),
+    )
+
+
+def _tactical_awareness_components(signals: _GameSignals) -> tuple[int, Dict[str, Any]]:
+    if signals.mistake_rate is None or signals.blunder_rate is None or signals.brilliant_rate is None:
+        raw = float(NEUTRAL_SCORE)
+        return NEUTRAL_SCORE, {
+            "missing_primary_data": True,
+            "mistake_rate": None,
+            "blunder_rate": None,
+            "brilliant_rate": None,
+            "mate_threat_events": int(signals.mate_threat_events),
+            "raw_before_clamp": raw,
+        }
+
+    error_rate = float(signals.mistake_rate) + float(signals.blunder_rate)
+    base = _score_from_error_rate(error_rate)
+    brilliant_bonus = min(6.0, float(signals.brilliant_rate) * 200.0)
+    mate_penalty = min(10.0, float(signals.mate_threat_events) * 3.0)
+    raw = base + brilliant_bonus - mate_penalty
+    return _clamp_score(raw), {
+        "missing_primary_data": False,
+        "mistake_rate": round(float(signals.mistake_rate), 4),
+        "blunder_rate": round(float(signals.blunder_rate), 4),
+        "brilliant_rate": round(float(signals.brilliant_rate), 4),
+        "mate_threat_events": int(signals.mate_threat_events),
+        "base_score": round(base, 2),
+        "brilliant_bonus": round(brilliant_bonus, 2),
+        "mate_penalty": round(mate_penalty, 2),
+        "raw_before_clamp": round(raw, 2),
+    }
+
+
+def _material_discipline_components(signals: _GameSignals) -> tuple[int, Dict[str, Any]]:
+    if signals.mistake_rate is None or signals.blunder_rate is None:
+        raw = float(NEUTRAL_SCORE)
+        return NEUTRAL_SCORE, {
+            "missing_primary_data": True,
+            "mistake_rate": None,
+            "blunder_rate": None,
+            "severe_material_events": int(signals.severe_material_events),
+            "raw_before_clamp": raw,
+        }
+
+    weighted_error_rate = (float(signals.blunder_rate) * 1.8) + (float(signals.mistake_rate) * 0.4)
+    base = _score_from_error_rate(weighted_error_rate)
+    severe_penalty = min(18.0, float(signals.severe_material_events) * 4.0)
+    raw = base - severe_penalty
+    return _clamp_score(raw), {
+        "missing_primary_data": False,
+        "mistake_rate": round(float(signals.mistake_rate), 4),
+        "blunder_rate": round(float(signals.blunder_rate), 4),
+        "weighted_error_rate": round(weighted_error_rate, 4),
+        "severe_material_events": int(signals.severe_material_events),
+        "base_score": round(base, 2),
+        "severe_penalty": round(severe_penalty, 2),
+        "raw_before_clamp": round(raw, 2),
+    }
+
+
+def _conversion_ability_components(signals: _GameSignals) -> tuple[int, Dict[str, Any]]:
+    if signals.moves is None:
+        raw = float(NEUTRAL_SCORE)
+        return NEUTRAL_SCORE, {
+            "missing_primary_data": True,
+            "is_win": bool(signals.is_win),
+            "late_error_rate": None,
+            "raw_before_clamp": raw,
+        }
+
+    if not signals.is_win:
+        raw = float(NEUTRAL_SCORE)
+        return NEUTRAL_SCORE, {
+            "missing_primary_data": False,
+            "is_win": False,
+            "late_error_events": int(signals.late_error_events),
+            "late_error_rate": None,
+            "raw_before_clamp": raw,
+        }
+
+    late_error_rate = float(signals.late_error_events) / float(max(1, signals.moves))
+    amplified_late_error = late_error_rate * 3.0
+    raw = _score_from_error_rate(amplified_late_error)
+    return _clamp_score(raw), {
+        "missing_primary_data": False,
+        "is_win": True,
+        "late_error_events": int(signals.late_error_events),
+        "late_error_rate": round(late_error_rate, 4),
+        "amplified_late_error_rate": round(amplified_late_error, 4),
+        "raw_before_clamp": round(raw, 2),
+    }
+
+
+def _defensive_resilience_components(signals: _GameSignals) -> tuple[int, Dict[str, Any]]:
+    if signals.mistake_rate is None or signals.blunder_rate is None:
+        raw = float(NEUTRAL_SCORE)
+        return NEUTRAL_SCORE, {
+            "missing_primary_data": True,
+            "is_win": bool(signals.is_win),
+            "mistake_rate": None,
+            "blunder_rate": None,
+            "mate_threat_events": int(signals.mate_threat_events),
+            "raw_before_clamp": raw,
+        }
+
+    if signals.is_win:
+        raw = float(NEUTRAL_SCORE)
+        return NEUTRAL_SCORE, {
+            "missing_primary_data": False,
+            "is_win": True,
+            "mistake_rate": round(float(signals.mistake_rate), 4),
+            "blunder_rate": round(float(signals.blunder_rate), 4),
+            "mate_threat_events": int(signals.mate_threat_events),
+            "raw_before_clamp": raw,
+        }
+
+    pressure_rate = float(signals.blunder_rate) + (float(signals.mistake_rate) * 0.5)
+    base = _score_from_error_rate(pressure_rate)
+    mate_penalty = min(20.0, float(signals.mate_threat_events) * 5.0)
+    raw = base - mate_penalty
+    return _clamp_score(raw), {
+        "missing_primary_data": False,
+        "is_win": False,
+        "mistake_rate": round(float(signals.mistake_rate), 4),
+        "blunder_rate": round(float(signals.blunder_rate), 4),
+        "pressure_rate": round(pressure_rate, 4),
+        "mate_threat_events": int(signals.mate_threat_events),
+        "base_score": round(base, 2),
+        "mate_penalty": round(mate_penalty, 2),
+        "raw_before_clamp": round(raw, 2),
+    }
+
+
+def _blunder_frequency_components(signals: _GameSignals) -> tuple[int, Dict[str, Any]]:
+    if signals.blunder_rate is None:
+        raw = float(NEUTRAL_SCORE)
+        return NEUTRAL_SCORE, {
+            "missing_primary_data": True,
+            "blunder_rate": None,
+            "raw_before_clamp": raw,
+        }
+
+    raw = _score_from_blunder_rate(float(signals.blunder_rate))
+    return _clamp_score(raw), {
+        "missing_primary_data": False,
+        "blunder_rate": round(float(signals.blunder_rate), 4),
+        "raw_before_clamp": round(raw, 2),
+    }
+
+
+def _score_from_error_rate(rate: float) -> float:
+    bounded = max(0.0, float(rate))
+    # Linear map: 0.00 -> 100, 0.10 -> 70, 0.20 -> 40, 0.30 -> 10.
+    return 100.0 - (bounded * 300.0)
+
+
+def _score_from_blunder_rate(rate: float) -> float:
+    bounded = max(0.0, float(rate))
+    # Linear map: 0.00 -> 100, 0.05 -> 75, 0.10 -> 50, 0.20 -> 0.
+    return 100.0 - (bounded * 500.0)
+
+
+def _effective_moves(summary: Mapping[str, Any]) -> int | None:
+    total_moves = _as_int(summary.get("total_moves", 0))
+    if total_moves > 0:
+        return total_moves
+    total_plies = _as_int(summary.get("total_plies", 0))
+    if total_plies > 0:
+        return max(1, int(round(total_plies / 2.0)))
+    return None
+
+
+def _normalized_label_counts(summary: Mapping[str, Any]) -> Mapping[str, int] | None:
+    raw_counts = summary.get("label_counts")
+    if not isinstance(raw_counts, Mapping):
+        return None
+    counts: Dict[str, int] = {}
+    for key in _LABEL_KEYS:
+        counts[key] = max(0, _as_int(raw_counts.get(key, 0)))
+    return counts
+
+
+def _aggregate_scores(values: Sequence[int]) -> int:
+    if not values:
+        return NEUTRAL_SCORE
+    total = sum(int(v) for v in values)
+    return _clamp_score(total / float(len(values)))
+
+
+def _neutral_scores() -> Dict[str, int]:
+    return {
+        "tactical_awareness": NEUTRAL_SCORE,
+        "material_discipline": NEUTRAL_SCORE,
+        "conversion_ability": NEUTRAL_SCORE,
+        "defensive_resilience": NEUTRAL_SCORE,
+        "blunder_frequency": NEUTRAL_SCORE,
+    }
+
+
+def _emit_empty_traits_debug(scores: Mapping[str, int]) -> None:
+    print(
+        f"[traits-debug] {json.dumps({'aggregate': {'payload_count': 0, 'scores_after_clamp': dict(scores)}}, ensure_ascii=True, sort_keys=True)}",
+        file=sys.stderr,
+    )
+
+
+def _traits_debug_enabled() -> bool:
+    return str(os.environ.get("TRAITS_DEBUG", "")).strip() == "1"
+
+
+def _emit_traits_debug(debug_rows: Sequence[Mapping[str, Any]], scores: Mapping[str, int]) -> None:
+    for row in debug_rows:
+        print(f"[traits-debug] {json.dumps(dict(row), ensure_ascii=True, sort_keys=True)}", file=sys.stderr)
+
+    # Aggregate raw values across payloads to keep the debug output deterministic.
+    def _avg_raw(component_key: str) -> float:
+        raws: list[float] = []
+        for row in debug_rows:
+            component = row.get(component_key)
+            if isinstance(component, Mapping):
+                try:
+                    raws.append(float(component.get("raw_before_clamp", 0.0)))
+                except Exception:
+                    continue
+        if not raws:
+            return float(NEUTRAL_SCORE)
+        return sum(raws) / float(len(raws))
+
+    aggregate = {
+        "aggregate": {
+            "payload_count": len(debug_rows),
+            "tactical_awareness_components": {"raw_before_clamp": round(_avg_raw("tactical_awareness_components"), 2)},
+            "material_discipline_components": {"raw_before_clamp": round(_avg_raw("material_discipline_components"), 2)},
+            "conversion_ability_components": {"raw_before_clamp": round(_avg_raw("conversion_ability_components"), 2)},
+            "defensive_resilience_components": {"raw_before_clamp": round(_avg_raw("defensive_resilience_components"), 2)},
+            "blunder_frequency_components": {"raw_before_clamp": round(_avg_raw("blunder_frequency_components"), 2)},
+            "scores_after_clamp": dict(scores),
+        }
+    }
+    print(f"[traits-debug] {json.dumps(aggregate, ensure_ascii=True, sort_keys=True)}", file=sys.stderr)
 
 
 def _iter_player_positions(payload: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
@@ -177,150 +466,3 @@ def _clamp_score(value: float) -> int:
     if value > 100:
         return 100
     return int(round(value))
-
-
-def _traits_debug_enabled() -> bool:
-    return str(os.environ.get("TRAITS_DEBUG", "")).strip() == "1"
-
-
-def _emit_traits_debug(payloads: Sequence[Mapping[str, Any]], scores: Mapping[str, int]) -> None:
-    tactical_blunders = 0
-    tactical_misses = 0
-    hanging_pieces = 0
-    material_loss_total = 0
-    opportunities = 0
-    conversions = 0
-    pressure_games = 0
-    resilient_games = 0
-    total_blunders = 0
-    total_moves = 0
-
-    for idx, payload in enumerate(payloads, start=1):
-        summary = _game_summary(payload)
-        key_positions_raw = payload.get("key_positions") or []
-        key_positions_count = len(key_positions_raw) if isinstance(key_positions_raw, Sequence) else 0
-        total_plies = _as_int(summary.get("total_plies", 0))
-        payload_total_moves = max(0, _as_int(summary.get("total_moves", 0)))
-        total_moves += payload_total_moves
-        label_counts = summary.get("label_counts")
-        if not isinstance(label_counts, Mapping):
-            label_counts = {}
-
-        player_positions = list(_iter_player_positions(payload))
-        payload_blunders = 0
-        payload_tactical_misses = 0
-        payload_hanging_pieces = 0
-        payload_material_loss = 0
-        payload_material_swing = 0
-
-        for position in player_positions:
-            label = str(position.get("label", "")).strip().lower()
-            tactical_flag = str(position.get("tactical_flag", "")).strip().lower()
-            material_change = _as_int(position.get("material_change", 0))
-            if label == "blunder":
-                payload_blunders += 1
-            if tactical_flag == "tactical_miss":
-                payload_tactical_misses += 1
-            if tactical_flag == "hanging_piece":
-                payload_hanging_pieces += 1
-            if material_change < 0:
-                payload_material_loss += abs(material_change)
-                payload_material_swing += material_change
-
-        tactical_blunders += payload_blunders
-        tactical_misses += payload_tactical_misses
-        hanging_pieces += payload_hanging_pieces
-        material_loss_total += payload_material_loss
-        total_blunders += payload_blunders
-
-        cutoff_move = max(6, max(1, payload_total_moves) // 3)
-        had_early_advantage = False
-        for position in player_positions:
-            move_number = _as_int(position.get("move_number", 0))
-            material_change = _as_int(position.get("material_change", 0))
-            if move_number <= cutoff_move and material_change >= 3:
-                had_early_advantage = True
-                break
-
-        converted = had_early_advantage and _is_player_win(summary)
-        if had_early_advantage:
-            opportunities += 1
-            if converted:
-                conversions += 1
-
-        under_pressure = payload_material_swing < -3
-        resilient = under_pressure and not _is_player_loss(summary)
-        if under_pressure:
-            pressure_games += 1
-            if resilient:
-                resilient_games += 1
-
-        payload_debug = {
-            "payload_index": idx,
-            "total_plies": total_plies,
-            "total_moves": payload_total_moves,
-            "label_counts": dict(label_counts),
-            "key_positions_count": key_positions_count,
-            "player_key_positions_count": len(player_positions),
-            "tactical_awareness_components": {
-                "blunders": payload_blunders,
-                "tactical_misses": payload_tactical_misses,
-                "hanging_pieces": payload_hanging_pieces,
-                "raw_before_clamp": 100 - ((payload_blunders * 8) + (payload_tactical_misses * 4) + (payload_hanging_pieces * 6)),
-            },
-            "material_discipline_components": {
-                "material_loss_total": payload_material_loss,
-                "raw_before_clamp": 100 - (payload_material_loss * 3),
-            },
-            "conversion_ability_components": {
-                "cutoff_move": cutoff_move,
-                "had_early_advantage": had_early_advantage,
-                "converted": converted,
-                "raw_before_clamp": 100.0 if not had_early_advantage else (100.0 if converted else 0.0),
-            },
-            "defensive_resilience_components": {
-                "material_swing": payload_material_swing,
-                "under_pressure": under_pressure,
-                "resilient": resilient,
-                "raw_before_clamp": 100.0 if not under_pressure else (100.0 if resilient else 0.0),
-            },
-            "blunder_frequency_components": {
-                "blunders": payload_blunders,
-                "total_moves": payload_total_moves,
-                "raw_before_clamp": 100.0 if payload_total_moves <= 0 else (1.0 - (payload_blunders / payload_total_moves)) * 100.0,
-            },
-        }
-        print(f"[traits-debug] {json.dumps(payload_debug, ensure_ascii=True, sort_keys=True)}", file=sys.stderr)
-
-    aggregate_debug = {
-        "aggregate": {
-            "payload_count": len(payloads),
-            "tactical_awareness_components": {
-                "blunders": tactical_blunders,
-                "tactical_misses": tactical_misses,
-                "hanging_pieces": hanging_pieces,
-                "raw_before_clamp": 100 - ((tactical_blunders * 8) + (tactical_misses * 4) + (hanging_pieces * 6)),
-            },
-            "material_discipline_components": {
-                "material_loss_total": material_loss_total,
-                "raw_before_clamp": 100 - (material_loss_total * 3),
-            },
-            "conversion_ability_components": {
-                "opportunities": opportunities,
-                "conversions": conversions,
-                "raw_before_clamp": 100.0 if opportunities <= 0 else (conversions / opportunities) * 100.0,
-            },
-            "defensive_resilience_components": {
-                "pressure_games": pressure_games,
-                "resilient_games": resilient_games,
-                "raw_before_clamp": 100.0 if pressure_games <= 0 else (resilient_games / pressure_games) * 100.0,
-            },
-            "blunder_frequency_components": {
-                "total_blunders": total_blunders,
-                "total_moves": total_moves,
-                "raw_before_clamp": 100.0 if total_moves <= 0 else (1.0 - (total_blunders / total_moves)) * 100.0,
-            },
-            "scores_after_clamp": dict(scores),
-        }
-    }
-    print(f"[traits-debug] {json.dumps(aggregate_debug, ensure_ascii=True, sort_keys=True)}", file=sys.stderr)
