@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from io import StringIO
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 try:
     import chess
@@ -64,7 +64,8 @@ class StockfishOracle:
         board = game.board()
         mainline_moves = list(game.mainline_moves())
 
-        key_positions: List[Dict[str, Any]] = []
+        all_positions: List[Dict[str, Any]] = []
+        key_candidates: List[Dict[str, Any]] = []
         label_counts: Dict[str, int] = {
             "brilliant": 0,
             "good": 0,
@@ -88,19 +89,20 @@ class StockfishOracle:
                     illegal_moves += 1
                     best_move = current_analysis.get("best_move")
                     best_san = _safe_san(board, best_move) if best_move is not None else None
-                    key_positions.append(
-                        {
-                            "move_number": move_number,
-                            "player": player,
-                            "label": "blunder",
-                            "material_change": 0,
-                            "mate_threat": True,
-                            "forcing": False,
-                            "tactical_flag": "illegal_move",
-                            "played_san": None,
-                            "best_san": best_san,
-                        }
-                    )
+                    row = {
+                        "move_number": move_number,
+                        "player": player,
+                        "label": "blunder",
+                        "material_change": 0,
+                        "mate_threat": True,
+                        "forcing": False,
+                        "tactical_flag": "illegal_move",
+                        "played_san": None,
+                        "best_san": best_san,
+                        "_abs_eval_swing": 10_000.0,
+                    }
+                    all_positions.append(row)
+                    key_candidates.append(row)
                     break
 
                 best_move = current_analysis.get("best_move")
@@ -134,6 +136,7 @@ class StockfishOracle:
                     played_is_best_move=bool(best_move == move),
                 )
                 label_counts[label] = label_counts.get(label, 0) + 1
+                abs_eval_swing = abs(eval_after - eval_before)
 
                 forcing = bool(is_capture or gives_check or is_promotion or mate_threat)
                 tactical_flag = _detect_tactical_flag(
@@ -145,31 +148,39 @@ class StockfishOracle:
                     is_promotion=is_promotion,
                 )
 
+                row = {
+                    "move_number": move_number,
+                    "player": player,
+                    "label": label,
+                    "material_change": int(material_change),
+                    "mate_threat": mate_threat,
+                    "forcing": forcing,
+                    "tactical_flag": tactical_flag,
+                    "played_san": played_san,
+                    "best_san": best_san,
+                    "_abs_eval_swing": float(abs_eval_swing),
+                }
+                all_positions.append(row)
                 if label != "good" or forcing or material_change != 0:
-                    key_positions.append(
-                        {
-                            "move_number": move_number,
-                            "player": player,
-                            "label": label,
-                            "material_change": int(material_change),
-                            "mate_threat": mate_threat,
-                            "forcing": forcing,
-                            "tactical_flag": tactical_flag,
-                            "played_san": played_san,
-                            "best_san": best_san,
-                        }
-                    )
+                    key_candidates.append(row)
+
+        strict_key_positions = _select_strict_key_positions(
+            all_positions=all_positions,
+            key_candidates=key_candidates,
+            required=4,
+        )
 
         return {
             "game_summary": {
                 "result": game.headers.get("Result", "*"),
+                "engine_depth": self._depth,
                 "total_plies": len(mainline_moves),
                 "total_moves": (len(mainline_moves) + 1) // 2,
                 "label_counts": label_counts,
                 "forced_mate_events": forced_mate_events,
                 "illegal_moves": illegal_moves,
             },
-            "key_positions": key_positions,
+            "key_positions": strict_key_positions,
         }
 
     def _analyse_position(
@@ -272,3 +283,99 @@ def _detect_tactical_flag(
     if label in {"mistake", "blunder"}:
         return "tactical_miss"
     return "none"
+
+
+def _select_strict_key_positions(
+    *,
+    all_positions: Sequence[Mapping[str, Any]],
+    key_candidates: Sequence[Mapping[str, Any]],
+    required: int,
+) -> List[Dict[str, Any]]:
+    selected: List[Mapping[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def _add(rows: Sequence[Mapping[str, Any]]) -> None:
+        if len(selected) >= required:
+            return
+        for row in rows:
+            if len(selected) >= required:
+                break
+            ident = _position_identity(row)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            selected.append(row)
+
+    _add(_sort_positions_by_swing(key_candidates))
+    if len(selected) < required:
+        non_good = [row for row in all_positions if str(row.get("label", "")).strip() != "good"]
+        _add(_sort_positions_by_swing(non_good))
+    if len(selected) < required:
+        _add(_sort_positions_by_swing(all_positions))
+
+    # If the game is too short, duplicate deterministically to guarantee exactly `required`.
+    if len(selected) < required and selected:
+        seed = list(selected)
+        idx = 0
+        while len(selected) < required:
+            selected.append(seed[idx % len(seed)])
+            idx += 1
+
+    if len(selected) < required:
+        while len(selected) < required:
+            selected.append(_placeholder_position(len(selected) + 1))
+
+    return [_public_key_position(selected[idx]) for idx in range(required)]
+
+
+def _sort_positions_by_swing(rows: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            -float(row.get("_abs_eval_swing", 0.0) or 0.0),
+            int(row.get("move_number", 0) or 0),
+            str(row.get("player", "") or ""),
+            str(row.get("played_san", "") or ""),
+            str(row.get("best_san", "") or ""),
+        ),
+    )
+
+
+def _position_identity(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        int(row.get("move_number", 0) or 0),
+        str(row.get("player", "") or ""),
+        str(row.get("played_san", "") or ""),
+        str(row.get("best_san", "") or ""),
+        str(row.get("label", "") or ""),
+        str(row.get("tactical_flag", "") or ""),
+    )
+
+
+def _public_key_position(row: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "move_number": row.get("move_number"),
+        "player": row.get("player"),
+        "label": row.get("label"),
+        "material_change": row.get("material_change"),
+        "mate_threat": row.get("mate_threat"),
+        "forcing": row.get("forcing"),
+        "tactical_flag": row.get("tactical_flag"),
+        "played_san": row.get("played_san"),
+        "best_san": row.get("best_san"),
+    }
+
+
+def _placeholder_position(index: int) -> Dict[str, Any]:
+    return {
+        "move_number": index,
+        "player": "White" if index % 2 == 1 else "Black",
+        "label": "good",
+        "material_change": 0,
+        "mate_threat": False,
+        "forcing": False,
+        "tactical_flag": "none",
+        "played_san": None,
+        "best_san": None,
+        "_abs_eval_swing": 0.0,
+    }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import analysis_pipeline as pipeline_module
 import chess_review
 from src.db import ingest_check as ingest_check_module
 from src.db import player_metrics as player_metrics_module
@@ -19,6 +20,9 @@ def _base_args(tmp_path):
         ollama_url="http://127.0.0.1:11434",
         timeout=5,
         max_tokens=100,
+        enable_engine=True,
+        stockfish_path="/fake/stockfish",
+        engine_depth=12,
         update_index=False,
         telegram_bot_token="",
         telegram_chat_id="",
@@ -49,8 +53,7 @@ def _sample_game() -> chess_review.GameInfo:
 def test_process_game_does_not_fail_without_postgres(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setattr(chess_review, "_validate_ollama_endpoint", lambda **_kwargs: None)
-    monkeypatch.setattr(chess_review, "call_ollama_generate", lambda **_kwargs: "# review")
+    monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# review")
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
@@ -66,8 +69,7 @@ def test_process_game_does_not_fail_without_postgres(monkeypatch, tmp_path) -> N
 def test_process_game_does_not_fail_when_postgres_is_down(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/chess")
-    monkeypatch.setattr(chess_review, "_validate_ollama_endpoint", lambda **_kwargs: None)
-    monkeypatch.setattr(chess_review, "call_ollama_generate", lambda **_kwargs: "# review")
+    monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# review")
 
     def _raise_connect(_url):
         raise RuntimeError("db unavailable")
@@ -85,6 +87,44 @@ def test_process_game_does_not_fail_when_postgres_is_down(monkeypatch, tmp_path)
     assert output_path is not None
     assert output_path.exists()
     assert (tmp_path / "output" / "player_stats.md").exists()
+
+
+def test_process_game_engine_failure_skips_markdown_and_db_and_llm(monkeypatch, tmp_path) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    llm_called = {"value": False}
+    telegram_calls: list[str] = []
+
+    monkeypatch.setattr(pipeline_module, "_run_stockfish_oracle", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        chess_review,
+        "_call_selected_llm_backend",
+        lambda **_kwargs: llm_called.update(value=True) or "# should-not-run",
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **_kwargs: telegram_calls.append(str(message)),
+    )
+
+    args = _base_args(tmp_path)
+    args.telegram_bot_token = "token"
+    args.telegram_chat_id = "42"
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        output_path = chess_review.process_game(conn, args, _sample_game())
+        processed_count = int(conn.execute("SELECT COUNT(*) FROM processed_games").fetchone()[0])
+    finally:
+        conn.close()
+
+    assert output_path is None
+    assert llm_called["value"] is False
+    assert processed_count == 0
+    assert len(telegram_calls) == 1
+    assert "Engine failure" in telegram_calls[0]
+    assert not list((tmp_path / "output" / "md").glob("*.md"))
 
 
 def test_poll_once_without_postgres_does_not_crash(monkeypatch, tmp_path) -> None:
@@ -109,7 +149,7 @@ def test_poll_once_without_postgres_does_not_crash(monkeypatch, tmp_path) -> Non
 def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setattr(chess_review, "_validate_ollama_endpoint", lambda **_kwargs: None)
+    monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# game review")
 
     calls: list[str] = []
     expected_timeout: dict[str, int | None] = {"value": None}
@@ -121,7 +161,7 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
         calls.append(user_msg)
         if "Create a Markdown summary for this player's latest cadence window." in user_msg:
             return "# player summary"
-        return "# game review"
+        return "# summary fallback"
 
     monkeypatch.setattr(chess_review, "call_ollama_generate", _fake_ollama_generate)
 

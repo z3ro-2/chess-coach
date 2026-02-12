@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
-SAFE_GAME_SUMMARY_KEYS = {
+SAFE_GAME_SUMMARY_KEYS: Sequence[str] = (
+    "engine_depth",
     "result",
     "total_plies",
     "total_moves",
@@ -18,7 +19,7 @@ SAFE_GAME_SUMMARY_KEYS = {
     "rated",
     "rules",
     "url",
-}
+)
 
 
 def build_llm_safe_payload(

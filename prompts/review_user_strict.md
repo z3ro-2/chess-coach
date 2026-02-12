@@ -1,80 +1,67 @@
-Generate a chess review in valid Markdown using ONLY the structured engine payload provided below.
+Return Markdown only.
 
-You must treat the payload as authoritative truth. Do not use any chess knowledge beyond what is explicitly contained in the payload.
-
-INPUT DATA (DO NOT REPEAT IN OUTPUT):
---------------------------------------
-{payload}
---------------------------------------
-Do NOT reproduce the input data in your output.
-
-OUTPUT FORMAT (FOLLOW EXACTLY):
-
-Start with YAML front matter (no code block):
+Use this exact structure and headings with no additions:
 
 ---
-date_utc: <from game_summary>
-your_color: <from game_summary>
-opponent: <from game_summary>
-result: <from game_summary>
-time_control: <from game_summary>
-rated: <from game_summary>
-url: <from game_summary>
+engine: Stockfish
+engine_depth: <game_summary.engine_depth>
+date_utc: <game_summary.date_utc>
+your_color: <game_summary.your_color>
+opponent: <game_summary.opponent>
+result: <game_summary.result>
+time_control: <game_summary.time_control>
+rated: <game_summary.rated>
+url: <game_summary.url>
 ---
 
 # Game Review
 
 ## Summary
-Write 2–4 short bullet points based ONLY on:
-- label_counts
-- frequency of blunders, mistakes, inaccuracies
-- repeated tactical_flag patterns
+- <bullet 1>
+- <bullet 2>
+- <bullet 3>
 
-Each bullet must be one short sentence.
+## Four Critical Positions
 
-## Key Inflection Points
+### 1. Move <move_number> – <player>
+Label: <blunder|mistake|inaccuracy|good|brilliant>
+Played: `<played_san>`
+Engine: `<best_san>`
+Explanation: <max 2 short sentences>
 
-For EACH key position in the payload, use EXACTLY this structure:
+### 2. Move <move_number> – <player>
+Label: <blunder|mistake|inaccuracy|good|brilliant>
+Played: `<played_san>`
+Engine: `<best_san>`
+Explanation: <max 2 short sentences>
 
-### Move <move_number> – <player>
-Label: <label>
+### 3. Move <move_number> – <player>
+Label: <blunder|mistake|inaccuracy|good|brilliant>
+Played: `<played_san>`
+Engine: `<best_san>`
+Explanation: <max 2 short sentences>
 
-You played: `<played_san>`
-Engine preferred: `<best_san>`
+### 4. Move <move_number> – <player>
+Label: <blunder|mistake|inaccuracy|good|brilliant>
+Played: `<played_san>`
+Engine: `<best_san>`
+Explanation: <max 2 short sentences>
 
-(If best_san is null, write: Engine preferred: No alternative provided)
-
-Explanation:
-- If material_change is not zero, state the material change.
-- If material_change is negative, explicitly say material was lost.
-- If mate_threat is true, explicitly say the move allowed a mating threat.
-- If tactical_flag == "hanging_piece", say an undefended piece was involved.
-- If tactical_flag == "tactical_miss", say a tactical opportunity was missed.
-- If forcing is true, say the position became forcing.
-
-Keep explanation to 2–4 short sentences. No extra commentary.
-
-## What to Watch For Next Time
-Write 2–3 bullets derived ONLY from repeated:
-- labels
-- tactical_flag values
+## Recurring Tactical Pattern
+<one short paragraph>
 
 ## Training Plan
-Suggest 3–5 concrete training actions derived ONLY from:
-- hanging_piece → blunder-check habit
-- tactical_miss → tactical puzzle training
-- mate_threat → king safety drills
-- frequent inaccuracies → slower move selection
+- <item 1>
+- <item 2>
+- <item 3>
 
-STRICT RULES:
-- Do NOT invent moves.
-- Do NOT mention any move not equal to played_san or best_san.
-- Do NOT suggest variations.
-- Do NOT reference openings, strategy, pawn structure, or positional concepts.
-- Do NOT reinterpret labels.
-- Do NOT add narrative or storytelling.
-- Do NOT add extra sections.
+Hard rules:
+- Exactly 4 critical positions. No more, no fewer.
+- Use label verbatim from payload.
+- Use only played_san and best_san from payload.
+- Do not suggest any move not present in payload.
+- No headings other than those shown above.
+- No extra sections, no variation, no creative formatting.
 
-Use short sentences.
-Direct language.
-No fluff.
+Payload JSON:
+{payload}

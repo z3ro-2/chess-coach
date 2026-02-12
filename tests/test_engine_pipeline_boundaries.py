@@ -38,6 +38,55 @@ def _san_tokens(text: str) -> set[str]:
     return set(pattern.findall(text))
 
 
+def _four_positions() -> list[dict[str, object]]:
+    return [
+        {
+            "move_number": 1,
+            "player": "White",
+            "label": "mistake",
+            "material_change": 0,
+            "mate_threat": False,
+            "forcing": False,
+            "tactical_flag": "tactical_miss",
+            "played_san": "e4",
+            "best_san": "Nf3",
+        },
+        {
+            "move_number": 1,
+            "player": "Black",
+            "label": "inaccuracy",
+            "material_change": 0,
+            "mate_threat": False,
+            "forcing": False,
+            "tactical_flag": "none",
+            "played_san": "e5",
+            "best_san": "c5",
+        },
+        {
+            "move_number": 2,
+            "player": "White",
+            "label": "blunder",
+            "material_change": -3,
+            "mate_threat": False,
+            "forcing": True,
+            "tactical_flag": "hanging_piece",
+            "played_san": "Qh5",
+            "best_san": "Nc3",
+        },
+        {
+            "move_number": 2,
+            "player": "Black",
+            "label": "good",
+            "material_change": 0,
+            "mate_threat": False,
+            "forcing": False,
+            "tactical_flag": "none",
+            "played_san": "Nc6",
+            "best_san": "Nc6",
+        },
+    ]
+
+
 def test_classify_move_thresholds() -> None:
     assert classify_move(eval_before=0.0, played_eval=-0.2, best_eval=0.0, played_is_best_move=False) == "good"
     assert classify_move(eval_before=0.0, played_eval=-0.7, best_eval=0.0, played_is_best_move=False) == "inaccuracy"
@@ -100,36 +149,21 @@ def test_build_llm_safe_payload_strips_engine_eval_fields() -> None:
     assert "best_san" in item
 
 
-def test_run_analysis_pipeline_engine_disabled_and_filters_illegal_suggestions(monkeypatch) -> None:
-    chess = pytest.importorskip("chess")
-    args = SimpleNamespace(enable_engine=False)
+def test_run_analysis_pipeline_engine_failure_raises_and_llm_not_called(monkeypatch) -> None:
+    args = SimpleNamespace(enable_engine=True)
     game = _Game()
-    board = chess.Board()
+    llm_called = {"value": False}
 
-    seen_llm_payload = {}
+    monkeypatch.setattr(pipeline_module, "_run_stockfish_oracle", lambda **_kwargs: None)
 
-    def _prompt_builder(_game, llm_payload):
-        seen_llm_payload["payload"] = llm_payload
-        return "sys", "user"
-
-    def _llm_runner(_system_msg, _user_msg):
-        return "# Summary\n- Try Nxe5 immediately and e4 if needed\n- Keep king safe"
-
-    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: board)
-
-    output = run_analysis_pipeline(
-        game=game,
-        args=args,
-        prompt_builder=_prompt_builder,
-        llm_runner=_llm_runner,
-        logger=logging.getLogger("test"),
-    )
-
-    assert seen_llm_payload["payload"] is None
-    assert "Nxe5" not in output
-    assert "e4" in output
-    assert "immediately" in output
-    assert "Keep king safe" in output
+    with pytest.raises(RuntimeError, match="Stockfish engine failed or produced no output."):
+        run_analysis_pipeline(
+            game=game,
+            args=args,
+            llm_runner=lambda _system_msg, _user_msg: llm_called.update(value=True) or "unexpected",
+            logger=logging.getLogger("test"),
+        )
+    assert llm_called["value"] is False
 
 
 def test_oracle_uses_single_analyse_call_per_position(monkeypatch) -> None:
@@ -167,10 +201,11 @@ def test_oracle_uses_single_analyse_call_per_position(monkeypatch) -> None:
         lambda _path: fake_engine,
     )
 
-    oracle.analyze_game(pgn_text)
+    output = oracle.analyze_game(pgn_text)
 
     # 2 plies => 3 unique board positions (initial, after white move, after black move).
     assert len(fake_engine.calls) == 3
+    assert len(output["key_positions"]) == 4
     assert not hasattr(StockfishOracle, "_best_line_analysis")
     assert not hasattr(StockfishOracle, "_evaluate_position")
 
@@ -212,9 +247,16 @@ def test_parse_args_engine_flags_and_values(monkeypatch, tmp_path) -> None:
     assert args_disabled.enable_engine is False
 
 
+def test_main_rejects_disable_engine(monkeypatch) -> None:
+    monkeypatch.setattr(chess_review, "parse_args", lambda: SimpleNamespace(enable_engine=False))
+    with pytest.raises(RuntimeError, match="Engine cannot be disabled in strict mode."):
+        chess_review.main()
+
+
 def test_strict_prompt_template_contains_required_phrase() -> None:
     template = pipeline_module.load_prompt_file("review_user_strict.md")
-    assert "Do NOT suggest any move not present in the payload" in template
+    assert "## Four Critical Positions" in template
+    assert "Exactly 4 critical positions. No more, no fewer." in template
 
 
 def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch) -> None:
@@ -226,26 +268,17 @@ def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch)
         pipeline_module,
         "_run_stockfish_oracle",
         lambda **_kwargs: {
-            "game_summary": {"result": "1-0", "total_moves": 2, "forced_mate_events": 0, "illegal_moves": 0},
-            "key_positions": [
-                {
-                    "move_number": 1,
-                    "player": "White",
-                    "label": "mistake",
-                    "material_change": 0,
-                    "mate_threat": False,
-                    "forcing": False,
-                    "tactical_flag": "tactical_miss",
-                    "played_san": "e4",
-                    "best_san": "Nf3",
-                }
-            ],
+            "game_summary": {
+                "engine_depth": 15,
+                "result": "1-0",
+                "total_moves": 2,
+                "forced_mate_events": 0,
+                "illegal_moves": 0,
+            },
+            "key_positions": _four_positions(),
         },
     )
     monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: None)
-
-    def _prompt_builder(_game, _llm_payload):
-        raise AssertionError("Legacy prompt builder should not be used in strict engine mode.")
 
     def _llm_runner(system_msg: str, user_msg: str) -> str:
         captured["system"] = system_msg
@@ -255,14 +288,14 @@ def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch)
     result = run_analysis_pipeline(
         game=game,
         args=args,
-        prompt_builder=_prompt_builder,
         llm_runner=_llm_runner,
         logger=logging.getLogger("test"),
     )
 
     assert result == "# strict"
-    assert "Do NOT suggest any move not present in the payload" in captured["user"]
+    assert "Do not suggest any move not present in payload." in captured["user"]
     assert '"best_san":"Nf3"' in captured["user"]
+    assert '"engine_depth":15' in captured["user"]
 
 
 def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
@@ -275,7 +308,13 @@ def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
         pipeline_module,
         "_run_stockfish_oracle",
         lambda **_kwargs: {
-            "game_summary": {"result": "1-0", "total_moves": 2, "forced_mate_events": 0, "illegal_moves": 0},
+            "game_summary": {
+                "engine_depth": 15,
+                "result": "1-0",
+                "total_moves": 2,
+                "forced_mate_events": 0,
+                "illegal_moves": 0,
+            },
             "key_positions": [
                 {
                     "move_number": 1,
@@ -287,7 +326,40 @@ def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
                     "tactical_flag": "none",
                     "played_san": "d4",
                     "best_san": "d5",
-                }
+                },
+                {
+                    "move_number": 1,
+                    "player": "Black",
+                    "label": "good",
+                    "material_change": 0,
+                    "mate_threat": False,
+                    "forcing": False,
+                    "tactical_flag": "none",
+                    "played_san": "Nf6",
+                    "best_san": "Nf6",
+                },
+                {
+                    "move_number": 2,
+                    "player": "White",
+                    "label": "mistake",
+                    "material_change": 0,
+                    "mate_threat": False,
+                    "forcing": False,
+                    "tactical_flag": "tactical_miss",
+                    "played_san": "c4",
+                    "best_san": "Nc3",
+                },
+                {
+                    "move_number": 2,
+                    "player": "Black",
+                    "label": "good",
+                    "material_change": 0,
+                    "mate_threat": False,
+                    "forcing": False,
+                    "tactical_flag": "none",
+                    "played_san": "d5",
+                    "best_san": "d5",
+                },
             ],
         },
     )
@@ -296,11 +368,10 @@ def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
     output = run_analysis_pipeline(
         game=game,
         args=args,
-        prompt_builder=lambda _game, _payload: ("legacy", "legacy"),
         llm_runner=lambda _sys, _user: "Play d4, but avoid e4 and consider d5.",
         logger=logging.getLogger("test"),
     )
 
-    allowed_sans = {"d4", "d5"}
+    allowed_sans = {"d4", "d5", "Nf6", "c4", "Nc3"}
     assert "e4" not in output
     assert _san_tokens(output) <= allowed_sans

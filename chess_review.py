@@ -125,6 +125,38 @@ def send_telegram_document(
         raise TelegramError(f"Telegram sendDocument failed: {str(payload)[:800]}")
 
 
+def send_telegram_message(
+    message: str,
+    *,
+    bot_token: str,
+    chat_id: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    disable_notification: bool = False,
+) -> None:
+    """Send a plain text message to Telegram via a bot."""
+    if not bot_token:
+        raise TelegramError("Missing bot_token")
+    if not chat_id:
+        raise TelegramError("Missing chat_id")
+
+    url = _telegram_api_base(bot_token) + "/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": str(message or "")[:4096],
+        "disable_notification": disable_notification,
+    }
+    resp = requests.post(url, data=payload, timeout=timeout)
+    if resp.status_code >= 400:
+        raise TelegramError(f"Telegram API error {resp.status_code}: {resp.text[:800]}")
+
+    try:
+        body = resp.json()
+    except Exception:
+        raise TelegramError(f"Telegram returned non-JSON: {resp.text[:800]}")
+    if not body.get("ok", False):
+        raise TelegramError(f"Telegram sendMessage failed: {str(body)[:800]}")
+
+
 def build_telegram_caption(game: "GameInfo") -> str:
     """Short caption for the Telegram message."""
     # Keep it compact and readable.
@@ -723,56 +755,6 @@ class LLMError(RuntimeError):
     pass
 
 
-def build_prompt(game: GameInfo, llm_payload: Optional[Mapping[str, Any]] = None) -> Tuple[str, str]:
-    """Return (system_message, user_message)."""
-    _ = llm_payload  # Engine mode prompt templates are loaded in analysis_pipeline.py.
-    local_dt = game.end_dt_utc.astimezone(get_display_timezone())
-    date_iso = local_dt.strftime("%Y-%m-%d")
-
-    white_rating = game.white_rating if game.white_rating is not None else "?"
-    black_rating = game.black_rating if game.black_rating is not None else "?"
-
-    system = (
-        "You are a chess coach. Produce a concise but insightful game review aimed at ~1000-rated players. "
-        "Do NOT go move-by-move. Focus only on the critical turning points and plans. "
-        "Be concrete: reference move numbers and describe the position/idea in words. "
-        "Avoid filler, be direct."
-    )
-
-    user = f"""Analyze this chess game and generate a Markdown review file.
-
-Context:
-- Player is \"{game.your_color}\" (the user).
-- Opponent: {game.opponent}
-- Date (display timezone): {date_iso}
-- Ratings (approx): {game.white_username}={white_rating}, {game.black_username}={black_rating}
-- Time control: {game.time_control}
-- Rated: {game.rated}
-- Rules: {game.rules}
-- Result: {game.result}
-- Game URL: {game.game_url}
-
-Output requirements:
-1) Output VALID Markdown.
-2) Start with YAML front matter (---) including: date_utc, your_color, opponent, result, time_control, rated, url.
-3) Include these sections (with headings):
-   - Summary (2-4 bullets: what decided the game)
-   - Key inflection points (3-7 items). For each: move number, what happened, better alternative, and a "rule of thumb".
-   - What to watch out for next time (patterns, not moves)
-   - Training plan (3-5 drills/tasks you can do this week)
-   - Next-game checklist (short, practical)
-4) Keep tone direct. No fluff.
-5) If the PGN includes annotations like $1/$2/etc, interpret them as hints but do not blindly trust them.
-
-Here is the PGN:
-```pgn
-{game.pgn}
-```
-"""
-
-    return system, user
-
-
 def call_openai_chat(
     api_key: str,
     model: str,
@@ -931,17 +913,30 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
 
     provider = get_provider()
     used_model = args.ollama_model if provider == "ollama" else args.gpt_model
-    review_md = run_analysis_pipeline(
-        game=game,
-        args=args,
-        prompt_builder=build_prompt,
-        llm_runner=lambda system_msg, user_msg: _call_selected_llm_backend(
+    try:
+        review_md = run_analysis_pipeline(
+            game=game,
             args=args,
-            system_msg=system_msg,
-            user_msg=user_msg,
-        ),
-        logger=logger,
-    )
+            llm_runner=lambda system_msg, user_msg: _call_selected_llm_backend(
+                args=args,
+                system_msg=system_msg,
+                user_msg=user_msg,
+            ),
+            logger=logger,
+        )
+    except Exception as exc:
+        logger.error("Stockfish failure: %s", exc)
+        try:
+            send_telegram_message(
+                f"❌ Engine failure for {game.game_url}\nStockfish could not produce analysis.",
+                bot_token=str(getattr(args, "telegram_bot_token", "") or ""),
+                chat_id=str(getattr(args, "telegram_chat_id", "") or ""),
+                timeout=int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+                disable_notification=bool(getattr(args, "telegram_disable_notification", False)),
+            )
+        except Exception as notify_exc:
+            logger.error("Telegram engine-failure notification failed: %s", notify_exc)
+        return None
 
     write_text(md_path, review_md)
 
@@ -1259,7 +1254,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--disable-engine",
         dest="enable_engine",
         action="store_false",
-        help="Disable Stockfish oracle and use legacy LLM-only flow.",
+        help="Disable Stockfish engine (rejected at runtime in strict mode).",
     )
     p.add_argument(
         "--stockfish-path",
@@ -1357,6 +1352,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
+    if not bool(getattr(args, "enable_engine", False)):
+        raise RuntimeError("Engine cannot be disabled in strict mode.")
     if args.provider == "ollama":
         args.ollama_url = _resolve_ollama_url_for_runtime(str(args.ollama_url))
         _apply_provider_runtime_fallback(args)
