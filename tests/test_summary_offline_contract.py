@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import analysis_pipeline as pipeline_module
 import chess_review
 from src.config.provider_config import set_provider
 from src.engine_traits import compute_engine_trait_scores
@@ -82,12 +83,20 @@ def _payload_v2(
     )
     merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in player_label_counts}
     return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
         "game_summary": {
             "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "your_color": your_color,
             "result": result,
             "total_moves": int(total_moves),
             "total_plies": int(total_plies),
+            "white_plies": int(total_moves),
+            "black_plies": int(total_moves),
+            "unlabeled_white_plies": 0,
+            "unlabeled_black_plies": 0,
+            "label_counts_total": dict(merged),
+            "label_counts_white": dict(by_side["white"]),
+            "label_counts_black": dict(by_side["black"]),
             "player_total_plies": int(player_total_plies),
             "player_total_moves": int(player_total_plies),
             "player_label_counts": dict(player_label_counts),
@@ -249,7 +258,7 @@ def test_trait_scoring_logic_correctness_with_fixture(predictable_key_payloads) 
         "material_discipline": 74,
         "conversion_ability": 90,
         "defensive_resilience": 83,
-        "blunder_frequency": 84,
+        "blunder_frequency": 89,
     }
 
 
@@ -371,3 +380,63 @@ def test_engine_failure_aborts_pipeline_and_sends_telegram(
     assert llm_called["value"] is False
     assert len(telegram_calls) == 1
     assert "Engine failure" in telegram_calls[0]
+
+
+def test_engine_payload_invalid_aborts_process_and_sends_telegram(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    telegram_calls: list[str] = []
+    llm_called = {"value": False}
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": {
+                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+                "engine_depth": 12,
+                "result": "1-0",
+                "total_plies": 4,
+                "total_moves": 2,
+                # Missing per-side v2 fields by construction.
+                "label_counts": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+            },
+            "key_positions": [
+                {"move_number": 1, "player": "White", "label": "good", "tactical_flag": "none", "material_change": 0, "played_san": "e4", "best_san": "e4"},
+                {"move_number": 1, "player": "Black", "label": "good", "tactical_flag": "none", "material_change": 0, "played_san": "e5", "best_san": "e5"},
+                {"move_number": 2, "player": "White", "label": "inaccuracy", "tactical_flag": "none", "material_change": 0, "played_san": "Nf3", "best_san": "Nc3"},
+                {"move_number": 2, "player": "Black", "label": "good", "tactical_flag": "none", "material_change": 0, "played_san": "Nc6", "best_san": "Nc6"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "_call_selected_llm_backend",
+        lambda **_kwargs: llm_called.update(value=True) or "# should-not-run",
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **_kwargs: telegram_calls.append(str(message)),
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, sample_game)
+        processed_count = int(conn.execute("SELECT COUNT(*) FROM processed_games").fetchone()[0])
+    finally:
+        conn.close()
+
+    md_dir = summary_args.out / "md"
+    md_files = list(md_dir.glob("*.md")) if md_dir.exists() else []
+    assert out is None
+    assert processed_count == 0
+    assert llm_called["value"] is False
+    assert len(telegram_calls) == 1
+    assert "Engine failure" in telegram_calls[0]
+    assert "Engine payload invalid:" in telegram_calls[0]
+    assert md_files == []

@@ -5,7 +5,7 @@ from __future__ import annotations
 from io import StringIO
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION, empty_label_counts
+from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION, empty_label_counts, sum_label_counts
 
 try:
     import chess
@@ -177,14 +177,27 @@ class StockfishOracle:
             key_candidates=key_candidates,
             required=4,
         )
+        total_plies = int(len(mainline_moves))
+        white_plies = int((total_plies + 1) // 2)
+        black_plies = int(total_plies // 2)
+        unlabeled_white_plies = max(0, white_plies - int(sum_label_counts(label_counts_by_side["white"])))
+        unlabeled_black_plies = max(0, black_plies - int(sum_label_counts(label_counts_by_side["black"])))
 
         return {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "game_summary": {
                 "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
                 "result": game.headers.get("Result", "*"),
                 "engine_depth": self._depth,
-                "total_plies": len(mainline_moves),
-                "total_moves": (len(mainline_moves) + 1) // 2,
+                "total_plies": total_plies,
+                "total_moves": (total_plies + 1) // 2,
+                "white_plies": white_plies,
+                "black_plies": black_plies,
+                "unlabeled_white_plies": int(unlabeled_white_plies),
+                "unlabeled_black_plies": int(unlabeled_black_plies),
+                "label_counts_total": dict(label_counts),
+                "label_counts_white": dict(label_counts_by_side["white"]),
+                "label_counts_black": dict(label_counts_by_side["black"]),
                 "label_counts": label_counts,
                 "label_counts_by_side": label_counts_by_side,
                 "forced_mate_events": forced_mate_events,

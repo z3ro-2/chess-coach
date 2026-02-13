@@ -7,6 +7,7 @@ import backfill as backfill_module
 import chess_review
 import pytest
 from engine.payload_schema import ENGINE_PAYLOAD_SCHEMA_VERSION
+import src.engine_traits as engine_traits_module
 
 
 def _raw_game(*, game_id: int, end_time: int, result: str = "1-0") -> dict:
@@ -43,11 +44,19 @@ def _oracle_output_for_game(
     )
     merged = {k: int(side_counts["white"][k]) + int(side_counts["black"][k]) for k in player_counts}
     return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
         "game_summary": {
             "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "engine_depth": 12,
             "total_plies": 40,
             "total_moves": 20,
+            "white_plies": 20,
+            "black_plies": 20,
+            "unlabeled_white_plies": 0,
+            "unlabeled_black_plies": 0,
+            "label_counts_total": dict(merged),
+            "label_counts_white": dict(side_counts["white"]),
+            "label_counts_black": dict(side_counts["black"]),
             "label_counts_by_side": side_counts,
             "label_counts": merged,
             "forced_mate_events": 0,
@@ -123,6 +132,31 @@ def test_backfill_does_not_reanalyze_already_stored_games(monkeypatch, conn) -> 
                         "result": "1-0",
                         "total_plies": 40,
                         "total_moves": 20,
+                        "white_plies": 20,
+                        "black_plies": 20,
+                        "unlabeled_white_plies": 0,
+                        "unlabeled_black_plies": 0,
+                        "label_counts_total": {
+                            "good": 35,
+                            "inaccuracy": 3,
+                            "mistake": 1,
+                            "blunder": 1,
+                            "brilliant": 0,
+                        },
+                        "label_counts_white": {
+                            "good": 15,
+                            "inaccuracy": 3,
+                            "mistake": 1,
+                            "blunder": 1,
+                            "brilliant": 0,
+                        },
+                        "label_counts_black": {
+                            "good": 20,
+                            "inaccuracy": 0,
+                            "mistake": 0,
+                            "blunder": 0,
+                            "brilliant": 0,
+                        },
                         "player_total_plies": 20,
                         "player_total_moves": 20,
                         "player_label_counts": {
@@ -320,7 +354,8 @@ def test_backfill_raises_when_limit_exceeds_two_hundred(monkeypatch, conn) -> No
         backfill_module.backfill_recent_games(conn, username="logan", limit=201)
 
 
-def test_print_backfill_summary_format_is_deterministic(capsys) -> None:
+def test_print_backfill_summary_format_is_deterministic(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("TRAITS_DEBUG", raising=False)
     chess_review._print_backfill_summary(
         {
             "total_games_requested": 20,
@@ -352,6 +387,7 @@ def test_print_backfill_summary_format_is_deterministic(capsys) -> None:
 
 
 def test_print_backfill_summary_uses_run_backfill_counts(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.delenv("TRAITS_DEBUG", raising=False)
     args = chess_review.parse_args(
         [
             "--username",
@@ -382,12 +418,20 @@ def test_print_backfill_summary_uses_run_backfill_counts(monkeypatch, tmp_path, 
         chess_review,
         "_analyze_game_with_stockfish",
         lambda **kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "game_summary": {
                 "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
                 "your_color": kwargs["game"].your_color,
                 "result": kwargs["game"].result,
                 "total_plies": 40,
                 "total_moves": 20,
+                "white_plies": 20,
+                "black_plies": 20,
+                "unlabeled_white_plies": 0,
+                "unlabeled_black_plies": 0,
+                "label_counts_total": {"good": 35, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                "label_counts_white": {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                "label_counts_black": {"good": 20, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
                 "player_total_plies": 20,
                 "player_total_moves": 20,
                 "player_label_counts": {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
@@ -425,3 +469,122 @@ def test_print_backfill_summary_uses_run_backfill_counts(monkeypatch, tmp_path, 
     assert "- games fetched from chess.com: 3" in out
     assert "- games analyzed with Stockfish: 2" in out
     assert "  tactical_awareness: 88" in out
+
+
+def test_backfill_summary_uses_exact_trait_scores(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.delenv("TRAITS_DEBUG", raising=False)
+    args = chess_review.parse_args(
+        [
+            "--username",
+            "logan",
+            "--provider",
+            "ollama",
+            "--backfill",
+            "1",
+            "--state-db",
+            str(tmp_path / "state.sqlite"),
+            "--out",
+            str(tmp_path / "output"),
+        ]
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "_fetch_backfill_candidates",
+        lambda **_kwargs: ([chess_review.parse_game(_raw_game(game_id=9, end_time=1_706_000_900), "logan")], 1),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "_analyze_game_with_stockfish",
+        lambda **kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": {
+                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+                "your_color": kwargs["game"].your_color,
+                "result": kwargs["game"].result,
+                "total_plies": 40,
+                "total_moves": 20,
+                "white_plies": 20,
+                "black_plies": 20,
+                "unlabeled_white_plies": 0,
+                "unlabeled_black_plies": 0,
+                "label_counts_total": {"good": 35, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                "label_counts_white": {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                "label_counts_black": {"good": 20, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+                "player_total_plies": 20,
+                "player_total_moves": 20,
+                "player_label_counts": {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                "label_counts_by_side": {
+                    "white": {"good": 15, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+                    "black": {"good": 20, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+                },
+                "label_counts": {"good": 35, "inaccuracy": 3, "mistake": 1, "blunder": 1, "brilliant": 0},
+            },
+            "key_positions": [],
+        },
+    )
+
+    expected_scores = {
+        "tactical_awareness": 67,
+        "material_discipline": 71,
+        "conversion_ability": 73,
+        "defensive_resilience": 79,
+        "blunder_frequency": 83,
+    }
+    compute_calls = {"count": 0}
+
+    def _fake_compute(payloads):
+        compute_calls["count"] += 1
+        assert isinstance(payloads, list)
+        return dict(expected_scores)
+
+    monkeypatch.setattr(engine_traits_module, "compute_engine_trait_scores", _fake_compute)
+
+    conn = chess_review.init_db(args.state_db)
+    try:
+        result = chess_review.run_backfill(conn, args)
+    finally:
+        conn.close()
+
+    assert compute_calls["count"] == 1
+    assert result["trait_scores"] == expected_scores
+
+    chess_review._print_backfill_summary(result)
+    out = capsys.readouterr().out
+    assert "  tactical_awareness: 67" in out
+    assert "  material_discipline: 71" in out
+    assert "  conversion_ability: 73" in out
+    assert "  defensive_resilience: 79" in out
+    assert "  blunder_frequency: 83" in out
+
+
+def test_backfill_summary_raises_on_traits_debug_mismatch(monkeypatch) -> None:
+    monkeypatch.setenv("TRAITS_DEBUG", "1")
+    monkeypatch.setattr(
+        engine_traits_module,
+        "get_last_traits_debug_aggregate",
+        lambda: {
+            "scores_after_clamp": {
+                "tactical_awareness": 10,
+                "material_discipline": 20,
+                "conversion_ability": 30,
+                "defensive_resilience": 40,
+                "blunder_frequency": 50,
+            }
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="Trait propagation mismatch detected"):
+        chess_review._print_backfill_summary(
+            {
+                "total_games_requested": 1,
+                "games_fetched_from_chess_com": 1,
+                "games_analyzed_with_stockfish": 1,
+                "trait_scores": {
+                    "tactical_awareness": 90,
+                    "material_discipline": 85,
+                    "conversion_ability": 80,
+                    "defensive_resilience": 75,
+                    "blunder_frequency": 95,
+                },
+            }
+        )

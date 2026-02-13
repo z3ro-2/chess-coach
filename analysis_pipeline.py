@@ -7,7 +7,13 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from engine.payload_schema import enrich_summary_with_player_fields, validate_engine_payload
+from engine.payload_schema import (
+    ENGINE_PAYLOAD_SCHEMA_VERSION,
+    LABEL_KEYS,
+    enrich_summary_with_player_fields,
+    normalize_label_counts,
+    validate_engine_payload,
+)
 from llm.safe_payload import build_llm_safe_payload
 from src.utils.timezone import get_display_timezone
 
@@ -30,6 +36,9 @@ def run_analysis_pipeline(
     engine_output = _run_stockfish_oracle(game=game, args=args, logger=logger)
     if engine_output is None:
         raise RuntimeError("Stockfish engine failed or produced no output.")
+    raw_errors = _raw_engine_payload_required_field_errors(engine_output)
+    if raw_errors:
+        raise RuntimeError(f"Engine payload invalid: {';'.join(raw_errors)}")
 
     summary = dict(engine_output.get("game_summary") or {})
     summary = enrich_summary_with_player_fields(
@@ -38,6 +47,7 @@ def run_analysis_pipeline(
     )
     summary["result"] = getattr(game, "result", None)
     engine_output = {
+        "schema_version": int(engine_output.get("schema_version", ENGINE_PAYLOAD_SCHEMA_VERSION) or ENGINE_PAYLOAD_SCHEMA_VERSION),
         "game_summary": summary,
         "key_positions": list(engine_output.get("key_positions") or []),
     }
@@ -47,9 +57,10 @@ def run_analysis_pipeline(
         require_player_fields=True,
         require_key_positions=True,
     )
-    if not validation.is_valid:
-        detail = ";".join(validation.errors)
-        raise RuntimeError(f"Stockfish payload invariants failed: {detail}")
+    invariant_errors = _analysis_payload_invariant_errors(engine_output=engine_output, validation=validation)
+    if invariant_errors:
+        detail = ";".join(invariant_errors)
+        raise RuntimeError(f"Engine payload invalid: {detail}")
 
     llm_payload = build_llm_safe_payload(
         engine_output,
@@ -64,9 +75,10 @@ def run_analysis_pipeline(
             "url": getattr(game, "game_url", None),
         },
     )
+    llm_payload = _to_player_only_prompt_payload(llm_payload)
     key_positions = llm_payload.get("key_positions") or []
     if len(key_positions) != 4:
-        raise RuntimeError("Stockfish oracle must return exactly 4 key positions.")
+        raise RuntimeError("Engine payload invalid: key_positions_must_have_exactly_four")
 
     system_template = load_prompt_file("review_system.md")
     user_template = load_prompt_file("review_user_strict.md")
@@ -137,3 +149,173 @@ def _collect_allowed_sans(llm_payload: Mapping[str, Any]) -> set[str]:
             if token:
                 allowed.add(token)
     return allowed
+
+
+def _raw_engine_payload_required_field_errors(engine_output: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    schema_version = int(engine_output.get("schema_version", 1) or 1)
+    if schema_version != ENGINE_PAYLOAD_SCHEMA_VERSION:
+        errors.append(f"unsupported_schema_version:{schema_version}")
+
+    summary_raw = engine_output.get("game_summary")
+    if not isinstance(summary_raw, Mapping):
+        return ["game_summary_missing_or_invalid"]
+    summary = dict(summary_raw)
+    summary_schema_version = int(summary.get("schema_version", schema_version) or schema_version)
+    if summary_schema_version != ENGINE_PAYLOAD_SCHEMA_VERSION:
+        errors.append(f"game_summary_schema_version_mismatch:{summary_schema_version}")
+
+    key_positions = engine_output.get("key_positions")
+    if not isinstance(key_positions, list):
+        errors.append("key_positions_missing_or_invalid")
+    elif len(key_positions) != 4:
+        errors.append(f"key_positions_must_have_exactly_four actual:{len(key_positions)}")
+
+    white_counts = normalize_label_counts(summary.get("label_counts_white"))
+    black_counts = normalize_label_counts(summary.get("label_counts_black"))
+    if white_counts is None:
+        errors.append("label_counts_white_missing_or_invalid")
+        white_counts = {key: 0 for key in LABEL_KEYS}
+    if black_counts is None:
+        errors.append("label_counts_black_missing_or_invalid")
+        black_counts = {key: 0 for key in LABEL_KEYS}
+
+    total_plies = int(summary.get("total_plies", 0) or 0)
+    white_plies = int(summary.get("white_plies", -1) or -1)
+    black_plies = int(summary.get("black_plies", -1) or -1)
+    if total_plies <= 0:
+        errors.append("total_plies_must_be_positive")
+    if white_plies < 0 or black_plies < 0:
+        errors.append("side_plies_missing_or_invalid")
+    if total_plies > 0 and white_plies >= 0 and black_plies >= 0 and int(white_plies + black_plies) != int(total_plies):
+        errors.append(f"total_plies_side_split_mismatch expected:{total_plies} actual:{white_plies + black_plies}")
+
+    labeled_white = int(sum(int(white_counts.get(key, 0)) for key in LABEL_KEYS))
+    labeled_black = int(sum(int(black_counts.get(key, 0)) for key in LABEL_KEYS))
+    unlabeled_white = max(0, int(summary.get("unlabeled_white_plies", max(0, white_plies - labeled_white)) or 0))
+    unlabeled_black = max(0, int(summary.get("unlabeled_black_plies", max(0, black_plies - labeled_black)) or 0))
+    if white_plies >= 0 and int(labeled_white + unlabeled_white) != int(white_plies):
+        errors.append(f"white_plies_accounting_mismatch expected:{white_plies} actual:{labeled_white + unlabeled_white}")
+    if black_plies >= 0 and int(labeled_black + unlabeled_black) != int(black_plies):
+        errors.append(f"black_plies_accounting_mismatch expected:{black_plies} actual:{labeled_black + unlabeled_black}")
+    return errors
+
+
+def _analysis_payload_invariant_errors(
+    *,
+    engine_output: Mapping[str, Any],
+    validation: Any,
+) -> list[str]:
+    errors: list[str] = []
+    if not bool(getattr(validation, "is_valid", False)):
+        errors.extend(list(getattr(validation, "errors", ()) or ()))
+    summary_raw = engine_output.get("game_summary")
+    if not isinstance(summary_raw, Mapping):
+        errors.append("game_summary_missing_or_invalid")
+        return errors
+    summary = dict(summary_raw)
+
+    schema_version = int(engine_output.get("schema_version", summary.get("schema_version", 1)) or 1)
+    if schema_version != ENGINE_PAYLOAD_SCHEMA_VERSION:
+        errors.append(f"unsupported_schema_version:{schema_version}")
+
+    key_positions = engine_output.get("key_positions")
+    if not isinstance(key_positions, list):
+        errors.append("key_positions_missing_or_invalid")
+    elif len(key_positions) != 4:
+        errors.append(f"key_positions_must_have_exactly_four actual:{len(key_positions)}")
+
+    your_color = str(summary.get("your_color", "")).strip().lower()
+    if your_color not in {"white", "black"}:
+        errors.append("your_color_missing_or_invalid")
+
+    white_counts = normalize_label_counts(summary.get("label_counts_white"))
+    black_counts = normalize_label_counts(summary.get("label_counts_black"))
+    if white_counts is None:
+        errors.append("label_counts_white_missing_or_invalid")
+        white_counts = {key: 0 for key in LABEL_KEYS}
+    if black_counts is None:
+        errors.append("label_counts_black_missing_or_invalid")
+        black_counts = {key: 0 for key in LABEL_KEYS}
+
+    try:
+        total_plies = int(summary.get("total_plies", 0) or 0)
+        white_plies = int(summary.get("white_plies", -1) or -1)
+        black_plies = int(summary.get("black_plies", -1) or -1)
+    except Exception:
+        total_plies = 0
+        white_plies = -1
+        black_plies = -1
+    if total_plies <= 0:
+        errors.append("total_plies_must_be_positive")
+    if white_plies < 0 or black_plies < 0:
+        errors.append("side_plies_missing_or_invalid")
+    if total_plies > 0 and white_plies >= 0 and black_plies >= 0 and int(white_plies + black_plies) != int(total_plies):
+        errors.append(f"total_plies_side_split_mismatch expected:{total_plies} actual:{white_plies + black_plies}")
+
+    labeled_white = int(sum(int(white_counts.get(key, 0)) for key in LABEL_KEYS))
+    labeled_black = int(sum(int(black_counts.get(key, 0)) for key in LABEL_KEYS))
+    unlabeled_white = max(0, int(summary.get("unlabeled_white_plies", max(0, white_plies - labeled_white)) or 0))
+    unlabeled_black = max(0, int(summary.get("unlabeled_black_plies", max(0, black_plies - labeled_black)) or 0))
+    if white_plies >= 0 and labeled_white + unlabeled_white != white_plies:
+        errors.append(
+            f"white_plies_accounting_mismatch expected:{white_plies} actual:{labeled_white + unlabeled_white}"
+        )
+    if black_plies >= 0 and labeled_black + unlabeled_black != black_plies:
+        errors.append(
+            f"black_plies_accounting_mismatch expected:{black_plies} actual:{labeled_black + unlabeled_black}"
+        )
+
+    return errors
+
+
+def _to_player_only_prompt_payload(llm_payload: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {
+        "schema_version": int(llm_payload.get("schema_version", ENGINE_PAYLOAD_SCHEMA_VERSION) or ENGINE_PAYLOAD_SCHEMA_VERSION),
+        "game_summary": dict(llm_payload.get("game_summary") or {}),
+        "key_positions": list(llm_payload.get("key_positions") or []),
+    }
+    summary = dict(payload["game_summary"])
+    your_color = str(summary.get("your_color", "")).strip().lower()
+    white_counts = normalize_label_counts(summary.get("label_counts_white")) or {key: 0 for key in LABEL_KEYS}
+    black_counts = normalize_label_counts(summary.get("label_counts_black")) or {key: 0 for key in LABEL_KEYS}
+    white_plies = int(summary.get("white_plies", 0) or 0)
+    black_plies = int(summary.get("black_plies", 0) or 0)
+    if your_color == "black":
+        player_counts = dict(black_counts)
+        player_plies = int(max(0, black_plies))
+    else:
+        player_counts = dict(white_counts)
+        player_plies = int(max(0, white_plies))
+
+    player_error_plies = int(
+        int(player_counts.get("inaccuracy", 0))
+        + int(player_counts.get("mistake", 0))
+        + int(player_counts.get("blunder", 0))
+    )
+    denom = float(max(1, player_plies))
+    metadata_keys = (
+        "schema_version",
+        "engine_depth",
+        "date_utc",
+        "your_color",
+        "opponent",
+        "result",
+        "time_control",
+        "rated",
+        "rules",
+        "url",
+    )
+    player_summary: dict[str, Any] = {}
+    for key in metadata_keys:
+        if key in summary:
+            player_summary[key] = summary.get(key)
+    player_summary["player_plies_analyzed"] = int(player_plies)
+    player_summary["player_label_counts_plies"] = dict(player_counts)
+    player_summary["player_error_plies"] = int(player_error_plies)
+    player_summary["player_error_rate_per_ply"] = round(float(player_error_plies) / denom, 4)
+    player_summary["player_inaccuracy_rate_per_ply"] = round(float(player_counts.get("inaccuracy", 0)) / denom, 4)
+    player_summary["player_mistake_rate_per_ply"] = round(float(player_counts.get("mistake", 0)) / denom, 4)
+    player_summary["player_blunder_rate_per_ply"] = round(float(player_counts.get("blunder", 0)) / denom, 4)
+    payload["game_summary"] = player_summary
+    return payload

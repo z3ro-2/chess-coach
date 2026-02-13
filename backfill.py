@@ -70,6 +70,7 @@ def backfill_recent_games(conn: sqlite3.Connection, username: str, limit: int) -
             raise RuntimeError(f"Stockfish engine failed for game {game.game_url}")
 
         payload = {
+            "schema_version": int(engine_output.get("schema_version", ENGINE_PAYLOAD_SCHEMA_VERSION) or ENGINE_PAYLOAD_SCHEMA_VERSION),
             "game_summary": enrich_summary_with_player_fields(
                 dict(engine_output.get("game_summary") or {}),
                 your_color=str(game.your_color),

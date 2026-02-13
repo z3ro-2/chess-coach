@@ -73,22 +73,25 @@ def enrich_summary_with_player_fields(
     if "total_moves" not in normalized:
         normalized["total_moves"] = (total_plies + 1) // 2 if total_plies > 0 else 0
 
-    side_counts_raw = normalized.get("label_counts_by_side")
-    side_counts: dict[str, dict[str, int]] = {
-        "white": empty_label_counts(),
-        "black": empty_label_counts(),
-    }
-    if isinstance(side_counts_raw, Mapping):
-        for side in SIDE_KEYS:
-            normalized_side = normalize_label_counts(side_counts_raw.get(side))
-            if normalized_side is not None:
-                side_counts[side] = normalized_side
+    side_counts = _normalized_side_counts(normalized)
+    if side_counts is None:
+        side_counts = {
+            "white": empty_label_counts(),
+            "black": empty_label_counts(),
+        }
     normalized["label_counts_by_side"] = side_counts
+    normalized["label_counts_white"] = dict(side_counts["white"])
+    normalized["label_counts_black"] = dict(side_counts["black"])
 
     merged_counts = empty_label_counts()
     for key in LABEL_KEYS:
         merged_counts[key] = int(side_counts["white"][key]) + int(side_counts["black"][key])
+    normalized["label_counts_total"] = merged_counts
     normalized["label_counts"] = merged_counts
+    normalized["white_plies"] = int(side_plies["white"])
+    normalized["black_plies"] = int(side_plies["black"])
+    normalized["unlabeled_white_plies"] = max(0, int(side_plies["white"]) - sum_label_counts(side_counts["white"]))
+    normalized["unlabeled_black_plies"] = max(0, int(side_plies["black"]) - sum_label_counts(side_counts["black"]))
 
     color = player_color_from_summary(normalized)
     if color is not None:
@@ -110,7 +113,12 @@ def validate_engine_payload(
     summary_raw = payload.get("game_summary")
     summary = summary_raw if isinstance(summary_raw, Mapping) else {}
 
-    schema_version = _as_int(summary.get("schema_version", 1))
+    schema_version = _as_int(payload.get("schema_version", summary.get("schema_version", 1)))
+    summary_schema_version = _as_int(summary.get("schema_version", schema_version))
+    if "schema_version" in payload and "schema_version" in summary and schema_version != summary_schema_version:
+        errors.append(
+            f"schema_version_mismatch payload:{schema_version} game_summary:{summary_schema_version}"
+        )
     if require_schema_version and schema_version != ENGINE_PAYLOAD_SCHEMA_VERSION:
         errors.append(
             f"unsupported_schema_version:{schema_version} expected:{ENGINE_PAYLOAD_SCHEMA_VERSION}"
@@ -127,22 +135,40 @@ def validate_engine_payload(
     if total_plies > 0 and total_moves != expected_moves:
         errors.append(f"total_moves_mismatch expected:{expected_moves} actual:{total_moves}")
 
-    label_counts = normalize_label_counts(summary.get("label_counts"))
-    if label_counts is None:
-        errors.append("label_counts_missing_or_invalid")
-        label_counts = empty_label_counts()
+    expected_side = expected_side_plies(total_plies)
+    white_plies = _as_int(summary.get("white_plies", expected_side["white"]))
+    black_plies = _as_int(summary.get("black_plies", expected_side["black"]))
+    if total_plies > 0 and int(white_plies + black_plies) != int(total_plies):
+        errors.append(f"total_plies_side_split_mismatch expected:{total_plies} actual:{white_plies + black_plies}")
 
-    side_counts = _normalized_side_counts(summary.get("label_counts_by_side"))
+    side_counts = _normalized_side_counts(summary)
     if side_counts is None:
-        errors.append("label_counts_by_side_missing_or_invalid")
+        errors.append("side_label_counts_missing_or_invalid")
         side_counts = {"white": empty_label_counts(), "black": empty_label_counts()}
 
-    expected_side = expected_side_plies(total_plies)
+    unlabeled_by_side: dict[str, int] = {"white": 0, "black": 0}
     for side in SIDE_KEYS:
-        if sum_label_counts(side_counts[side]) != expected_side[side]:
+        side_plies = int(white_plies if side == "white" else black_plies)
+        labeled_plies = int(sum_label_counts(side_counts[side]))
+        unlabeled_key = f"unlabeled_{side}_plies"
+        default_unlabeled = max(0, side_plies - labeled_plies)
+        unlabeled_plies = max(0, _as_int(summary.get(unlabeled_key, default_unlabeled)))
+        unlabeled_by_side[side] = int(unlabeled_plies)
+        if labeled_plies > side_plies:
             errors.append(
-                f"side_plies_mismatch:{side} expected:{expected_side[side]} actual:{sum_label_counts(side_counts[side])}"
+                f"side_labeled_plies_exceed_total:{side} labeled:{labeled_plies} total:{side_plies}"
             )
+        if labeled_plies + unlabeled_plies != side_plies:
+            errors.append(
+                f"side_plies_accounting_mismatch:{side} expected:{side_plies} actual:{labeled_plies + unlabeled_plies}"
+            )
+
+    label_counts = normalize_label_counts(summary.get("label_counts_total"))
+    if label_counts is None:
+        label_counts = normalize_label_counts(summary.get("label_counts"))
+    if label_counts is None:
+        errors.append("label_counts_total_missing_or_invalid")
+        label_counts = empty_label_counts()
 
     for key in LABEL_KEYS:
         expected_total = int(side_counts["white"][key]) + int(side_counts["black"][key])
@@ -151,9 +177,14 @@ def validate_engine_payload(
             errors.append(
                 f"label_total_mismatch:{key} expected:{expected_total} actual:{actual_total}"
             )
-    if sum_label_counts(label_counts) != total_plies:
+    legacy_label_counts = normalize_label_counts(summary.get("label_counts"))
+    if legacy_label_counts is not None and dict(legacy_label_counts) != dict(label_counts):
+        errors.append("label_counts_legacy_mismatch_label_counts_total")
+
+    total_unlabeled = int(unlabeled_by_side["white"] + unlabeled_by_side["black"])
+    if int(sum_label_counts(label_counts) + total_unlabeled) != int(total_plies):
         errors.append(
-            f"total_plies_label_sum_mismatch expected:{total_plies} actual:{sum_label_counts(label_counts)}"
+            f"total_plies_label_sum_mismatch expected:{total_plies} actual:{sum_label_counts(label_counts) + total_unlabeled}"
         )
 
     key_positions = payload.get("key_positions")
@@ -170,25 +201,27 @@ def validate_engine_payload(
         if require_player_fields:
             errors.append("your_color_missing_or_invalid")
     else:
-        player_total_plies = _as_int(summary.get("player_total_plies", expected_side[your_color]))
+        expected_player_plies = int(white_plies if your_color == "white" else black_plies)
+        player_total_plies = _as_int(summary.get("player_total_plies", expected_player_plies))
         player_total_moves = _as_int(summary.get("player_total_moves", player_total_plies))
         player_raw = summary.get("player_label_counts")
         normalized_player = normalize_label_counts(player_raw)
         if normalized_player is None:
             normalized_player = dict(side_counts[your_color])
         player_label_counts = normalized_player
+        player_unlabeled_plies = int(unlabeled_by_side[your_color])
 
-        if player_total_plies != expected_side[your_color]:
+        if player_total_plies != expected_player_plies:
             errors.append(
-                f"player_total_plies_mismatch expected:{expected_side[your_color]} actual:{player_total_plies}"
+                f"player_total_plies_mismatch expected:{expected_player_plies} actual:{player_total_plies}"
             )
         if player_total_moves != player_total_plies:
             errors.append(
                 f"player_total_moves_mismatch expected:{player_total_plies} actual:{player_total_moves}"
             )
-        if sum_label_counts(player_label_counts) != player_total_plies:
+        if int(sum_label_counts(player_label_counts) + player_unlabeled_plies) != int(player_total_plies):
             errors.append(
-                f"player_plies_label_sum_mismatch expected:{player_total_plies} actual:{sum_label_counts(player_label_counts)}"
+                f"player_plies_label_sum_mismatch expected:{player_total_plies} actual:{sum_label_counts(player_label_counts) + player_unlabeled_plies}"
             )
         if dict(player_label_counts) != dict(side_counts[your_color]):
             errors.append("player_label_counts_mismatch_side_counts")
@@ -217,9 +250,22 @@ def validate_engine_payload(
 def _normalized_side_counts(raw_side_counts: Any) -> dict[str, dict[str, int]] | None:
     if not isinstance(raw_side_counts, Mapping):
         return None
+
+    white_counts = normalize_label_counts(raw_side_counts.get("label_counts_white"))
+    black_counts = normalize_label_counts(raw_side_counts.get("label_counts_black"))
+    if white_counts is not None and black_counts is not None:
+        return {
+            "white": white_counts,
+            "black": black_counts,
+        }
+
+    side_counts_raw = raw_side_counts.get("label_counts_by_side")
+    if not isinstance(side_counts_raw, Mapping):
+        side_counts_raw = raw_side_counts
+
     normalized: dict[str, dict[str, int]] = {}
     for side in SIDE_KEYS:
-        side_counts = normalize_label_counts(raw_side_counts.get(side))
+        side_counts = normalize_label_counts(side_counts_raw.get(side) if isinstance(side_counts_raw, Mapping) else None)
         if side_counts is None:
             return None
         normalized[side] = side_counts

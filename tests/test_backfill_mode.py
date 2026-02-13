@@ -31,6 +31,7 @@ def _args(tmp_path, *, backfill: int) -> SimpleNamespace:
     return SimpleNamespace(
         username="logan",
         backfill=backfill,
+        rebuild_payloads=False,
         lookback_days=10,
         rules_filter="chess",
         stockfish_path="/fake/stockfish",
@@ -61,12 +62,20 @@ def _backfill_payload_for_game(game: chess_review.GameInfo) -> dict:
     )
     merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in player_counts}
     return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
         "game_summary": {
             "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "your_color": game.your_color,
             "result": game.result,
             "total_plies": 40,
             "total_moves": 20,
+            "white_plies": 20,
+            "black_plies": 20,
+            "unlabeled_white_plies": 0,
+            "unlabeled_black_plies": 0,
+            "label_counts_total": dict(merged),
+            "label_counts_white": dict(by_side["white"]),
+            "label_counts_black": dict(by_side["black"]),
             "player_total_plies": 20,
             "player_total_moves": 20,
             "player_label_counts": player_counts,
@@ -123,6 +132,42 @@ def test_backfill_runs_without_llm_calls(monkeypatch, tmp_path) -> None:
     assert meta_count == 2
 
 
+def test_parse_args_accepts_rebuild_payload_flags(tmp_path) -> None:
+    args_long = chess_review.parse_args(
+        [
+            "--username",
+            "logan",
+            "--provider",
+            "ollama",
+            "--backfill",
+            "100",
+            "--rebuild-payloads",
+            "--state-db",
+            str(tmp_path / "state.sqlite"),
+            "--out",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert bool(args_long.rebuild_payloads) is True
+
+    args_alias = chess_review.parse_args(
+        [
+            "--username",
+            "logan",
+            "--provider",
+            "ollama",
+            "--backfill",
+            "100",
+            "--backfill-reset",
+            "--state-db",
+            str(tmp_path / "state.sqlite"),
+            "--out",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert bool(args_alias.rebuild_payloads) is True
+
+
 def test_backfill_invokes_engine_once_per_game_and_stores_payloads(monkeypatch, tmp_path) -> None:
     args = _args(tmp_path, backfill=3)
     raw_games = [
@@ -163,6 +208,62 @@ def test_backfill_invokes_engine_once_per_game_and_stores_payloads(monkeypatch, 
     loaded = json.loads(str(rows[0][1]))
     assert loaded["game_summary"]["result"] == "1/2-1/2"
     assert isinstance(loaded["key_positions"], list)
+
+
+def test_backfill_rebuild_payloads_overwrites_existing_payload(monkeypatch, tmp_path) -> None:
+    args = _args(tmp_path, backfill=1)
+    args.rebuild_payloads = True
+    raw_games = [_raw_game(game_id=77, end_time=1_706_000_770)]
+    monkeypatch.setattr(
+        chess_review,
+        "_fetch_backfill_candidates",
+        lambda **_kwargs: (_parsed_games(raw_games), len(raw_games)),
+    )
+
+    analyze_calls = {"count": 0}
+
+    def _analyze(**kwargs):
+        analyze_calls["count"] += 1
+        payload = _backfill_payload_for_game(kwargs["game"])
+        payload["game_summary"]["label_counts_white"]["blunder"] = 2
+        payload["game_summary"]["label_counts_total"]["blunder"] = (
+            int(payload["game_summary"]["label_counts_white"]["blunder"])
+            + int(payload["game_summary"]["label_counts_black"]["blunder"])
+        )
+        payload["game_summary"]["label_counts"]["blunder"] = int(payload["game_summary"]["label_counts_total"]["blunder"])
+        return payload
+
+    monkeypatch.setattr(chess_review, "_analyze_game_with_stockfish", _analyze)
+
+    conn = chess_review.init_db(args.state_db)
+    try:
+        existing = _backfill_payload_for_game(_parsed_games(raw_games)[0])
+        existing["game_summary"]["label_counts_white"]["blunder"] = 0
+        existing["game_summary"]["label_counts_total"]["blunder"] = 0
+        existing["game_summary"]["label_counts"]["blunder"] = 0
+        chess_review._store_engine_payload(
+            conn,
+            game_url="https://www.chess.com/game/live/77",
+            end_time=1_706_000_770,
+            engine_depth=12,
+            payload=existing,
+        )
+        result = chess_review.run_backfill(conn, args)
+        row = conn.execute(
+            "SELECT payload_json FROM engine_payloads WHERE game_url = ?",
+            ("https://www.chess.com/game/live/77",),
+        ).fetchone()
+        assert row is not None
+        stored = json.loads(str(row[0]))
+    finally:
+        conn.close()
+
+    assert analyze_calls["count"] == 1
+    assert result["engine_analyses"] == 1
+    assert result["stale_payloads_rederived"] == 1
+    assert int(stored["schema_version"]) == ENGINE_PAYLOAD_SCHEMA_VERSION
+    assert int(stored["game_summary"]["schema_version"]) == ENGINE_PAYLOAD_SCHEMA_VERSION
+    assert int(stored["game_summary"]["label_counts_white"]["blunder"]) == 2
 
 
 def test_backfill_respects_n_when_fewer_games_exist(monkeypatch, tmp_path) -> None:

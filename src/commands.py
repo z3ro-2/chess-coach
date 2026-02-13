@@ -110,9 +110,11 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
     )
     recent_meta = app._load_recent_game_meta_for_summary(conn, cadence)
     trait_window_metrics = app._compute_trait_scores_and_window_metrics(conn, args, window_size=trait_window)
-    trait_scores = dict(trait_window_metrics.get("scores") or {})
+    trait_scores = app._normalized_trait_scores(trait_window_metrics.get("scores") or {})
+    trait_window_games = int(trait_window_metrics.get("trait_window_games", 0) or 0)
     trait_window_moves = int(trait_window_metrics.get("trait_window_moves", 0) or 0)
     trait_confidence = str(trait_window_metrics.get("confidence", "LOW") or "LOW")
+    trait_confidence_reason = str(trait_window_metrics.get("confidence_reason", "") or "").strip()
     summary_context = app._load_latest_summary_context(conn)
     summary_md = app._generate_player_summary_markdown(
         args,
@@ -121,7 +123,7 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         stats_path=stats_path,
         recent_meta=recent_meta,
         trait_scores=trait_scores,
-        trait_window_size=trait_window,
+        trait_window_size=trait_window_games,
         trait_window_moves=trait_window_moves,
         trait_confidence=trait_confidence,
         summary_context=summary_context,
@@ -131,13 +133,15 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
     latest_end_time = int(recent_meta[0][0]) if recent_meta else int(time.time())
     app._set_summary_state(conn, processed_count, latest_end_time)
     score_line = (
-        f"tactical_awareness={int(trait_scores.get('tactical_awareness', 100) or 100)}, "
-        f"material_discipline={int(trait_scores.get('material_discipline', 100) or 100)}, "
-        f"conversion_ability={int(trait_scores.get('conversion_ability', 100) or 100)}, "
-        f"defensive_resilience={int(trait_scores.get('defensive_resilience', 100) or 100)}, "
-        f"blunder_frequency={int(trait_scores.get('blunder_frequency', 100) or 100)}"
+        f"tactical_awareness={int(trait_scores['tactical_awareness'])}, "
+        f"material_discipline={int(trait_scores['material_discipline'])}, "
+        f"conversion_ability={int(trait_scores['conversion_ability'])}, "
+        f"defensive_resilience={int(trait_scores['defensive_resilience'])}, "
+        f"blunder_frequency={int(trait_scores['blunder_frequency'])}"
     )
-    text = f"Summary generated: {summary_path}\nTrait scores (last {trait_window} games): {score_line}"
+    text = f"Summary generated: {summary_path}\nTrait scores (v2 window {trait_window_games}/{trait_window} games): {score_line}"
+    if trait_confidence_reason:
+        text = f"{text}\nTrait confidence: {trait_confidence} ({trait_confidence_reason})"
     return {"text": text, "file": summary_path}
 
 

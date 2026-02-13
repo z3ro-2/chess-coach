@@ -10,6 +10,13 @@ SAFE_GAME_SUMMARY_KEYS: Sequence[str] = (
     "result",
     "total_plies",
     "total_moves",
+    "white_plies",
+    "black_plies",
+    "unlabeled_white_plies",
+    "unlabeled_black_plies",
+    "label_counts_total",
+    "label_counts_white",
+    "label_counts_black",
     "player_total_plies",
     "player_total_moves",
     "label_counts",
@@ -32,6 +39,7 @@ def build_llm_safe_payload(
     game_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     raw_summary = dict(engine_output.get("game_summary") or {})
+    schema_version = int(engine_output.get("schema_version", raw_summary.get("schema_version", 1)) or 1)
     # For review text, expose only player-scoped counts under `label_counts`.
     player_label_counts = raw_summary.get("player_label_counts")
     if isinstance(player_label_counts, Mapping):
@@ -62,6 +70,7 @@ def build_llm_safe_payload(
         )
 
     return {
+        "schema_version": int(schema_version),
         "game_summary": game_summary,
         "key_positions": key_positions,
     }

@@ -50,7 +50,7 @@ def test_run_analysis_pipeline_rejects_invariant_violations(monkeypatch) -> None
         },
     )
 
-    with pytest.raises(RuntimeError, match="Stockfish payload invariants failed"):
+    with pytest.raises(RuntimeError, match="Engine payload invalid:"):
         run_analysis_pipeline(
             game=game,
             args=args,
@@ -88,9 +88,15 @@ def test_stockfish_oracle_payload_matches_schema_invariants(monkeypatch) -> None
 
     output = oracle.analyze_game(pgn_text)
     summary = dict(output["game_summary"])
+    assert int(output.get("schema_version", 0)) == ENGINE_PAYLOAD_SCHEMA_VERSION
     assert summary["schema_version"] == ENGINE_PAYLOAD_SCHEMA_VERSION
     assert int(summary["total_plies"]) == 6
     assert int(summary["total_moves"]) == 3
+    assert int(summary["white_plies"]) == 3
+    assert int(summary["black_plies"]) == 3
+    assert isinstance(summary.get("label_counts_total"), dict)
+    assert isinstance(summary.get("label_counts_white"), dict)
+    assert isinstance(summary.get("label_counts_black"), dict)
 
     payload = {
         "game_summary": enrich_summary_with_player_fields(summary, your_color="white"),
@@ -113,6 +119,42 @@ def test_stockfish_oracle_payload_matches_schema_invariants(monkeypatch) -> None
     assert sum(int(v) for v in validation.player_label_counts.values()) == 3
 
 
+def test_schema_v2_minimal_payload_with_per_side_counts_passes_invariants() -> None:
+    payload = {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+        "game_summary": {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "your_color": "white",
+            "result": "1-0",
+            "total_plies": 6,
+            "total_moves": 3,
+            "white_plies": 3,
+            "black_plies": 3,
+            "unlabeled_white_plies": 0,
+            "unlabeled_black_plies": 0,
+            "label_counts_white": {"good": 2, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+            "label_counts_black": {"good": 3, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+            "label_counts_total": {"good": 5, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+            "player_total_plies": 3,
+            "player_total_moves": 3,
+            "player_label_counts": {"good": 2, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+        },
+        "key_positions": [],
+    }
+    validation = validate_engine_payload(
+        payload,
+        require_schema_version=True,
+        require_player_fields=True,
+        require_key_positions=False,
+    )
+    assert validation.is_valid, ",".join(validation.errors)
+    assert validation.schema_version == ENGINE_PAYLOAD_SCHEMA_VERSION
+    assert validation.total_plies == 6
+    assert sum(int(v) for v in validation.label_counts.values()) == 6
+    assert sum(int(v) for v in validation.label_counts_by_side["white"].values()) == 3
+    assert sum(int(v) for v in validation.label_counts_by_side["black"].values()) == 3
+
+
 def test_llm_safe_payload_exposes_player_only_label_counts() -> None:
     payload = {
         "game_summary": {
@@ -125,6 +167,7 @@ def test_llm_safe_payload_exposes_player_only_label_counts() -> None:
         "key_positions": [],
     }
     safe = build_llm_safe_payload(payload)
+    assert safe["schema_version"] == ENGINE_PAYLOAD_SCHEMA_VERSION
     assert safe["game_summary"]["label_counts"] == {
         "good": 16,
         "inaccuracy": 2,

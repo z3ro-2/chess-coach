@@ -32,12 +32,20 @@ def _payload(
     )
     merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in label_counts}
     return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
         "game_summary": {
             "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "your_color": your_color,
             "result": result,
             "total_moves": total_moves,
             "total_plies": total_plies,
+            "white_plies": int(total_moves),
+            "black_plies": int(total_moves),
+            "unlabeled_white_plies": 0,
+            "unlabeled_black_plies": 0,
+            "label_counts_total": dict(merged),
+            "label_counts_white": dict(by_side["white"]),
+            "label_counts_black": dict(by_side["black"]),
             "player_total_plies": player_total_plies,
             "player_total_moves": player_total_plies,
             "player_label_counts": label_counts,
@@ -154,7 +162,7 @@ def test_compute_trait_scores_for_window_includes_backfill_payloads(monkeypatch,
 
     assert scores["tactical_awareness"] < 80
     assert scores["material_discipline"] < 80
-    assert scores["blunder_frequency"] < 85
+    assert scores["blunder_frequency"] < 90
     assert scores["conversion_ability"] <= 70
 
 
@@ -169,8 +177,8 @@ def test_compute_trait_scores_for_window_respects_limit_n(tmp_path) -> None:
             payload=_payload(
                 your_color="white",
                 result="0-1",
-                total_moves=24,
-                label_counts={"good": 10, "inaccuracy": 4, "mistake": 6, "blunder": 4, "brilliant": 0},
+                total_moves=30,
+                label_counts={"good": 16, "inaccuracy": 4, "mistake": 6, "blunder": 4, "brilliant": 0},
                 key_positions=[{"player": "White", "move_number": 20, "label": "blunder", "tactical_flag": "mate_threat", "material_change": -5}],
             ),
         )
@@ -182,8 +190,8 @@ def test_compute_trait_scores_for_window_respects_limit_n(tmp_path) -> None:
             payload=_payload(
                 your_color="white",
                 result="1-0",
-                total_moves=24,
-                label_counts={"good": 20, "inaccuracy": 2, "mistake": 2, "blunder": 0, "brilliant": 0},
+                total_moves=30,
+                label_counts={"good": 26, "inaccuracy": 2, "mistake": 2, "blunder": 0, "brilliant": 0},
                 key_positions=[],
             ),
         )
@@ -194,8 +202,8 @@ def test_compute_trait_scores_for_window_respects_limit_n(tmp_path) -> None:
             payload=_payload(
                 your_color="white",
                 result="1-0",
-                total_moves=24,
-                label_counts={"good": 21, "inaccuracy": 2, "mistake": 1, "blunder": 0, "brilliant": 0},
+                total_moves=30,
+                label_counts={"good": 27, "inaccuracy": 2, "mistake": 1, "blunder": 0, "brilliant": 0},
                 key_positions=[],
             ),
         )
@@ -307,9 +315,11 @@ def test_trait_window_metrics_include_moves_and_confidence_tier(tmp_path) -> Non
     finally:
         conn.close()
 
-    assert metrics["trait_window_games"] == 20
+    assert metrics["trait_window_games"] == 2
+    assert metrics["trait_window_requested_games"] == 20
     assert metrics["trait_window_moves"] == 260
-    assert metrics["confidence"] == "MEDIUM"
+    assert metrics["confidence"] == "LOW"
+    assert str(metrics["confidence_reason"]).startswith("insufficient v2 payloads")
 
 
 def test_load_recent_game_reviews_for_traits_has_stable_tiebreak_order(tmp_path) -> None:
@@ -371,6 +381,7 @@ def test_trait_window_with_old_schema_payload_ignores_invalid_row_without_reanal
             },
         )
         scores = chess_review._compute_trait_scores_for_window(conn, SimpleNamespace(), window_size=2)
+        metrics = chess_review._compute_trait_scores_and_window_metrics(conn, SimpleNamespace(), window_size=2)
     finally:
         conn.close()
 
@@ -381,3 +392,42 @@ def test_trait_window_with_old_schema_payload_ignores_invalid_row_without_reanal
         "defensive_resilience": 50,
         "blunder_frequency": 100,
     }
+    assert metrics["trait_window_games"] == 1
+    assert metrics["trait_window_requested_games"] == 2
+    assert metrics["confidence"] == "LOW"
+    assert str(metrics["confidence_reason"]).startswith("insufficient v2 payloads")
+
+
+def test_load_recent_game_reviews_for_traits_skips_legacy_and_collects_older_v2_payloads(tmp_path) -> None:
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        _insert_payload(
+            conn,
+            game_id=501,
+            end_time=1_706_000_300,
+            payload={"game_summary": {"your_color": "white", "result": "1-0"}, "key_positions": []},
+        )
+        second = _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=24,
+            label_counts={"good": 20, "inaccuracy": 2, "mistake": 2, "blunder": 0, "brilliant": 0},
+            key_positions=[],
+        )
+        second["game_summary"]["marker"] = "newer-v2"
+        third = _payload(
+            your_color="white",
+            result="1-0",
+            total_moves=24,
+            label_counts={"good": 19, "inaccuracy": 3, "mistake": 2, "blunder": 0, "brilliant": 0},
+            key_positions=[],
+        )
+        third["game_summary"]["marker"] = "older-v2"
+        _insert_payload(conn, game_id=502, end_time=1_706_000_200, payload=second)
+        _insert_payload(conn, game_id=503, end_time=1_706_000_100, payload=third)
+
+        loaded = chess_review._load_recent_game_reviews_for_traits(conn, 2)
+    finally:
+        conn.close()
+
+    assert [str(item["game_summary"]["marker"]) for item in loaded] == ["newer-v2", "older-v2"]

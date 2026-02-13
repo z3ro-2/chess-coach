@@ -113,7 +113,7 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
         chess_review._record_processed_game_meta(conn, game)
         result = run_command("summary", conn, args)
         assert Path(result["file"]).exists()
-        assert "Trait scores (last 7 games):" in str(result["text"])
+        assert "Trait scores (v2 window 7/7 games):" in str(result["text"])
     finally:
         conn.close()
 

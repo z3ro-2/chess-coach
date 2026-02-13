@@ -40,12 +40,20 @@ def _payload_v2(
     )
     merged = {k: int(by_side["white"][k]) + int(by_side["black"][k]) for k in player_label_counts}
     return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
         "game_summary": {
             "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "your_color": your_color,
             "result": result,
             "total_moves": int(total_moves),
             "total_plies": int(total_plies),
+            "white_plies": int(total_moves),
+            "black_plies": int(total_moves),
+            "unlabeled_white_plies": 0,
+            "unlabeled_black_plies": 0,
+            "label_counts_total": dict(merged),
+            "label_counts_white": dict(by_side["white"]),
+            "label_counts_black": dict(by_side["black"]),
             "player_total_plies": int(total_moves),
             "player_total_moves": int(total_moves),
             "player_label_counts": dict(player_label_counts),

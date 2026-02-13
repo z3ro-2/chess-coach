@@ -22,11 +22,13 @@ def _payload(
     key_positions: list[dict],
     opponent_label_counts: dict[str, int] | None = None,
 ) -> dict:
-    expected_player_plies = (total_plies + 1) // 2 if your_color == "white" else total_plies // 2
+    white_plies = (int(total_plies) + 1) // 2
+    black_plies = int(total_plies) // 2
+    expected_player_plies = int(white_plies if your_color == "white" else black_plies)
     assert sum(int(v) for v in player_label_counts.values()) == expected_player_plies
 
     if opponent_label_counts is None:
-        expected_opponent_plies = total_plies - expected_player_plies
+        expected_opponent_plies = int(total_plies) - expected_player_plies
         opponent_label_counts = {
             "good": expected_opponent_plies,
             "inaccuracy": 0,
@@ -50,19 +52,29 @@ def _payload(
         key: int(by_side["white"][key]) + int(by_side["black"][key])
         for key in ("good", "inaccuracy", "mistake", "blunder", "brilliant")
     }
+    unlabeled_white_plies = max(0, int(white_plies) - sum(int(v) for v in by_side["white"].values()))
+    unlabeled_black_plies = max(0, int(black_plies) - sum(int(v) for v in by_side["black"].values()))
 
     return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
         "game_summary": {
             "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "your_color": your_color,
             "result": result,
             "total_moves": (int(total_plies) + 1) // 2,
             "total_plies": int(total_plies),
+            "white_plies": int(white_plies),
+            "black_plies": int(black_plies),
+            "unlabeled_white_plies": int(unlabeled_white_plies),
+            "unlabeled_black_plies": int(unlabeled_black_plies),
+            "label_counts_total": dict(total_counts),
+            "label_counts_white": dict(by_side["white"]),
+            "label_counts_black": dict(by_side["black"]),
             "player_total_plies": int(expected_player_plies),
             "player_total_moves": int(expected_player_plies),
             "player_label_counts": dict(player_label_counts),
-            "label_counts": total_counts,
-            "label_counts_by_side": by_side,
+            "label_counts": dict(total_counts),
+            "label_counts_by_side": dict(by_side),
         },
         "key_positions": key_positions,
     }
@@ -70,6 +82,34 @@ def _payload(
 
 def test_invalid_payload_returns_neutral_scores() -> None:
     payloads = [{"game_summary": {"your_color": "white", "result": "1-0"}, "key_positions": []}]
+    scores = compute_engine_trait_scores(payloads)
+    assert scores == {
+        "tactical_awareness": 50,
+        "material_discipline": 50,
+        "conversion_ability": 50,
+        "defensive_resilience": 50,
+        "blunder_frequency": 50,
+    }
+
+
+def test_v1_payload_is_rejected_for_trait_scoring() -> None:
+    payloads = [
+        {
+            "game_summary": {
+                # Missing schema_version => treated as schema v1.
+                "your_color": "white",
+                "result": "1-0",
+                "total_plies": 40,
+                "total_moves": 20,
+                "label_counts": {"good": 34, "inaccuracy": 3, "mistake": 2, "blunder": 1, "brilliant": 0},
+                "label_counts_by_side": {
+                    "white": {"good": 17, "inaccuracy": 2, "mistake": 1, "blunder": 0, "brilliant": 0},
+                    "black": {"good": 17, "inaccuracy": 1, "mistake": 1, "blunder": 1, "brilliant": 0},
+                },
+            },
+            "key_positions": [],
+        }
+    ]
     scores = compute_engine_trait_scores(payloads)
     assert scores == {
         "tactical_awareness": 50,
@@ -99,6 +139,37 @@ def test_player_only_counts_ignore_opponent_side() -> None:
     )
 
     assert compute_engine_trait_scores([base]) == compute_engine_trait_scores([noisy_opponent])
+
+
+def test_invalid_payload_is_excluded_without_overwriting_valid_scores() -> None:
+    valid = _payload(
+        your_color="white",
+        result="1-0",
+        total_plies=80,
+        player_label_counts={"good": 32, "inaccuracy": 5, "mistake": 2, "blunder": 1, "brilliant": 0},
+        key_positions=[],
+    )
+    invalid = {
+        "game_summary": {"schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION, "your_color": "white", "result": "1-0"},
+        "key_positions": [],
+    }
+    mixed_scores = compute_engine_trait_scores([valid, invalid])
+    valid_scores = compute_engine_trait_scores([valid])
+    assert mixed_scores == valid_scores
+
+
+def test_regression_combined_side_counts_do_not_double_player_error_rates() -> None:
+    payload = _payload(
+        your_color="white",
+        result="1-0",
+        total_plies=80,
+        player_label_counts={"good": 38, "inaccuracy": 2, "mistake": 0, "blunder": 0, "brilliant": 0},
+        key_positions=[],
+        opponent_label_counts={"good": 10, "inaccuracy": 10, "mistake": 10, "blunder": 10, "brilliant": 0},
+    )
+    scores = compute_engine_trait_scores([payload])
+    assert scores["tactical_awareness"] >= 70
+    assert scores["blunder_frequency"] >= 75
 
 
 def test_bad_player_payload_produces_low_scores() -> None:
@@ -157,6 +228,38 @@ def test_average_player_payload_produces_mid_scores() -> None:
     assert scores["conversion_ability"] == 50
 
 
+def test_plausible_1100ish_player_rates_produce_believable_non_extreme_scores() -> None:
+    payloads: list[dict] = []
+    for idx in range(12):
+        result = "1-0" if idx % 3 == 0 else "0-1" if idx % 3 == 1 else "1/2-1/2"
+        payloads.append(
+            _payload(
+                your_color="white",
+                result=result,
+                total_plies=80,
+                player_label_counts={"good": 28, "inaccuracy": 5, "mistake": 5, "blunder": 2, "brilliant": 0},
+                key_positions=[
+                    {"player": "White", "move_number": 12, "label": "good", "tactical_flag": "none", "material_change": 0},
+                    {"player": "White", "move_number": 20, "label": "inaccuracy", "tactical_flag": "none", "material_change": 0},
+                    {"player": "White", "move_number": 28, "label": "good", "tactical_flag": "mate_threat" if idx % 4 == 0 else "none", "material_change": 0},
+                    {
+                        "player": "White",
+                        "move_number": 36,
+                        "label": "mistake" if idx % 3 == 0 else "good",
+                        "tactical_flag": "none",
+                        "material_change": -3 if idx % 5 == 0 else 0,
+                    },
+                ],
+            )
+        )
+    scores = compute_engine_trait_scores(payloads)
+    for value in scores.values():
+        assert 0 < value < 100
+    assert 30 <= scores["tactical_awareness"] <= 75
+    assert 45 <= scores["material_discipline"] <= 85
+    assert 55 <= scores["blunder_frequency"] <= 90
+
+
 def test_clean_games_produce_high_scores() -> None:
     payloads = [
         _payload(
@@ -181,6 +284,66 @@ def test_clean_games_produce_high_scores() -> None:
     assert scores["conversion_ability"] >= 70
     assert scores["defensive_resilience"] >= 70
     assert scores["blunder_frequency"] >= 80
+
+
+def test_conversion_ability_sane_for_club_player() -> None:
+    window = _WindowAggregates(
+        payload_count=1,
+        primary_games=1,
+        total_player_plies=100,
+        total_good=100,
+        total_inaccuracy=0,
+        total_mistake=0,
+        total_blunder=0,
+        total_brilliant=0,
+        win_games=1,
+        win_player_plies=100,
+        win_player_positions=20,
+        win_late_error_events=2,
+    )
+
+    scores, _ = _compute_window_scores(window)
+    assert 75 <= scores["conversion_ability"] <= 85
+
+
+def test_conversion_ability_low_when_throwing_wins() -> None:
+    window = _WindowAggregates(
+        payload_count=1,
+        primary_games=1,
+        total_player_plies=100,
+        total_good=100,
+        total_inaccuracy=0,
+        total_mistake=0,
+        total_blunder=0,
+        total_brilliant=0,
+        win_games=1,
+        win_player_plies=100,
+        win_player_positions=20,
+        win_late_error_events=7,
+    )
+
+    scores, _ = _compute_window_scores(window)
+    assert scores["conversion_ability"] < 50
+
+
+def test_conversion_never_negative() -> None:
+    window = _WindowAggregates(
+        payload_count=1,
+        primary_games=1,
+        total_player_plies=100,
+        total_good=100,
+        total_inaccuracy=0,
+        total_mistake=0,
+        total_blunder=0,
+        total_brilliant=0,
+        win_games=1,
+        win_player_plies=100,
+        win_player_positions=20,
+        win_late_error_events=16,
+    )
+
+    scores, _ = _compute_window_scores(window)
+    assert scores["conversion_ability"] == 0
 
 
 def test_individual_trait_functions_match_aggregate_output() -> None:

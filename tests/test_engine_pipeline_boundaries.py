@@ -32,6 +32,30 @@ class _Game:
         return datetime.fromtimestamp(1_706_000_000, tz=timezone.utc)
 
 
+def _v2_summary_with_side_counts() -> dict[str, object]:
+    return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+        "engine_depth": 15,
+        "result": "1-0",
+        "total_plies": 4,
+        "total_moves": 2,
+        "white_plies": 2,
+        "black_plies": 2,
+        "unlabeled_white_plies": 0,
+        "unlabeled_black_plies": 0,
+        "label_counts_total": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+        "label_counts_white": {"good": 1, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+        "label_counts_black": {"good": 2, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+        "label_counts_by_side": {
+            "white": {"good": 1, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+            "black": {"good": 2, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
+        },
+        "label_counts": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+        "forced_mate_events": 0,
+        "illegal_moves": 0,
+    }
+
+
 def _san_tokens(text: str) -> set[str]:
     pattern = re.compile(
         r"\b(?:O-O-O|O-O|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?|[a-h]x[a-h][1-8](?:=[QRBN])?[+#]?|[a-h][1-8](?:=[QRBN])?[+#]?)\b"
@@ -269,20 +293,8 @@ def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch)
         pipeline_module,
         "_run_stockfish_oracle",
         lambda **_kwargs: {
-            "game_summary": {
-                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
-                "engine_depth": 15,
-                "result": "1-0",
-                "total_plies": 4,
-                "total_moves": 2,
-                "label_counts_by_side": {
-                    "white": {"good": 1, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
-                    "black": {"good": 2, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
-                },
-                "label_counts": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
-                "forced_mate_events": 0,
-                "illegal_moves": 0,
-            },
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary_with_side_counts(),
             "key_positions": _four_positions(),
         },
     )
@@ -304,6 +316,42 @@ def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch)
     assert "Do not suggest any move not present in payload." in captured["user"]
     assert '"best_san":"Nf3"' in captured["user"]
     assert '"engine_depth":15' in captured["user"]
+    assert '"player_error_rate_per_ply":' in captured["user"]
+    assert '"player_plies_analyzed":' in captured["user"]
+    assert '"label_counts_white"' not in captured["user"]
+
+
+def test_run_analysis_pipeline_rejects_missing_per_side_fields_before_llm(monkeypatch) -> None:
+    args = SimpleNamespace(enable_engine=True)
+    game = _Game()
+    llm_called = {"value": False}
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": {
+                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+                "result": "1-0",
+                "total_plies": 4,
+                "total_moves": 2,
+                # Missing label_counts_white/black and side ply totals by construction.
+                "label_counts": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
+            },
+            "key_positions": _four_positions(),
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: None)
+
+    with pytest.raises(RuntimeError, match="Engine payload invalid:"):
+        run_analysis_pipeline(
+            game=game,
+            args=args,
+            llm_runner=lambda _system_msg, _user_msg: llm_called.update(value=True) or "unexpected",
+            logger=logging.getLogger("test"),
+        )
+    assert llm_called["value"] is False
 
 
 def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
@@ -316,20 +364,8 @@ def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
         pipeline_module,
         "_run_stockfish_oracle",
         lambda **_kwargs: {
-            "game_summary": {
-                "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
-                "engine_depth": 15,
-                "result": "1-0",
-                "total_plies": 4,
-                "total_moves": 2,
-                "label_counts_by_side": {
-                    "white": {"good": 1, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
-                    "black": {"good": 2, "inaccuracy": 0, "mistake": 0, "blunder": 0, "brilliant": 0},
-                },
-                "label_counts": {"good": 3, "inaccuracy": 1, "mistake": 0, "blunder": 0, "brilliant": 0},
-                "forced_mate_events": 0,
-                "illegal_moves": 0,
-            },
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary_with_side_counts(),
             "key_positions": [
                 {
                     "move_number": 1,

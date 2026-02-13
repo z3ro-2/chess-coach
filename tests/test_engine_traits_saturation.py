@@ -5,37 +5,47 @@ from src.engine_traits import compute_engine_trait_scores
 
 
 def _strict_mode_saturation_payload() -> dict:
+    white_counts = {
+        "good": 41,
+        "inaccuracy": 0,
+        "mistake": 0,
+        "blunder": 0,
+        "brilliant": 0,
+    }
+    black_counts = {
+        "good": 30,
+        "inaccuracy": 6,
+        "mistake": 3,
+        "blunder": 2,
+        "brilliant": 0,
+    }
     return {
+        "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
         "game_summary": {
             "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
             "your_color": "black",
             "result": "0-1",
             "total_plies": 82,
             "total_moves": 41,
-            "player_total_plies": 41,
-            "player_total_moves": 41,
-            "player_label_counts": {
-                "good": 30,
+            "white_plies": 41,
+            "black_plies": 41,
+            "unlabeled_white_plies": 0,
+            "unlabeled_black_plies": 0,
+            "label_counts_total": {
+                "good": 71,
                 "inaccuracy": 6,
                 "mistake": 3,
                 "blunder": 2,
                 "brilliant": 0,
             },
+            "label_counts_white": dict(white_counts),
+            "label_counts_black": dict(black_counts),
+            "player_total_plies": 41,
+            "player_total_moves": 41,
+            "player_label_counts": dict(black_counts),
             "label_counts_by_side": {
-                "white": {
-                    "good": 41,
-                    "inaccuracy": 0,
-                    "mistake": 0,
-                    "blunder": 0,
-                    "brilliant": 0,
-                },
-                "black": {
-                    "good": 30,
-                    "inaccuracy": 6,
-                    "mistake": 3,
-                    "blunder": 2,
-                    "brilliant": 0,
-                },
+                "white": dict(white_counts),
+                "black": dict(black_counts),
             },
             "label_counts": {
                 "good": 71,

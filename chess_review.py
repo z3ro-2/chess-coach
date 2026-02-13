@@ -74,6 +74,13 @@ CHESSCOM_GAMES_URL = "https://api.chess.com/pub/player/{username}/games/{year}/{
 DEFAULT_TIMEOUT = 120  # seconds (local Ollama cold starts can be slow)
 USER_AGENT = "chess-review-daemon/0.1 (+https://chess.com/pubapi)"
 logger = logging.getLogger(__name__)
+TRAIT_SCORE_KEYS: tuple[str, ...] = (
+    "tactical_awareness",
+    "material_discipline",
+    "conversion_ability",
+    "defensive_resilience",
+    "blunder_frequency",
+)
 
 # -----------------------------
 # Telegram notifications
@@ -557,17 +564,17 @@ def _load_recent_game_reviews_for_traits(
     conn: sqlite3.Connection,
     limit: int,
 ) -> List[Dict[str, Any]]:
+    target = max(1, int(limit))
     cur = conn.execute(
         """
         SELECT game_url, payload_json
         FROM engine_payloads
         ORDER BY end_time DESC, game_url DESC
-        LIMIT ?
-        """,
-        (max(1, int(limit)),),
+        """
     )
     payloads: List[Dict[str, Any]] = []
-    for game_url, payload_json in cur.fetchall():
+    skipped_legacy = 0
+    for game_url, payload_json in cur:
         try:
             loaded = json.loads(str(payload_json))
         except Exception:
@@ -581,6 +588,7 @@ def _load_recent_game_reviews_for_traits(
             require_key_positions=False,
         )
         if not validation.is_valid:
+            skipped_legacy += 1
             logger.error(
                 "Ignoring stale/invalid engine payload for trait window game_url=%s schema=%s errors=%s",
                 str(game_url),
@@ -589,6 +597,13 @@ def _load_recent_game_reviews_for_traits(
             )
             continue
         payloads.append(loaded)
+        if len(payloads) >= target:
+            break
+    if skipped_legacy > 0:
+        logger.warning(
+            "Trait window skipped %s legacy/stale payloads while collecting schema v2 payloads.",
+            int(skipped_legacy),
+        )
     return payloads
 
 
@@ -613,6 +628,7 @@ def _analyze_game_with_stockfish(*, game: GameInfo, args: argparse.Namespace) ->
     )
     game_summary["result"] = game.result
     payload = {
+        "schema_version": int(engine_output.get("schema_version", ENGINE_PAYLOAD_SCHEMA_VERSION) or ENGINE_PAYLOAD_SCHEMA_VERSION),
         "game_summary": game_summary,
         "key_positions": list(engine_output.get("key_positions") or []),
     }
@@ -690,22 +706,54 @@ def _trait_confidence_from_moves(total_moves: int) -> str:
     return "LOW"
 
 
+def _normalized_trait_scores(raw_scores: Mapping[str, Any]) -> Dict[str, int]:
+    assert isinstance(raw_scores, Mapping)
+    assert all(key in raw_scores for key in TRAIT_SCORE_KEYS)
+    normalized: Dict[str, int] = {}
+    for key in TRAIT_SCORE_KEYS:
+        normalized[key] = int(raw_scores[key])
+    return normalized
+
+
+def _traits_debug_enabled() -> bool:
+    return str(os.environ.get("TRAITS_DEBUG", "")).strip() == "1"
+
+
 def _compute_trait_scores_and_window_metrics(
     conn: sqlite3.Connection,
     args: argparse.Namespace,
     *,
     window_size: int,
 ) -> Dict[str, Any]:
-    from src.engine_traits import compute_engine_trait_scores
+    from src.engine_traits import compute_engine_trait_scores, get_last_aggregate_scores_after_clamp
 
     payloads = _load_engine_payloads_for_trait_window(conn, args, window_size=window_size)
+    target_window = max(1, int(window_size))
     total_moves = sum(_payload_total_moves(payload) for payload in payloads)
-    scores = compute_engine_trait_scores(payloads)
+    v2_payload_count = len(payloads)
+    trait_scores = compute_engine_trait_scores(payloads)
+    assert isinstance(trait_scores, dict)
+    assert all(k in trait_scores for k in TRAIT_SCORE_KEYS)
+    normalized_scores = _normalized_trait_scores(trait_scores)
+    debug_scores_after_clamp = get_last_aggregate_scores_after_clamp()
+    confidence = _trait_confidence_from_moves(total_moves)
+    confidence_reason = ""
+    if v2_payload_count < target_window:
+        confidence = "LOW"
+        confidence_reason = f"insufficient v2 payloads ({int(v2_payload_count)}/{int(target_window)})"
+        logger.warning(
+            "Trait window confidence forced LOW: insufficient v2 payloads (%s/%s).",
+            int(v2_payload_count),
+            int(target_window),
+        )
     return {
-        "scores": dict(scores),
-        "trait_window_games": max(1, int(window_size)),
+        "scores": dict(normalized_scores),
+        "scores_after_clamp": dict(debug_scores_after_clamp) if isinstance(debug_scores_after_clamp, Mapping) else None,
+        "trait_window_games": int(v2_payload_count),
+        "trait_window_requested_games": int(target_window),
         "trait_window_moves": max(0, int(total_moves)),
-        "confidence": _trait_confidence_from_moves(total_moves),
+        "confidence": str(confidence),
+        "confidence_reason": str(confidence_reason),
     }
 
 
@@ -761,13 +809,6 @@ def _load_latest_summary_context(conn: sqlite3.Connection) -> Dict[str, str]:
 
 
 def _primary_weakness_from_trait_scores(trait_scores: Mapping[str, Any]) -> Dict[str, Any]:
-    keys = [
-        "tactical_awareness",
-        "material_discipline",
-        "conversion_ability",
-        "defensive_resilience",
-        "blunder_frequency",
-    ]
     labels = {
         "tactical_awareness": "Tactical Awareness",
         "material_discipline": "Material Discipline",
@@ -775,8 +816,9 @@ def _primary_weakness_from_trait_scores(trait_scores: Mapping[str, Any]) -> Dict
         "defensive_resilience": "Defensive Resilience",
         "blunder_frequency": "Blunder Frequency",
     }
-    scored = [(key, int(trait_scores.get(key, 100) or 100)) for key in keys]
-    scored.sort(key=lambda item: (item[1], keys.index(item[0])))
+    scores = _normalized_trait_scores(trait_scores)
+    scored = [(key, int(scores[key])) for key in TRAIT_SCORE_KEYS]
+    scored.sort(key=lambda item: (item[1], TRAIT_SCORE_KEYS.index(item[0])))
     weakest_key, weakest_score = scored[0]
     return {
         "trait_key": weakest_key,
@@ -857,6 +899,7 @@ def _build_player_summary_prompt(
         "You are a strict chess summary formatter. "
         "Use only provided JSON values and return Markdown in the exact requested structure."
     )
+    normalized_trait_scores = _normalized_trait_scores(trait_scores)
     summary_context_json = json.dumps(
         {
             "date_utc": str(summary_context.get("date_utc", "unknown") or "unknown"),
@@ -882,11 +925,11 @@ def _build_player_summary_prompt(
     )
     trait_scores_json = json.dumps(
         {
-            "tactical_awareness": int(trait_scores.get("tactical_awareness", 100) or 100),
-            "material_discipline": int(trait_scores.get("material_discipline", 100) or 100),
-            "conversion_ability": int(trait_scores.get("conversion_ability", 100) or 100),
-            "defensive_resilience": int(trait_scores.get("defensive_resilience", 100) or 100),
-            "blunder_frequency": int(trait_scores.get("blunder_frequency", 100) or 100),
+            "tactical_awareness": int(normalized_trait_scores["tactical_awareness"]),
+            "material_discipline": int(normalized_trait_scores["material_discipline"]),
+            "conversion_ability": int(normalized_trait_scores["conversion_ability"]),
+            "defensive_resilience": int(normalized_trait_scores["defensive_resilience"]),
+            "blunder_frequency": int(normalized_trait_scores["blunder_frequency"]),
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -903,7 +946,7 @@ def _build_player_summary_prompt(
     primary_weakness_json = json.dumps(
         {
             "trait_name": str(primary_weakness.get("trait_name", "Unknown trait") or "Unknown trait"),
-            "score": int(primary_weakness.get("score", 100) or 100),
+            "score": int(primary_weakness["score"]),
             "reason": str(primary_weakness.get("reason", "") or ""),
         },
         ensure_ascii=True,
@@ -1008,6 +1051,7 @@ def _generate_player_summary_markdown(
     _ = stats_path
     _ = recent_meta
     _ = trait_window_size
+    trait_scores = _normalized_trait_scores(trait_scores)
     performance_summary = _build_performance_summary(recent_meta)
     primary_weakness = _primary_weakness_from_trait_scores(trait_scores)
     trait_window = {
@@ -1067,9 +1111,13 @@ def _maybe_generate_player_summary(
         args,
         window_size=trait_window_size,
     )
-    trait_scores = dict(trait_window_metrics.get("scores") or {})
+    trait_scores = _normalized_trait_scores(trait_window_metrics.get("scores") or {})
+    trait_window_games = int(trait_window_metrics.get("trait_window_games", 0) or 0)
     trait_window_moves = int(trait_window_metrics.get("trait_window_moves", 0) or 0)
     trait_confidence = str(trait_window_metrics.get("confidence", "LOW") or "LOW")
+    trait_confidence_reason = str(trait_window_metrics.get("confidence_reason", "") or "").strip()
+    if trait_confidence_reason:
+        logger.warning("Player summary trait window note: %s", trait_confidence_reason)
     summary_context = _load_latest_summary_context(conn)
     summary_md = _generate_player_summary_markdown(
         args,
@@ -1078,7 +1126,7 @@ def _maybe_generate_player_summary(
         stats_path=stats_path,
         recent_meta=recent_meta,
         trait_scores=trait_scores,
-        trait_window_size=trait_window_size,
+        trait_window_size=trait_window_games,
         trait_window_moves=trait_window_moves,
         trait_confidence=trait_confidence,
         summary_context=summary_context,
@@ -1582,14 +1630,16 @@ def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str
     processed_games = 0
     engine_analyses = 0
     stale_payloads_rederived = 0
+    rebuild_payloads = bool(getattr(args, "rebuild_payloads", False))
 
     for game in games:
-        payload_reusable = _stored_engine_payload_is_reusable(conn, game.game_url)
+        payload_exists = _engine_payload_exists(conn, game.game_url)
+        payload_reusable = (not rebuild_payloads) and _stored_engine_payload_is_reusable(conn, game.game_url)
         if payload_reusable:
             _upsert_backfill_processed_records(conn, game=game, args=args)
             processed_games += 1
             continue
-        if _engine_payload_exists(conn, game.game_url):
+        if payload_exists:
             stale_payloads_rederived += 1
         payload = _analyze_game_with_stockfish(game=game, args=args)
         inserted = _store_engine_payload(
@@ -1610,6 +1660,8 @@ def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str
         args,
         window_size=max(1, int(getattr(args, "player_trait_window", 20) or 20)),
     )
+    assert isinstance(trait_scores, dict)
+    assert all(k in trait_scores for k in TRAIT_SCORE_KEYS)
     return {
         "total_games_requested": requested_count,
         "games_fetched_from_chess_com": fetched_count,
@@ -1622,17 +1674,29 @@ def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str
 
 
 def _print_backfill_summary(result: Mapping[str, Any]) -> None:
-    scores = dict(result.get("trait_scores") or {})
+    scores = _normalized_trait_scores(result.get("trait_scores") or {})
+    if _traits_debug_enabled():
+        from src.engine_traits import get_last_traits_debug_aggregate
+
+        aggregate = get_last_traits_debug_aggregate()
+        if not isinstance(aggregate, Mapping):
+            raise RuntimeError("Trait propagation mismatch detected")
+        expected_raw = aggregate.get("scores_after_clamp")
+        if not isinstance(expected_raw, Mapping):
+            raise RuntimeError("Trait propagation mismatch detected")
+        expected = _normalized_trait_scores(expected_raw)
+        if scores != expected:
+            raise RuntimeError("Trait propagation mismatch detected")
     print("Backfill Summary:")
     print(f"- total games requested: {int(result.get('total_games_requested', 0) or 0)}")
     print(f"- games fetched from chess.com: {int(result.get('games_fetched_from_chess_com', 0) or 0)}")
     print(f"- games analyzed with Stockfish: {int(result.get('games_analyzed_with_stockfish', 0) or 0)}")
     print("- traits (post-backfill):")
-    print(f"  tactical_awareness: {int(scores.get('tactical_awareness', 100) or 100)}")
-    print(f"  material_discipline: {int(scores.get('material_discipline', 100) or 100)}")
-    print(f"  conversion_ability: {int(scores.get('conversion_ability', 100) or 100)}")
-    print(f"  defensive_resilience: {int(scores.get('defensive_resilience', 100) or 100)}")
-    print(f"  blunder_frequency: {int(scores.get('blunder_frequency', 100) or 100)}")
+    print(f"  tactical_awareness: {int(scores['tactical_awareness'])}")
+    print(f"  material_discipline: {int(scores['material_discipline'])}")
+    print(f"  conversion_ability: {int(scores['conversion_ability'])}")
+    print(f"  defensive_resilience: {int(scores['defensive_resilience'])}")
+    print(f"  blunder_frequency: {int(scores['blunder_frequency'])}")
 
 
 def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -1894,6 +1958,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Backfill last N games with strict Stockfish engine payloads only (no LLM/polling/Telegram).",
+    )
+    p.add_argument(
+        "--rebuild-payloads",
+        "--backfill-reset",
+        dest="rebuild_payloads",
+        action="store_true",
+        help="Force re-analysis and overwrite engine payloads during backfill (default keeps idempotent reuse).",
     )
     p.add_argument("--lookback-days", type=int, default=10, help="How far back to scan for unprocessed games")
 

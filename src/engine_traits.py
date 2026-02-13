@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
-from engine.payload_schema import EnginePayloadValidationResult, validate_engine_payload
+from engine.payload_schema import EnginePayloadValidationResult, LABEL_KEYS, normalize_label_counts, validate_engine_payload
 
 NEUTRAL_SCORE = 50
 LOW_VOLUME_MOVE_CAP = 50
@@ -17,7 +17,9 @@ LOW_VOLUME_SCORE_MAX = 80
 ERROR_PRESENT_SCORE_MAX = 95
 ERROR_RATE_STRICT_CAP_THRESHOLD = 0.02
 ERROR_RATE_STRICT_CAP_MAX = 90
+PLAYER_PLY_COUNT_TOLERANCE = 1
 logger = logging.getLogger(__name__)
+_LAST_AGGREGATE_SCORES_AFTER_CLAMP: Dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,9 @@ class _GameSignals:
 class _WindowAggregates:
     payload_count: int = 0
     primary_games: int = 0
+    excluded_invalid_payloads: int = 0
+    excluded_missing_primary_fields: int = 0
+    excluded_integrity_payloads: int = 0
     total_player_plies: int = 0
     total_good: int = 0
     total_inaccuracy: int = 0
@@ -63,6 +68,7 @@ def compute_engine_trait_scores(payloads: Sequence[Mapping[str, Any]]) -> Dict[s
     """Compute deterministic trait scores from player-only move counts."""
     if not payloads:
         scores = _neutral_scores()
+        _set_last_aggregate_scores_after_clamp(scores)
         if _traits_debug_enabled():
             _emit_empty_traits_debug(scores)
         return scores
@@ -84,35 +90,99 @@ def compute_engine_trait_scores(payloads: Sequence[Mapping[str, Any]]) -> Dict[s
                 int(validation.schema_version),
                 ",".join(validation.errors),
             )
-            scores = _neutral_scores()
-            if _traits_debug_enabled():
-                _emit_invalid_payload_debug(idx, validation, scores)
-            return scores
+            window.excluded_invalid_payloads += 1
+            debug_rows.append(
+                {
+                    "payload_index": int(idx),
+                    "game_url": _extract_game_url(payload=payload, summary=_game_summary(payload)),
+                    "schema_version": int(validation.schema_version),
+                    "excluded": True,
+                    "exclude_reason": "invalid_payload",
+                    "errors": list(validation.errors),
+                }
+            )
+            continue
 
-        signals = _collect_game_signals(payload, validation)
+        primary_projection = _extract_primary_projection(validation=validation, payload=payload)
+        if primary_projection is None:
+            logger.error(
+                "Trait payload missing primary v2 fields at index=%s schema=%s",
+                int(idx),
+                int(validation.schema_version),
+            )
+            window.excluded_missing_primary_fields += 1
+            debug_rows.append(
+                {
+                    "payload_index": int(idx),
+                    "game_url": _extract_game_url(payload=payload, summary=_game_summary(payload)),
+                    "schema_version": int(validation.schema_version),
+                    "excluded": True,
+                    "exclude_reason": "missing_primary_v2_fields",
+                }
+            )
+            continue
+
+        player_plies = int(primary_projection["player_plies"])
+        player_label_counts = dict(primary_projection["player_label_counts"])
+        labeled_total = int(sum(int(player_label_counts.get(key, 0)) for key in LABEL_KEYS))
+        if int(player_plies) < 1:
+            logger.error("Trait payload ignored due to player_plies<1 at index=%s", int(idx))
+            window.excluded_integrity_payloads += 1
+            debug_rows.append(
+                {
+                    "payload_index": int(idx),
+                    "game_url": _extract_game_url(payload=payload, summary=_game_summary(payload)),
+                    "schema_version": int(validation.schema_version),
+                    "excluded": True,
+                    "exclude_reason": "player_plies_lt_one",
+                    "player_plies": int(player_plies),
+                }
+            )
+            continue
+        if int(labeled_total) > int(player_plies + PLAYER_PLY_COUNT_TOLERANCE):
+            logger.error(
+                "Trait payload ignored due to player label sum integrity violation index=%s player_plies=%s labeled_total=%s tolerance=%s",
+                int(idx),
+                int(player_plies),
+                int(labeled_total),
+                int(PLAYER_PLY_COUNT_TOLERANCE),
+            )
+            window.excluded_integrity_payloads += 1
+            debug_rows.append(
+                {
+                    "payload_index": int(idx),
+                    "game_url": _extract_game_url(payload=payload, summary=_game_summary(payload)),
+                    "schema_version": int(validation.schema_version),
+                    "excluded": True,
+                    "exclude_reason": "player_label_sum_integrity_violation",
+                    "player_plies": int(player_plies),
+                    "player_label_sum": int(labeled_total),
+                }
+            )
+            continue
+
+        signals = _collect_game_signals(payload, player_plies=player_plies, player_label_counts=player_label_counts)
         _accumulate_window(window, signals)
-        debug_rows.append(
-            {
-                "payload_index": idx,
-                "schema_version": int(validation.schema_version),
-                "total_plies": int(validation.total_plies),
-                "total_moves": int(validation.total_moves),
-                "player_total_plies": int(signals.player_plies),
-                "player_label_counts": dict(signals.player_label_counts),
-                "key_positions_count": signals.key_positions_count,
-                "player_key_positions_count": signals.player_key_positions_count,
-                "severe_material_events": signals.severe_material_events,
-                "mate_threat_events": signals.mate_threat_events,
-                "late_error_events": signals.late_error_events,
-                "is_win": signals.is_win,
-                "is_non_win": signals.is_non_win,
-            }
-        )
+        debug_rows.append(_build_payload_debug_row(idx=idx, payload=payload, validation=validation, signals=signals))
 
     scores, aggregate_components = _compute_window_scores(window)
+    _set_last_aggregate_scores_after_clamp(scores)
     if _traits_debug_enabled():
         _emit_traits_debug(debug_rows, aggregate_components, scores)
     return scores
+
+
+def get_last_aggregate_scores_after_clamp() -> Dict[str, int] | None:
+    if _LAST_AGGREGATE_SCORES_AFTER_CLAMP is None:
+        return None
+    return dict(_LAST_AGGREGATE_SCORES_AFTER_CLAMP)
+
+
+def get_last_traits_debug_aggregate() -> Dict[str, Any] | None:
+    scores = get_last_aggregate_scores_after_clamp()
+    if scores is None:
+        return None
+    return {"scores_after_clamp": dict(scores)}
 
 
 def tactical_awareness(payloads: Sequence[Mapping[str, Any]]) -> int:
@@ -137,7 +207,9 @@ def blunder_frequency(payloads: Sequence[Mapping[str, Any]]) -> int:
 
 def _collect_game_signals(
     payload: Mapping[str, Any],
-    validation: EnginePayloadValidationResult,
+    *,
+    player_plies: int,
+    player_label_counts: Mapping[str, int],
 ) -> _GameSignals:
     summary = _game_summary(payload)
 
@@ -148,7 +220,7 @@ def _collect_game_signals(
     severe_material_events = 0
     mate_threat_events = 0
     late_error_events = 0
-    late_threshold = max(1, int(round(float(max(1, validation.player_total_plies)) * 0.7)))
+    late_threshold = max(1, int(round(float(max(1, int(player_plies))) * 0.7)))
 
     for position in player_positions:
         material_change = _as_int(position.get("material_change", 0))
@@ -166,8 +238,8 @@ def _collect_game_signals(
     is_win = _is_player_win(summary)
     return _GameSignals(
         summary=summary,
-        player_plies=max(1, int(validation.player_total_plies)),
-        player_label_counts=dict(validation.player_label_counts),
+        player_plies=int(player_plies),
+        player_label_counts=dict(player_label_counts),
         key_positions_count=key_positions_count,
         player_key_positions_count=player_key_positions_count,
         severe_material_events=severe_material_events,
@@ -178,8 +250,68 @@ def _collect_game_signals(
     )
 
 
+def _build_payload_debug_row(
+    *,
+    idx: int,
+    payload: Mapping[str, Any],
+    validation: EnginePayloadValidationResult,
+    signals: _GameSignals,
+) -> Dict[str, Any]:
+    your_color_raw = str(validation.your_color or signals.summary.get("your_color") or "").strip().lower()
+    your_color = your_color_raw if your_color_raw in {"white", "black"} else None
+    opponent_color = "black" if your_color == "white" else "white" if your_color == "black" else None
+    label_counts = dict(validation.label_counts)
+    label_counts_sum = int(sum(int(v) for v in label_counts.values()))
+    player_label_counts = dict(signals.player_label_counts)
+    player_label_sum = int(sum(int(v) for v in player_label_counts.values()))
+    player_error_count = int(
+        int(player_label_counts.get("inaccuracy", 0))
+        + int(player_label_counts.get("mistake", 0))
+        + int(player_label_counts.get("blunder", 0))
+    )
+    player_rates = _derive_player_rates(player_label_counts=player_label_counts, player_plies=int(signals.player_plies))
+
+    return {
+        "payload_index": idx,
+        "game_url": _extract_game_url(payload=payload, summary=signals.summary),
+        "your_color": your_color,
+        "schema_version": int(validation.schema_version),
+        "total_plies": int(validation.total_plies),
+        "total_moves": int(validation.total_moves),
+        "label_counts": label_counts,
+        "label_counts_sum": int(label_counts_sum),
+        "label_counts_to_total_moves_ratio": _ratio_or_none(label_counts_sum, int(validation.total_moves)),
+        "label_counts_to_total_plies_ratio": _ratio_or_none(label_counts_sum, int(validation.total_plies)),
+        "label_counts_by_side": {
+            "white": dict(validation.label_counts_by_side.get("white", {})),
+            "black": dict(validation.label_counts_by_side.get("black", {})),
+        },
+        "player_side_label_counts": (
+            dict(validation.label_counts_by_side.get(your_color, {})) if your_color is not None else None
+        ),
+        "opponent_side_label_counts": (
+            dict(validation.label_counts_by_side.get(opponent_color, {})) if opponent_color is not None else None
+        ),
+        "player_total_plies": int(signals.player_plies),
+        "player_label_counts": player_label_counts,
+        "player_label_sum": int(player_label_sum),
+        "player_error_count": int(player_error_count),
+        "player_inaccuracy_rate": player_rates.get("inaccuracy_rate"),
+        "player_mistake_rate": player_rates.get("mistake_rate"),
+        "player_blunder_rate": player_rates.get("blunder_rate"),
+        "player_error_rate": player_rates.get("error_rate"),
+        "key_positions_count": signals.key_positions_count,
+        "player_key_positions_count": signals.player_key_positions_count,
+        "severe_material_events": signals.severe_material_events,
+        "mate_threat_events": signals.mate_threat_events,
+        "late_error_events": signals.late_error_events,
+        "is_win": signals.is_win,
+        "is_non_win": signals.is_non_win,
+    }
+
+
 def _accumulate_window(window: _WindowAggregates, signals: _GameSignals) -> None:
-    plies = int(max(1, signals.player_plies))
+    plies = int(signals.player_plies)
     labels = signals.player_label_counts
 
     window.primary_games += 1
@@ -218,18 +350,29 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
             + window.total_blunder
             + window.total_brilliant
         )
-        assert labeled_total == int(window.total_player_plies)
+        allowed = int(window.total_player_plies + (max(0, window.primary_games) * PLAYER_PLY_COUNT_TOLERANCE))
+        assert labeled_total <= int(allowed)
     except AssertionError:
         logger.error(
-            "Trait window integrity violation: total_player_plies=%s primary_games=%s",
+            "Trait window integrity violation: total_player_plies=%s primary_games=%s labeled_total=%s",
             int(window.total_player_plies),
             int(window.primary_games),
+            int(
+                window.total_good
+                + window.total_inaccuracy
+                + window.total_mistake
+                + window.total_blunder
+                + window.total_brilliant
+            ),
         )
         scores = _neutral_scores()
         return scores, {
             "coverage": 0.0,
             "integrity_violation": True,
             "missing_primary_data": True,
+            "excluded_invalid_payloads": int(window.excluded_invalid_payloads),
+            "excluded_missing_primary_fields": int(window.excluded_missing_primary_fields),
+            "excluded_integrity_payloads": int(window.excluded_integrity_payloads),
             "primary_games": int(window.primary_games),
             "total_player_plies": int(window.total_player_plies),
             "total_errors": 0,
@@ -247,6 +390,9 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
             "coverage": 0.0,
             "integrity_violation": False,
             "missing_primary_data": True,
+            "excluded_invalid_payloads": int(window.excluded_invalid_payloads),
+            "excluded_missing_primary_fields": int(window.excluded_missing_primary_fields),
+            "excluded_integrity_payloads": int(window.excluded_integrity_payloads),
             "primary_games": int(window.primary_games),
             "total_player_plies": int(window.total_player_plies),
             "total_errors": 0,
@@ -287,7 +433,15 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         }
     else:
         win_late_error_rate = float(window.win_late_error_events) / float(max(1, window.win_player_positions))
-        conversion_raw = _score_from_error_rate(win_late_error_rate * 2.0)
+        # Club-level conversion slope:
+        # 0.05 late error -> 90
+        # 0.10 late error -> 80
+        # 0.20 late error -> 60
+        # 0.30 late error -> 40
+        # 0.50 late error -> 0
+        conversion_raw = 100.0 - (win_late_error_rate * 200.0)
+        if conversion_raw < 0.0:
+            conversion_raw = 0.0
         conversion_data = {
             "win_games": int(window.win_games),
             "win_player_positions": int(window.win_player_positions),
@@ -321,13 +475,8 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
 
     blunder_raw = _score_from_blunder_rate(blunder_rate)
 
-    # Blend toward neutral when part of the window lacks required summary data.
+    # Exclude invalid/missing payloads entirely; keep coverage only for downstream confidence.
     coverage = float(window.primary_games) / float(max(1, window.payload_count))
-    tactical_raw = _coverage_blend(tactical_raw, coverage)
-    material_raw = _coverage_blend(material_raw, coverage)
-    conversion_raw = _coverage_blend(conversion_raw, coverage)
-    defensive_raw = _coverage_blend(defensive_raw, coverage)
-    blunder_raw = _coverage_blend(blunder_raw, coverage)
 
     scores = {
         "tactical_awareness": _clamp_score(tactical_raw),
@@ -347,6 +496,9 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         "coverage": round(coverage, 4),
         "integrity_violation": False,
         "missing_primary_data": bool(window.primary_games < window.payload_count),
+        "excluded_invalid_payloads": int(window.excluded_invalid_payloads),
+        "excluded_missing_primary_fields": int(window.excluded_missing_primary_fields),
+        "excluded_integrity_payloads": int(window.excluded_integrity_payloads),
         "primary_games": int(window.primary_games),
         "total_player_plies": int(window.total_player_plies),
         "total_errors": int(total_errors),
@@ -355,6 +507,9 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         "window_totals": {
             "payload_count": int(window.payload_count),
             "primary_games": int(window.primary_games),
+            "excluded_invalid_payloads": int(window.excluded_invalid_payloads),
+            "excluded_missing_primary_fields": int(window.excluded_missing_primary_fields),
+            "excluded_integrity_payloads": int(window.excluded_integrity_payloads),
             "total_player_plies": int(window.total_player_plies),
             "total_good": int(window.total_good),
             "total_inaccuracy": int(window.total_inaccuracy),
@@ -444,14 +599,58 @@ def _coverage_blend(raw_score: float, coverage: float) -> float:
 
 def _score_from_error_rate(rate: float) -> float:
     bounded = max(0.0, float(rate))
-    # Calibration target for club-level (~1100) error rates.
-    return 100.0 - (bounded * 200.0)
+    # Monotonic piecewise calibration for club-level (900-1400) player-only error rates.
+    # Anchors: 0.00->100, 0.10->80, 0.20->60, 0.30->40, 0.40->20, 0.50->0.
+    return _piecewise_linear_score(
+        bounded,
+        (
+            (0.00, 100.0),
+            (0.10, 80.0),
+            (0.20, 60.0),
+            (0.30, 40.0),
+            (0.40, 20.0),
+            (0.50, 0.0),
+        ),
+    )
 
 
 def _score_from_blunder_rate(rate: float) -> float:
     bounded = max(0.0, float(rate))
-    # 0.00 -> 100, 0.10 -> 60, 0.20 -> 20.
-    return 100.0 - (bounded * 400.0)
+    # Gentler monotonic curve for club-level blunder rates to avoid extreme saturation.
+    return _piecewise_linear_score(
+        bounded,
+        (
+            (0.00, 100.0),
+            (0.03, 92.0),
+            (0.06, 84.0),
+            (0.10, 72.0),
+            (0.15, 56.0),
+            (0.20, 40.0),
+            (0.30, 16.0),
+            (0.40, 0.0),
+        ),
+    )
+
+
+def _piecewise_linear_score(x: float, points: Sequence[tuple[float, float]]) -> float:
+    """Piecewise-linear interpolation over monotonic x breakpoints."""
+    if not points:
+        return 0.0
+    px = float(x)
+    ordered = list(points)
+    if px <= float(ordered[0][0]):
+        return float(ordered[0][1])
+    for i in range(1, len(ordered)):
+        x0, y0 = ordered[i - 1]
+        x1, y1 = ordered[i]
+        fx0 = float(x0)
+        fx1 = float(x1)
+        if px <= fx1:
+            if fx1 <= fx0:
+                return float(y1)
+            t = (px - fx0) / (fx1 - fx0)
+            return float(y0) + (float(y1) - float(y0)) * t
+    return float(ordered[-1][1])
 
 
 def _neutral_scores() -> Dict[str, int]:
@@ -530,6 +729,54 @@ def _game_summary(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return {}
 
 
+def _extract_primary_projection(
+    *,
+    validation: EnginePayloadValidationResult,
+    payload: Mapping[str, Any],
+) -> Dict[str, Any] | None:
+    summary = _game_summary(payload)
+    your_color = str(summary.get("your_color", "")).strip().lower()
+    if your_color not in {"white", "black"}:
+        return None
+
+    white_plies = _as_int(summary.get("white_plies", -1))
+    black_plies = _as_int(summary.get("black_plies", -1))
+    if white_plies < 0 or black_plies < 0:
+        return None
+    if int(white_plies + black_plies) != int(validation.total_plies):
+        return None
+
+    white_counts = normalize_label_counts(summary.get("label_counts_white"))
+    black_counts = normalize_label_counts(summary.get("label_counts_black"))
+    if white_counts is None or black_counts is None:
+        return None
+
+    player_counts = dict(white_counts if your_color == "white" else black_counts)
+    player_plies = int(white_plies if your_color == "white" else black_plies)
+    return {
+        "player_plies": int(player_plies),
+        "player_label_counts": player_counts,
+    }
+
+
+def _derive_player_rates(
+    *,
+    player_label_counts: Mapping[str, int],
+    player_plies: int,
+) -> Dict[str, float]:
+    denom = float(max(1, int(player_plies)))
+    inaccuracy = int(player_label_counts.get("inaccuracy", 0))
+    mistake = int(player_label_counts.get("mistake", 0))
+    blunder = int(player_label_counts.get("blunder", 0))
+    error_total = int(inaccuracy + mistake + blunder)
+    return {
+        "inaccuracy_rate": round(float(inaccuracy) / denom, 4),
+        "mistake_rate": round(float(mistake) / denom, 4),
+        "blunder_rate": round(float(blunder) / denom, 4),
+        "error_rate": round(float(error_total) / denom, 4),
+    }
+
+
 def _is_player_win(summary: Mapping[str, Any]) -> bool:
     result = str(summary.get("result", "")).strip()
     color = str(summary.get("your_color", "")).strip().lower()
@@ -538,6 +785,24 @@ def _is_player_win(summary: Mapping[str, Any]) -> bool:
     if color == "black":
         return result == "0-1"
     return False
+
+
+def _extract_game_url(*, payload: Mapping[str, Any], summary: Mapping[str, Any]) -> str | None:
+    for key in ("game_url", "url"):
+        value = summary.get(key)
+        if value is None:
+            value = payload.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _ratio_or_none(numerator: int, denominator: int) -> float | None:
+    if int(denominator) <= 0:
+        return None
+    return round(float(numerator) / float(denominator), 4)
 
 
 def _as_int(value: Any) -> int:
@@ -553,3 +818,8 @@ def _clamp_score(value: float) -> int:
     if value > 100:
         return 100
     return int(round(value))
+
+
+def _set_last_aggregate_scores_after_clamp(scores: Mapping[str, Any]) -> None:
+    global _LAST_AGGREGATE_SCORES_AFTER_CLAMP
+    _LAST_AGGREGATE_SCORES_AFTER_CLAMP = {str(k): int(v) for k, v in dict(scores).items()}
