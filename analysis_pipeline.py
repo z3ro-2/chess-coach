@@ -25,11 +25,20 @@ class LLMFormatViolationError(RuntimeError):
     """Raised when per-game LLM output is not strict JSON or fails schema validation."""
 
 
+def _resolve_project_root(start_file: str) -> Path:
+    start = Path(start_file).resolve().parent
+    for candidate in (start, *start.parents):
+        if (candidate / "prompts").is_dir():
+            return candidate
+    return start
+
+
+BASE_DIR = _resolve_project_root(__file__)
+PROMPTS_DIR = BASE_DIR / "prompts"
+
+
 def load_prompt_file(name: str) -> str:
-    base_path = Path(__file__).resolve().parent
-    path = base_path / "prompts" / name
-    if not path.exists():
-        path = base_path.parent / "prompts" / name
+    path = PROMPTS_DIR / name
     return path.read_text(encoding="utf-8")
 
 
