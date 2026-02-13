@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from io import StringIO
 from pathlib import Path
@@ -19,6 +20,8 @@ from llm.safe_payload import build_llm_safe_payload
 from src.config.provider_config import get_provider
 from src.llm_diagnostics import prompt_hash, split_model_name_version, hash_text_sha256
 from src.utils.timezone import get_display_timezone
+
+logger = logging.getLogger(__name__)
 
 
 class LLMFormatViolationError(RuntimeError):
@@ -39,7 +42,14 @@ PROMPTS_DIR = BASE_DIR / "prompts"
 
 def load_prompt_file(name: str) -> str:
     path = PROMPTS_DIR / name
-    return path.read_text(encoding="utf-8")
+    content = path.read_text(encoding="utf-8")
+    logger.info(
+        "Prompt loaded filename=%s path=%s sha256=%s",
+        str(name),
+        str(path.resolve()),
+        hash_text_sha256(content),
+    )
+    return content
 
 
 def run_analysis_pipeline(
@@ -337,9 +347,9 @@ def _resolve_prompt_hash_config(args: Any) -> tuple[float, float, int]:
     if provider == "gpt":
         max_tokens = int(getattr(args, "max_tokens", 1400) or 1400)
         return 0.4, 1.0, max_tokens
-    temperature = _env_float("LLM_TEMPERATURE", 0.4)
-    top_p = _env_float("LLM_TOP_P", 1.0)
-    max_tokens = _env_int("LLM_MAX_TOKENS", 1400)
+    temperature = _env_float("LLM_TEMPERATURE", 0.05)
+    top_p = _env_float("LLM_TOP_P", 0.7)
+    max_tokens = _env_int("LLM_MAX_TOKENS", 600)
     return float(temperature), float(top_p), int(max_tokens)
 
 

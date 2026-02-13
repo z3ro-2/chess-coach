@@ -52,8 +52,62 @@ def test_status_command_without_postgres(monkeypatch, tmp_path) -> None:
         conn.close()
 
     text = str(result["text"])
-    assert "Postgres: disabled" in text
+    assert "Postgres OK: no" in text
     assert "Games since last summary:" in text
+    assert "Pending games count:" in text
+
+
+def test_status_includes_llm_info(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.05")
+    monkeypatch.setenv("LLM_TOP_P", "0.7")
+
+    out_dir = tmp_path / "output"
+    md_dir = out_dir / "md"
+    md_dir.mkdir(parents=True, exist_ok=True)
+    (md_dir / "latest.md").write_text(
+        "## Review\nok\n\n## LLM Diagnostics\n"
+        '{"prompt_hash":"abc123","output_hash":"def456","retry_attempted":false}\n',
+        encoding="utf-8",
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _args(tmp_path)
+        args.out = out_dir
+        result = run_command("status", conn, args)
+    finally:
+        conn.close()
+
+    text = str(result["text"])
+    assert "LLM model: llama3.1:8b" in text
+    assert "LLM temperature: 0.05" in text
+    assert "LLM top_p: 0.7" in text
+    assert "Last prompt_hash: abc123" in text
+    assert "Last output_hash: def456" in text
+    assert "Last generation: success" in text
+
+
+def test_status_includes_pending_games(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _args(tmp_path)
+        args.out.mkdir(parents=True, exist_ok=True)
+        conn.execute(
+            """
+            INSERT INTO engine_payloads (game_url, end_time, created_at, engine_depth, payload_json)
+            VALUES (?, ?, strftime('%s','now'), ?, ?)
+            """,
+            ("https://www.chess.com/game/live/1000", 1_706_000_111, 15, '{"schema_version":2}'),
+        )
+        conn.commit()
+        result = run_command("status", conn, args)
+    finally:
+        conn.close()
+
+    text = str(result["text"])
+    assert "Pending games count: 1" in text
 
 
 def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monkeypatch, tmp_path) -> None:
@@ -255,9 +309,9 @@ def test_llm_config_command_shows_defaults_when_env_missing(monkeypatch, tmp_pat
         conn.close()
     parsed = json.loads(str(result["text"]))
     assert parsed == {
-        "LLM_MAX_TOKENS": 1400,
-        "LLM_TEMPERATURE": 0.4,
-        "LLM_TOP_P": 1.0,
+        "LLM_MAX_TOKENS": 600,
+        "LLM_TEMPERATURE": 0.05,
+        "LLM_TOP_P": 0.7,
         "OLLAMA_MODEL": "llama3.1:8b",
         "OLLAMA_URL": "http://127.0.0.1:11434",
     }

@@ -3,7 +3,7 @@ from __future__ import annotations
 import src.db.runtime_updates as runtime_updates
 
 
-def test_consume_engine_failure_notification_once_marks_and_suppresses_duplicate(monkeypatch) -> None:
+def test_should_notify_then_mark_engine_failure(monkeypatch) -> None:
     state = {"failure_notified": False, "update_calls": 0, "commits": 0}
 
     class _DummyConn:
@@ -41,23 +41,29 @@ def test_consume_engine_failure_notification_once_marks_and_suppresses_duplicate
         "player_color": "white",
     }
 
-    first = runtime_updates.consume_engine_failure_notification_once(
+    first = runtime_updates.should_notify_engine_failure(
         player_username="logan",
         game_payload=game_payload,
     )
-    second = runtime_updates.consume_engine_failure_notification_once(
+    marked = runtime_updates.mark_engine_failure_notified(
+        player_username="logan",
+        game_payload=game_payload,
+    )
+    second = runtime_updates.should_notify_engine_failure(
         player_username="logan",
         game_payload=game_payload,
     )
 
     assert first["available"] is True
     assert first["should_notify"] is True
-    assert first["updated"] is True
+    assert first["reason"] == "notify_pending"
+
+    assert marked["available"] is True
+    assert marked["updated"] is True
 
     assert second["available"] is True
     assert second["should_notify"] is False
-    assert second["updated"] is False
 
     assert state["failure_notified"] is True
     assert state["update_calls"] == 1
-    assert state["commits"] == 2
+    assert state["commits"] == 3

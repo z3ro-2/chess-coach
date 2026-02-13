@@ -67,19 +67,22 @@ from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import (
-    consume_engine_failure_notification_once,
     fetch_player_runtime_snapshot,
+    mark_engine_failure_notified,
+    should_notify_engine_failure,
     sync_game_record_and_traits,
 )
 from src.db.schema import ensure_postgres_core_schema
 from src.llm_diagnostics import hash_text_sha256, prompt_hash, split_model_name_version
 from src.telegram_commands import poll_telegram_commands
+from src.telegram_formatter import render_summary_for_telegram
 from src.utils.timezone import get_display_timezone
 
 CHESSCOM_GAMES_URL = "https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
 DEFAULT_TIMEOUT = 120  # seconds (local Ollama cold starts can be slow)
 USER_AGENT = "chess-review-daemon/0.1 (+https://chess.com/pubapi)"
 logger = logging.getLogger(__name__)
+TELEGRAM_FAILED_LOG_DIR = Path("/data/logs")
 TRAIT_SCORE_KEYS: tuple[str, ...] = (
     "tactical_awareness",
     "material_discipline",
@@ -121,9 +124,9 @@ def send_telegram_document(
     url = _telegram_api_base(bot_token) + "/sendDocument"
     data = {
         "chat_id": chat_id,
-        "caption": caption[:1024],  # Telegram caption limit (safe clamp)
+        "caption": render_summary_for_telegram(caption)[:1024],  # Telegram caption limit (safe clamp)
         "disable_notification": disable_notification,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }
 
     # Use multipart/form-data
@@ -160,8 +163,10 @@ def send_telegram_message(
     url = _telegram_api_base(bot_token) + "/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": str(message or "")[:4096],
+        "text": render_summary_for_telegram(str(message or ""))[:4096],
         "disable_notification": disable_notification,
+        "disable_web_page_preview": True,
+        "parse_mode": "HTML",
     }
     resp = requests.post(url, data=payload, timeout=timeout)
     if resp.status_code >= 400:
@@ -173,6 +178,66 @@ def send_telegram_message(
         raise TelegramError(f"Telegram returned non-JSON: {resp.text[:800]}")
     if not body.get("ok", False):
         raise TelegramError(f"Telegram sendMessage failed: {str(body)[:800]}")
+
+
+def _telegram_error_status_code(exc: Exception) -> int | None:
+    match = re.search(r"Telegram API error\s+(\d+)", str(exc))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _strip_engine_failure_diagnostics(message: str) -> str:
+    lines = [line for line in str(message or "").splitlines() if not line.strip().lower().startswith("- reason:")]
+    return "\n".join(lines).strip()
+
+
+def _write_telegram_failed_message_dump(*, context: str, formatted_message: str) -> None:
+    context_token = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(context or "unknown")).strip("_") or "unknown"
+    target = TELEGRAM_FAILED_LOG_DIR / f"tg_failed_{context_token}.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(str(formatted_message or ""), encoding="utf-8")
+
+
+def _send_engine_failure_telegram_with_retry(*, message: str, args: argparse.Namespace, context: str) -> bool:
+    send_kwargs = {
+        "bot_token": str(getattr(args, "telegram_bot_token", "") or ""),
+        "chat_id": str(getattr(args, "telegram_chat_id", "") or ""),
+        "timeout": int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+        "disable_notification": bool(getattr(args, "telegram_disable_notification", False)),
+    }
+    try:
+        send_telegram_message(message, **send_kwargs)
+        return True
+    except Exception as exc:
+        status = _telegram_error_status_code(exc)
+        if status == 400:
+            try:
+                _write_telegram_failed_message_dump(
+                    context=context,
+                    formatted_message=render_summary_for_telegram(message),
+                )
+            except Exception:
+                logger.error("Failed to write Telegram failed-message dump for context=%s", context, exc_info=True)
+            try:
+                send_telegram_message(_strip_engine_failure_diagnostics(message), **send_kwargs)
+                return True
+            except Exception as second_exc:
+                logger.error("Telegram engine-failure notification retry (400) failed: %s", second_exc)
+                return False
+        if status is not None and status >= 500:
+            time.sleep(0.5)
+            try:
+                send_telegram_message(message, **send_kwargs)
+                return True
+            except Exception as second_exc:
+                logger.error("Telegram engine-failure notification retry (5xx) failed: %s", second_exc)
+                return False
+        logger.error("Telegram engine-failure notification failed: %s", exc)
+        return False
 
 
 def build_telegram_caption(game: "GameInfo") -> str:
@@ -2072,35 +2137,41 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         )
     except Exception as exc:
         logger.error("Stockfish failure: %s", exc)
-        notify_decision = consume_engine_failure_notification_once(
+        game_payload_for_notify = {
+            "game_url": game.game_url,
+            "pgn": game.pgn,
+            "end_time": game.end_time,
+            "time_control": game.time_control,
+            "rated": game.rated,
+            "rules": game.rules,
+            "result": game.result,
+            "white_username": game.white_username,
+            "black_username": game.black_username,
+            "white_rating": game.white_rating,
+            "black_rating": game.black_rating,
+            "player_color": game.your_color,
+        }
+        notify_decision = should_notify_engine_failure(
             player_username=args.username,
-            game_payload={
-                "game_url": game.game_url,
-                "pgn": game.pgn,
-                "end_time": game.end_time,
-                "time_control": game.time_control,
-                "rated": game.rated,
-                "rules": game.rules,
-                "result": game.result,
-                "white_username": game.white_username,
-                "black_username": game.black_username,
-                "white_rating": game.white_rating,
-                "black_rating": game.black_rating,
-                "player_color": game.your_color,
-            },
+            game_payload=game_payload_for_notify,
         )
         if not bool(notify_decision.get("should_notify", True)):
             return None
-        try:
-            send_telegram_message(
-                f"❌ Engine failure for {game.game_url}\nStockfish could not produce analysis.\nReason: {str(exc)[:300]}",
-                bot_token=str(getattr(args, "telegram_bot_token", "") or ""),
-                chat_id=str(getattr(args, "telegram_chat_id", "") or ""),
-                timeout=int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
-                disable_notification=bool(getattr(args, "telegram_disable_notification", False)),
+        sent = _send_engine_failure_telegram_with_retry(
+            message=(
+                f"# Engine failure\n"
+                f"- Game: {game.game_url}\n"
+                f"- Detail: Stockfish could not produce analysis.\n"
+                f"- Reason: {str(exc)[:300]}"
+            ),
+            args=args,
+            context=short_id_from_url(game.game_url),
+        )
+        if sent:
+            mark_engine_failure_notified(
+                player_username=args.username,
+                game_payload=game_payload_for_notify,
             )
-        except Exception as notify_exc:
-            logger.error("Telegram engine-failure notification failed: %s", notify_exc)
         return None
 
     write_text(md_path, review_md)
@@ -2405,9 +2476,9 @@ def get_loaded_llm_config() -> Dict[str, Any]:
     config: Dict[str, Any] = {
         "OLLAMA_URL": str(os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").strip(),
         "OLLAMA_MODEL": str(os.environ.get("OLLAMA_MODEL", "llama3.1:8b") or "llama3.1:8b").strip(),
-        "LLM_TEMPERATURE": _load_float("LLM_TEMPERATURE", 0.4),
-        "LLM_TOP_P": _load_float("LLM_TOP_P", 1.0),
-        "LLM_MAX_TOKENS": _load_int("LLM_MAX_TOKENS", 1400),
+        "LLM_TEMPERATURE": _load_float("LLM_TEMPERATURE", 0.05),
+        "LLM_TOP_P": _load_float("LLM_TOP_P", 0.7),
+        "LLM_MAX_TOKENS": _load_int("LLM_MAX_TOKENS", 600),
     }
 
     parsed = urlparse(config["OLLAMA_URL"])

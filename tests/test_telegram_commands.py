@@ -74,6 +74,9 @@ def test_telegram_command_parsing_and_dispatch(monkeypatch, tmp_path) -> None:
     assert handled == 1
     assert row is not None and int(row[0]) == 102
     assert any(item["url"].endswith("/sendMessage") for item in posted_messages)
+    send_message_calls = [item for item in posted_messages if item["url"].endswith("/sendMessage")]
+    assert send_message_calls
+    assert all(str(call.get("data", {}).get("parse_mode", "")) == "HTML" for call in send_message_calls)
 
 
 def test_setprovider_gpt_updates_runtime_provider(monkeypatch, tmp_path) -> None:

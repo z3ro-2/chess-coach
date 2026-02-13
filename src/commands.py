@@ -6,6 +6,7 @@ import os
 import sqlite3
 import time
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -73,12 +74,21 @@ def _status_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
             f"{datetime.fromtimestamp(end_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} | {game_url}"
         )
 
-    postgres_enabled = bool(os.environ.get("DATABASE_URL", "").strip())
+    postgres_ok = _postgres_reachable()
+    pending_games = _pending_games_count(conn)
+    llm_info = _status_llm_info(args, out_dir=Path(args.out))
     lines = [
         "Status",
         f"- Last processed game: {last_game_text}",
         f"- Games since last summary: {since_last_summary}",
-        f"- Postgres: {'enabled' if postgres_enabled else 'disabled'}",
+        f"- Postgres OK: {'yes' if postgres_ok else 'no'}",
+        f"- Pending games count: {pending_games}",
+        f"- LLM model: {llm_info['model']}",
+        f"- LLM temperature: {llm_info['temperature']}",
+        f"- LLM top_p: {llm_info['top_p']}",
+        f"- Last prompt_hash: {llm_info['prompt_hash']}",
+        f"- Last output_hash: {llm_info['output_hash']}",
+        f"- Last generation: {llm_info['last_generation']}",
         f"- Output directory: {Path(args.out)}",
     ]
     return {"text": "\n".join(lines), "file": None}
@@ -260,3 +270,79 @@ def _llm_status(args: Any) -> str:
         return "configured but unreachable"
     except Exception:
         return "configured but unreachable"
+
+
+def _pending_games_count(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM engine_payloads ep
+            LEFT JOIN processed_games pg ON pg.game_url = ep.game_url
+            WHERE pg.game_url IS NULL
+            """
+        ).fetchone()
+        return int((row[0] if row is not None else 0) or 0)
+    except Exception:
+        return 0
+
+
+def _status_llm_info(args: Any, *, out_dir: Path) -> dict[str, str]:
+    provider = str(get_provider() or getattr(args, "provider", "ollama")).strip().lower()
+    model = str(getattr(args, "gpt_model", "") if provider == "gpt" else getattr(args, "ollama_model", "")).strip() or "unknown"
+    temperature = "n/a"
+    top_p = "n/a"
+    try:
+        import chess_review as app
+
+        cfg = app.get_loaded_llm_config()
+        temperature = str(cfg.get("LLM_TEMPERATURE", "n/a"))
+        top_p = str(cfg.get("LLM_TOP_P", "n/a"))
+    except Exception:
+        pass
+
+    diag = _load_last_llm_diagnostics(out_dir)
+    prompt_hash = str(diag.get("prompt_hash", "n/a") or "n/a")
+    output_hash = str(diag.get("output_hash", "n/a") or "n/a")
+    if prompt_hash != "n/a" and output_hash != "n/a":
+        last_generation = "success"
+    elif prompt_hash != "n/a" or output_hash != "n/a":
+        last_generation = "failure"
+    else:
+        last_generation = "unknown"
+    return {
+        "model": model,
+        "temperature": temperature,
+        "top_p": top_p,
+        "prompt_hash": prompt_hash,
+        "output_hash": output_hash,
+        "last_generation": last_generation,
+    }
+
+
+def _load_last_llm_diagnostics(out_dir: Path) -> dict[str, Any]:
+    md_dir = Path(out_dir) / "md"
+    files = sorted(md_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return {}
+    try:
+        content = files[0].read_text(encoding="utf-8")
+    except Exception:
+        return {}
+    marker = "## LLM Diagnostics"
+    if marker not in content:
+        return {}
+    tail = content.split(marker, 1)[1]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        if re.match(r"^[A-Za-z0-9_\\-]+\\s*=", stripped):
+            continue
+    return {}

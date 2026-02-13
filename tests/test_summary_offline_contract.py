@@ -350,26 +350,30 @@ def test_engine_failure_aborts_pipeline_and_sends_telegram(
     assert "Engine failure" in telegram_calls[0]
 
 
-def test_engine_failure_second_attempt_does_not_send_duplicate_telegram(
+def test_failure_notified_flag_set_after_success(
     monkeypatch,
     tmp_path,
     summary_args,
     sample_game,
 ) -> None:
     telegram_calls: list[str] = []
-    notify_states = iter(
-        [
-            {"available": True, "reason": "marked_notified", "should_notify": True, "updated": True},
-            {"available": True, "reason": "already_notified", "should_notify": False, "updated": False},
-        ]
-    )
+    marks: list[dict] = []
 
     monkeypatch.setattr(
         chess_review,
         "run_analysis_pipeline",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Stockfish engine failed or produced no output.")),
     )
-    monkeypatch.setattr(chess_review, "consume_engine_failure_notification_once", lambda **_kwargs: next(notify_states))
+    monkeypatch.setattr(
+        chess_review,
+        "should_notify_engine_failure",
+        lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_engine_failure_notified",
+        lambda **kwargs: marks.append(dict(kwargs)) or {"available": True, "reason": "marked_notified", "updated": True},
+    )
     monkeypatch.setattr(
         chess_review,
         "send_telegram_message",
@@ -378,15 +382,143 @@ def test_engine_failure_second_attempt_does_not_send_duplicate_telegram(
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
-        first = chess_review.process_game(conn, summary_args, sample_game)
-        second = chess_review.process_game(conn, summary_args, sample_game)
+        out = chess_review.process_game(conn, summary_args, sample_game)
     finally:
         conn.close()
 
-    assert first is None
-    assert second is None
+    assert out is None
     assert len(telegram_calls) == 1
-    assert "Engine failure" in telegram_calls[0]
+    assert len(marks) == 1
+
+
+def test_failure_not_notified_on_send_error(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    marks: list[dict] = []
+
+    monkeypatch.setattr(
+        chess_review,
+        "run_analysis_pipeline",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Stockfish engine failed or produced no output.")),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "should_notify_engine_failure",
+        lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_engine_failure_notified",
+        lambda **kwargs: marks.append(dict(kwargs)) or {"available": True, "reason": "marked_notified", "updated": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(chess_review.TelegramError("Telegram API error 400: bad request")),
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, sample_game)
+    finally:
+        conn.close()
+
+    assert out is None
+    assert marks == []
+
+
+def test_telegram_send_retry_on_server_error(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    calls = {"count": 0}
+    marks: list[dict] = []
+
+    monkeypatch.setattr(
+        chess_review,
+        "run_analysis_pipeline",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Stockfish engine failed or produced no output.")),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "should_notify_engine_failure",
+        lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_engine_failure_notified",
+        lambda **kwargs: marks.append(dict(kwargs)) or {"available": True, "reason": "marked_notified", "updated": True},
+    )
+
+    def _send_with_one_500(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise chess_review.TelegramError("Telegram API error 500: server error")
+        return None
+
+    monkeypatch.setattr(chess_review, "send_telegram_message", _send_with_one_500)
+    monkeypatch.setattr(chess_review.time, "sleep", lambda _seconds: None)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, sample_game)
+    finally:
+        conn.close()
+
+    assert out is None
+    assert calls["count"] == 2
+    assert len(marks) == 1
+
+
+def test_telegram_retry_strips_diagnostics(monkeypatch, tmp_path, summary_args) -> None:
+    sent_messages: list[str] = []
+
+    def _send_stub(message, **_kwargs):
+        sent_messages.append(str(message))
+        if len(sent_messages) == 1:
+            raise chess_review.TelegramError("Telegram API error 400: bad request")
+        return None
+
+    monkeypatch.setattr(chess_review, "send_telegram_message", _send_stub)
+    monkeypatch.setattr(chess_review, "TELEGRAM_FAILED_LOG_DIR", tmp_path / "logs")
+
+    ok = chess_review._send_engine_failure_telegram_with_retry(
+        message="# Engine failure\n- Detail: x\n- Reason: invalid <json>",
+        args=summary_args,
+        context="game_123",
+    )
+
+    assert ok is True
+    assert len(sent_messages) == 2
+    assert "- Reason:" in sent_messages[0]
+    assert "- Reason:" not in sent_messages[1]
+
+
+def test_telegram_persistent_failure_logs_to_file(monkeypatch, tmp_path, summary_args) -> None:
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(chess_review.TelegramError("Telegram API error 400: bad request")),
+    )
+    monkeypatch.setattr(chess_review, "TELEGRAM_FAILED_LOG_DIR", tmp_path / "logs")
+
+    ok = chess_review._send_engine_failure_telegram_with_retry(
+        message="# Engine failure\n- Detail: x\n- Reason: invalid <json>",
+        args=summary_args,
+        context="game(123)",
+    )
+
+    dump_path = tmp_path / "logs" / "tg_failed_game_123.txt"
+    assert ok is False
+    assert dump_path.exists()
+    content = dump_path.read_text(encoding="utf-8")
+    assert "<b>Engine failure</b>" in content
+    assert "&lt;json&gt;" in content
 
 
 def test_engine_payload_invalid_aborts_process_and_sends_telegram(

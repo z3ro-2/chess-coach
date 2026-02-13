@@ -74,55 +74,89 @@ def sync_game_record_and_traits(
         cleanup()
 
 
-def consume_engine_failure_notification_once(
+def should_notify_engine_failure(
     *,
     player_username: str,
     game_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Mark engine failure notification as sent once per game row.
-
-    Returns a structured result with `should_notify`:
-    - True: caller should send Telegram notification now (first failure)
-    - False: notification already sent for this game
-    """
+    """Check if engine failure Telegram notification should be sent."""
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not _is_postgres_url(database_url):
-        return {"available": False, "reason": "no_database_url", "should_notify": True, "updated": False}
+        return {"available": False, "reason": "no_database_url", "should_notify": True}
 
     try:
         conn, cleanup = _connect_db(database_url)
     except Exception:
         logger.debug("Skipping engine failure-notification dedupe: DB unavailable.", exc_info=True)
-        return {"available": False, "reason": "db_unreachable", "should_notify": True, "updated": False}
+        return {"available": False, "reason": "db_unreachable", "should_notify": True}
 
     try:
         player_columns = _table_columns(conn, "players")
         game_columns = _table_columns(conn, "games")
         if not player_columns or not game_columns or "failure_notified" not in game_columns:
-            return {"available": False, "reason": "schema_missing", "should_notify": True, "updated": False}
+            return {"available": False, "reason": "schema_missing", "should_notify": True}
 
         player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
         if player_id is None:
             conn.rollback()
-            return {"available": False, "reason": "player_unresolved", "should_notify": True, "updated": False}
+            return {"available": False, "reason": "player_unresolved", "should_notify": True}
 
         game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
         row = _fetchone(conn, "SELECT failure_notified FROM games WHERE id = %s LIMIT 1", (game_id,))
         already_notified = bool(row and row.get("failure_notified"))
-        if already_notified:
-            conn.commit()
-            return {"available": True, "reason": "already_notified", "should_notify": False, "updated": False}
-
-        _execute(conn, "UPDATE games SET failure_notified = TRUE WHERE id = %s", (game_id,))
         conn.commit()
-        return {"available": True, "reason": "marked_notified", "should_notify": True, "updated": True}
+        if already_notified:
+            return {"available": True, "reason": "already_notified", "should_notify": False}
+        return {"available": True, "reason": "notify_pending", "should_notify": True}
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
         logger.debug("Skipping engine failure-notification dedupe due to unexpected error.", exc_info=True)
-        return {"available": False, "reason": "runtime_sync_failed", "should_notify": True, "updated": False}
+        return {"available": False, "reason": "runtime_sync_failed", "should_notify": True}
+    finally:
+        cleanup()
+
+
+def mark_engine_failure_notified(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Mark the game row as having sent engine-failure Telegram notification."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping engine failure-notification mark: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns or "failure_notified" not in game_columns:
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        _execute(conn, "UPDATE games SET failure_notified = TRUE WHERE id = %s", (game_id,))
+        conn.commit()
+        return {"available": True, "reason": "marked_notified", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping engine failure-notification mark due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
     finally:
         cleanup()
 

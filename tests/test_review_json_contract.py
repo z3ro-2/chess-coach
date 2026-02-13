@@ -346,6 +346,50 @@ def test_structure_drift_retry_then_valid_output_passes(monkeypatch) -> None:
     assert "Recovered from drift." in output
 
 
+def test_llm_retry_logic_on_epoch_change(monkeypatch) -> None:
+    key_positions = _four_positions()
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary(),
+            "key_positions": key_positions,
+            "all_positions": _trace_for_positions(key_positions),
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: None)
+    hash_calls = {"n": 0}
+
+    def _changing_prompt_hash(*_args, **_kwargs) -> str:
+        hash_calls["n"] += 1
+        return f"epoch-hash-{hash_calls['n']}"
+
+    monkeypatch.setattr(pipeline_module, "prompt_hash", _changing_prompt_hash)
+
+    calls: list[str] = []
+
+    def _llm_runner(_system: str, user: str) -> str:
+        calls.append(user)
+        if len(calls) == 1:
+            return "invalid-json"
+        return (
+            '{"game_overview":"Epoch retry succeeded.","critical_mistakes":[],"strengths":["S1"],'
+            '"training_focus":["T1"],"confidence":"LOW"}'
+        )
+
+    output = run_analysis_pipeline(
+        game=_Game(),
+        args=SimpleNamespace(enable_engine=True),
+        llm_runner=_llm_runner,
+        logger=logging.getLogger("test"),
+    )
+
+    assert len(calls) == 2
+    assert hash_calls["n"] >= 2
+    assert "Epoch retry succeeded." in output
+
+
 def test_structure_drift_two_non_compliant_outputs_trigger_fallback(monkeypatch) -> None:
     monkeypatch.delenv("ENABLE_LLM_SELF_CRITIQUE", raising=False)
     key_positions = _four_positions()

@@ -64,3 +64,13 @@ def test_prompt_hash_changes_when_max_tokens_changes() -> None:
         1.0,
         1400,
     )
+
+
+def test_prompt_hash_changes_when_sampling_config_changes() -> None:
+    baseline = prompt_hash("System", "User", "llama3.1", 0.05, 0.7, 600)
+    changed_temp = prompt_hash("System", "User", "llama3.1", 0.10, 0.7, 600)
+    changed_top_p = prompt_hash("System", "User", "llama3.1", 0.05, 0.9, 600)
+    changed_max = prompt_hash("System", "User", "llama3.1", 0.05, 0.7, 900)
+    assert baseline != changed_temp
+    assert baseline != changed_top_p
+    assert baseline != changed_max

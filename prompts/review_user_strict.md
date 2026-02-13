@@ -1,6 +1,9 @@
 Return raw JSON only.
 Do not output prose outside JSON.
 Do not wrap output in code fences.
+Do not wrap output in markdown, code fences, prose, or comments.
+Do not include any text outside JSON.
+If you cannot produce exactly valid JSON, output this error object only: {"error":"FORMAT_VIOLATION"}.
 
 You are generating a structured chess game review.
 
@@ -13,6 +16,22 @@ Output must begin with '{' and end with '}'.
 
 Required JSON schema (exact keys, exact structure):
 
+{
+  "game_overview": string,
+  "critical_mistakes": [
+    {
+      "move_number": integer,
+      "description": string,
+      "why_it_matters": string,
+      "improvement_tip": string
+    }
+  ],
+  "strengths": [string],
+  "training_focus": [string],
+  "confidence": "LOW" | "MEDIUM" | "HIGH"
+}
+
+Schema reminder (must match exactly):
 {
   "game_overview": string,
   "critical_mistakes": [
