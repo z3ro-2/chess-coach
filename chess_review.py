@@ -1771,11 +1771,20 @@ def extract_pgn_header(pgn: str, key: str) -> Optional[str]:
 
 
 def parse_game(raw: Dict[str, Any], username: str) -> Optional[GameInfo]:
+    game, _reason = _parse_game_with_reason(raw, username)
+    return game
+
+
+def _parse_game_with_reason(raw: Dict[str, Any], username: str) -> tuple[Optional[GameInfo], Optional[str]]:
     game_url = raw.get("url") or ""
     pgn = raw.get("pgn") or ""
     end_time = raw.get("end_time")
-    if not game_url or not pgn or not isinstance(end_time, int):
-        return None
+    if not game_url:
+        return None, "missing game URL"
+    if not pgn:
+        return None, "missing PGN"
+    if not isinstance(end_time, int):
+        return None, "missing/invalid end_time"
 
     rules = raw.get("rules") or "chess"
     time_control = raw.get("time_control") or ""
@@ -1787,11 +1796,11 @@ def parse_game(raw: Dict[str, Any], username: str) -> Optional[GameInfo]:
     white_u = _normalize_username(white.get("username", ""))
     black_u = _normalize_username(black.get("username", ""))
     if not white_u or not black_u:
-        return None
+        return None, "missing player usernames"
 
     user_u = _normalize_username(username)
     if user_u not in (white_u, black_u):
-        return None
+        return None, "game does not include configured username"
 
     your_color = "white" if user_u == white_u else "black"
     opponent = black_u if your_color == "white" else white_u
@@ -1821,7 +1830,7 @@ def parse_game(raw: Dict[str, Any], username: str) -> Optional[GameInfo]:
         result=result,
         your_color=your_color,
         opponent=opponent,
-    )
+    ), None
 
 
 def safe_filename(s: str, max_len: int = 60) -> str:
@@ -2243,19 +2252,26 @@ def _print_backfill_summary(result: Mapping[str, Any]) -> None:
 
 def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     raw_games = fetch_recent_games(args.username, args.lookback_days)
+    _poll_debug("total games fetched from chess.com: %s", int(len(raw_games)))
 
     parsed: List[GameInfo] = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
 
     for rg in raw_games:
-        gi = parse_game(rg, args.username)
+        raw_url = str((rg or {}).get("url", "") or "")
+        raw_end_time = (rg or {}).get("end_time")
+        _poll_debug("fetched game url=%s end_time=%s", raw_url, raw_end_time)
+        gi, parse_skip_reason = _parse_game_with_reason(rg, args.username)
         if gi is None:
+            _poll_debug("game skipped url=%s reason=%s", raw_url, str(parse_skip_reason or "parse failure"))
             continue
 
         if args.rules_filter and gi.rules != args.rules_filter:
+            _poll_debug("game skipped url=%s reason=rules_filter mismatch", gi.game_url)
             continue
 
         if gi.end_dt_utc < cutoff:
+            _poll_debug("game skipped url=%s reason=outside lookback window", gi.game_url)
             continue
 
         parsed.append(gi)
@@ -2265,8 +2281,14 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     created = 0
     for g in parsed:
         if is_processed(conn, g.game_url):
+            _poll_debug("game skipped url=%s reason=already processed", g.game_url)
             continue
 
+        if not str(g.time_control or "").strip():
+            _poll_debug("game skipped url=%s reason=unsupported time control", g.game_url)
+            continue
+
+        _poll_debug("Game selected for processing: %s", g.game_url)
         if args.dry_run:
             print(f"[dry-run] Would process: {g.end_dt_utc.isoformat()} {g.game_url}")
             created += 1
@@ -2279,6 +2301,8 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 if out:
                     print(f"[ok] Wrote: {out}")
                     created += 1
+                else:
+                    _poll_debug("game skipped url=%s reason=integrity exclusion", g.game_url)
                 last_err = None
                 break
             except Exception as e:
@@ -2324,6 +2348,16 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except Exception:
         return float(default)
+
+
+def _polling_debug_enabled() -> bool:
+    return str(os.environ.get("DEBUG_POLLING", "")).strip() == "1"
+
+
+def _poll_debug(msg: str, *args: Any) -> None:
+    if not _polling_debug_enabled():
+        return
+    logger.info("[POLL-DEBUG] " + msg, *args)
 
 
 def get_loaded_llm_config() -> Dict[str, Any]:
@@ -2775,6 +2809,7 @@ def _report_bootstrap_status(username: str, result: Mapping[str, Any]) -> None:
         return
 
     if reason in {"already_seeded", "no_recent_games", "no_new_games"}:
+        _poll_debug("bootstrap skipped reason=bootstrap exclusion detail=%s", reason)
         logger.info("Bootstrap skipped for %s (%s).", username, reason)
         return
 

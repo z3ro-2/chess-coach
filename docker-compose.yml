@@ -35,6 +35,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ${HOME}/chess:/data
+      - ./prompts:/app/prompts
     networks:
       - chessnet
 

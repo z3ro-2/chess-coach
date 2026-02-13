@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import sys
 import json
+import time
 from types import SimpleNamespace
 
 import analysis_pipeline as pipeline_module
@@ -270,3 +272,115 @@ def test_state_db_defaults_from_env_and_init_db_writes(monkeypatch, tmp_path) ->
 
     assert row is not None
     assert writable_state_db.exists()
+
+
+def test_polling_debug_logs_skip_reasons_when_enabled(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.setenv("DEBUG_POLLING", "1")
+    now_epoch = int(time.time())
+    raw_games = [
+        {"url": "https://www.chess.com/game/live/1", "pgn": "", "end_time": now_epoch, "white": {"username": "logan"}, "black": {"username": "opponent"}},
+        {
+            "url": "https://www.chess.com/game/live/2",
+            "pgn": '[Event "Live Chess"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+            "end_time": now_epoch,
+            "rules": "chess960",
+            "time_control": "600",
+            "white": {"username": "logan"},
+            "black": {"username": "opponent"},
+        },
+        {
+            "url": "https://www.chess.com/game/live/3",
+            "pgn": '[Event "Live Chess"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+            "end_time": 1,
+            "rules": "chess",
+            "time_control": "600",
+            "white": {"username": "logan"},
+            "black": {"username": "opponent"},
+        },
+        {
+            "url": "https://www.chess.com/game/live/4",
+            "pgn": '[Event "Live Chess"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+            "end_time": now_epoch,
+            "rules": "chess",
+            "time_control": "600",
+            "white": {"username": "logan"},
+            "black": {"username": "opponent"},
+        },
+        {
+            "url": "https://www.chess.com/game/live/5",
+            "pgn": '[Event "Live Chess"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+            "end_time": now_epoch,
+            "rules": "chess",
+            "time_control": "600",
+            "white": {"username": "logan"},
+            "black": {"username": "opponent"},
+        },
+    ]
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: raw_games)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = True
+        args.retries = 1
+
+        processed_game = chess_review.parse_game(raw_games[3], "logan")
+        assert processed_game is not None
+        md_path = tmp_path / "output" / "md" / "already.md"
+        pgn_path = tmp_path / "output" / "pgn" / "already.pgn"
+        chess_review.write_text(md_path, "# review")
+        chess_review.write_text(pgn_path, processed_game.pgn)
+        chess_review.mark_processed(
+            conn=conn,
+            game_url=processed_game.game_url,
+            end_time=processed_game.end_time,
+            md_path=md_path,
+            pgn_path=pgn_path,
+            provider=args.provider,
+            model=args.ollama_model,
+            content_hash="h",
+        )
+
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 1
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[POLL-DEBUG] total games fetched from chess.com: 5" in text
+    assert "reason=missing PGN" in text
+    assert "reason=rules_filter mismatch" in text
+    assert "reason=outside lookback window" in text
+    assert "reason=already processed" in text
+    assert "Game selected for processing: https://www.chess.com/game/live/5" in text
+
+
+def test_polling_debug_logs_suppressed_when_flag_disabled(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.delenv("DEBUG_POLLING", raising=False)
+    monkeypatch.setattr(
+        chess_review,
+        "fetch_recent_games",
+        lambda *_args, **_kwargs: [
+            {"url": "https://www.chess.com/game/live/1", "pgn": "", "end_time": int(time.time()), "white": {"username": "logan"}, "black": {"username": "opponent"}}
+        ],
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = True
+        args.retries = 1
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    assert "[POLL-DEBUG]" not in "\n".join(record.getMessage() for record in caplog.records)
