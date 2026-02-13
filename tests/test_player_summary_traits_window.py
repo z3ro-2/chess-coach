@@ -322,6 +322,37 @@ def test_trait_window_metrics_include_moves_and_confidence_tier(tmp_path) -> Non
     assert str(metrics["confidence_reason"]).startswith("insufficient v2 payloads")
 
 
+def test_trait_window_metrics_flag_integrity_warning_in_diagnostics(tmp_path) -> None:
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        _insert_payload(
+            conn,
+            game_id=303,
+            end_time=1_706_000_400,
+            payload=_payload(
+                your_color="white",
+                result="0-1",
+                total_moves=20,
+                label_counts={"good": 0, "inaccuracy": 8, "mistake": 5, "blunder": 7, "brilliant": 0},
+                key_positions=[],
+            ),
+        )
+        metrics = chess_review._compute_trait_scores_and_window_metrics(
+            conn,
+            SimpleNamespace(),
+            window_size=1,
+        )
+    finally:
+        conn.close()
+
+    assert metrics["integrity_warning"] is True
+    assert "trait window integrity warning" in str(metrics["confidence_reason"])
+    diagnostics = dict(metrics["trait_diagnostics"])
+    assert "window_integrity" in diagnostics
+    assert diagnostics["window_integrity"]["warning"] is True
+    assert "non_good_rate_gt_0_75" in diagnostics["window_integrity"]["reasons"]
+
+
 def test_load_recent_game_reviews_for_traits_has_stable_tiebreak_order(tmp_path) -> None:
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:

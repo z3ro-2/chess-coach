@@ -131,3 +131,63 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
 
     assert retrigger is None
     assert len(calls) == calls_before_restart
+
+
+def test_summary_command_reports_trait_integrity_warning(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(chess_review, "call_ollama_generate", lambda **_kwargs: "# forced summary")
+
+    def _fake_trait_window_metrics(_conn, _args, *, window_size: int):
+        assert window_size == 5
+        return {
+            "scores": {
+                "tactical_awareness": 50,
+                "material_discipline": 50,
+                "conversion_ability": 50,
+                "defensive_resilience": 50,
+                "blunder_frequency": 50,
+            },
+            "trait_window_games": 5,
+            "trait_window_moves": 180,
+            "confidence": "LOW",
+            "confidence_reason": "trait window integrity warning (non_good_rate_gt_0_75)",
+            "integrity_warning": True,
+            "integrity_warning_reasons": ["non_good_rate_gt_0_75"],
+            "trait_diagnostics": {
+                "window_integrity": {
+                    "warning": True,
+                    "reasons": ["non_good_rate_gt_0_75"],
+                    "trait_update_refused": False,
+                }
+            },
+        }
+
+    monkeypatch.setattr(chess_review, "_compute_trait_scores_and_window_metrics", _fake_trait_window_metrics)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _args(tmp_path)
+        args.player_trait_window = 5
+        args.out.mkdir(parents=True, exist_ok=True)
+        game = _sample_game()
+        md_path = args.out / "md" / "g.md"
+        pgn_path = args.out / "pgn" / "g.pgn"
+        chess_review.write_text(md_path, "# review")
+        chess_review.write_text(pgn_path, game.pgn)
+        chess_review.mark_processed(
+            conn=conn,
+            game_url=game.game_url,
+            end_time=game.end_time,
+            md_path=md_path,
+            pgn_path=pgn_path,
+            provider=args.provider,
+            model=args.ollama_model,
+            content_hash="h",
+        )
+        chess_review._record_processed_game_meta(conn, game)
+        result = run_command("summary", conn, args)
+    finally:
+        conn.close()
+
+    text = str(result["text"])
+    assert "Trait integrity warning: non_good_rate_gt_0_75" in text

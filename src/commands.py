@@ -114,7 +114,14 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
     trait_window_games = int(trait_window_metrics.get("trait_window_games", 0) or 0)
     trait_window_moves = int(trait_window_metrics.get("trait_window_moves", 0) or 0)
     trait_confidence = str(trait_window_metrics.get("confidence", "LOW") or "LOW")
+    trait_diagnostics = dict(trait_window_metrics.get("trait_diagnostics") or {})
     trait_confidence_reason = str(trait_window_metrics.get("confidence_reason", "") or "").strip()
+    integrity_warning = bool(trait_window_metrics.get("integrity_warning", False))
+    integrity_warning_reasons = [
+        str(reason)
+        for reason in list(trait_window_metrics.get("integrity_warning_reasons") or [])
+        if str(reason).strip()
+    ]
     summary_context = app._load_latest_summary_context(conn)
     summary_md = app._generate_player_summary_markdown(
         args,
@@ -127,6 +134,7 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         trait_window_moves=trait_window_moves,
         trait_confidence=trait_confidence,
         summary_context=summary_context,
+        trait_diagnostics=trait_diagnostics,
     )
     summary_path = Path(args.out) / "player_summary.md"
     app.write_text(summary_path, summary_md)
@@ -142,6 +150,8 @@ def _summary_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
     text = f"Summary generated: {summary_path}\nTrait scores (v2 window {trait_window_games}/{trait_window} games): {score_line}"
     if trait_confidence_reason:
         text = f"{text}\nTrait confidence: {trait_confidence} ({trait_confidence_reason})"
+    if integrity_warning:
+        text = f"{text}\nTrait integrity warning: {','.join(integrity_warning_reasons) or 'detected'}"
     return {"text": text, "file": summary_path}
 
 

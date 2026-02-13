@@ -18,8 +18,11 @@ ERROR_PRESENT_SCORE_MAX = 95
 ERROR_RATE_STRICT_CAP_THRESHOLD = 0.02
 ERROR_RATE_STRICT_CAP_MAX = 90
 PLAYER_PLY_COUNT_TOLERANCE = 1
+SANITY_NON_GOOD_RATE_MAX = 0.75
+SANITY_BLUNDER_RATE_MAX = 0.30
 logger = logging.getLogger(__name__)
 _LAST_AGGREGATE_SCORES_AFTER_CLAMP: Dict[str, int] | None = None
+_LAST_AGGREGATE_COMPONENTS: Dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -67,8 +70,9 @@ class _WindowAggregates:
 def compute_engine_trait_scores(payloads: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     """Compute deterministic trait scores from player-only move counts."""
     if not payloads:
-        scores = _neutral_scores()
-        _set_last_aggregate_scores_after_clamp(scores)
+        window = _WindowAggregates(payload_count=0)
+        scores, aggregate_components = _compute_window_scores(window)
+        _set_last_aggregate_snapshot(scores=scores, aggregate_components=aggregate_components)
         if _traits_debug_enabled():
             _emit_empty_traits_debug(scores)
         return scores
@@ -166,7 +170,7 @@ def compute_engine_trait_scores(payloads: Sequence[Mapping[str, Any]]) -> Dict[s
         debug_rows.append(_build_payload_debug_row(idx=idx, payload=payload, validation=validation, signals=signals))
 
     scores, aggregate_components = _compute_window_scores(window)
-    _set_last_aggregate_scores_after_clamp(scores)
+    _set_last_aggregate_snapshot(scores=scores, aggregate_components=aggregate_components)
     if _traits_debug_enabled():
         _emit_traits_debug(debug_rows, aggregate_components, scores)
     return scores
@@ -178,11 +182,21 @@ def get_last_aggregate_scores_after_clamp() -> Dict[str, int] | None:
     return dict(_LAST_AGGREGATE_SCORES_AFTER_CLAMP)
 
 
+def get_last_aggregate_components() -> Dict[str, Any] | None:
+    if _LAST_AGGREGATE_COMPONENTS is None:
+        return None
+    return dict(_LAST_AGGREGATE_COMPONENTS)
+
+
 def get_last_traits_debug_aggregate() -> Dict[str, Any] | None:
     scores = get_last_aggregate_scores_after_clamp()
     if scores is None:
         return None
-    return {"scores_after_clamp": dict(scores)}
+    aggregate_components = get_last_aggregate_components()
+    payload: Dict[str, Any] = {"scores_after_clamp": dict(scores)}
+    if isinstance(aggregate_components, Mapping):
+        payload["aggregate_components"] = dict(aggregate_components)
+    return payload
 
 
 def tactical_awareness(payloads: Sequence[Mapping[str, Any]]) -> int:
@@ -369,14 +383,25 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         return scores, {
             "coverage": 0.0,
             "integrity_violation": True,
+            "integrity_warning": True,
+            "integrity_warning_reasons": ["window_integrity_violation"],
+            "trait_update_refused": False,
             "missing_primary_data": True,
             "excluded_invalid_payloads": int(window.excluded_invalid_payloads),
             "excluded_missing_primary_fields": int(window.excluded_missing_primary_fields),
             "excluded_integrity_payloads": int(window.excluded_integrity_payloads),
             "primary_games": int(window.primary_games),
             "total_player_plies": int(window.total_player_plies),
+            "player_label_sum": int(
+                window.total_good
+                + window.total_inaccuracy
+                + window.total_mistake
+                + window.total_blunder
+                + window.total_brilliant
+            ),
             "total_errors": 0,
             "max_allowed_score": int(NEUTRAL_SCORE),
+            "guardrails": {"max_allowed_score": int(NEUTRAL_SCORE)},
             "tactical_awareness_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
             "material_discipline_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
             "conversion_ability_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
@@ -389,14 +414,19 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         return scores, {
             "coverage": 0.0,
             "integrity_violation": False,
+            "integrity_warning": False,
+            "integrity_warning_reasons": [],
+            "trait_update_refused": False,
             "missing_primary_data": True,
             "excluded_invalid_payloads": int(window.excluded_invalid_payloads),
             "excluded_missing_primary_fields": int(window.excluded_missing_primary_fields),
             "excluded_integrity_payloads": int(window.excluded_integrity_payloads),
             "primary_games": int(window.primary_games),
             "total_player_plies": int(window.total_player_plies),
+            "player_label_sum": 0,
             "total_errors": 0,
             "max_allowed_score": int(NEUTRAL_SCORE),
+            "guardrails": {"max_allowed_score": int(NEUTRAL_SCORE)},
             "tactical_awareness_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
             "material_discipline_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
             "conversion_ability_components": {"raw_before_clamp": float(NEUTRAL_SCORE)},
@@ -417,11 +447,14 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
 
     error_signal = (mistake_rate * 1.0) + (blunder_rate * 2.5)
     tactical_base = _score_from_error_rate(error_signal)
-    tactical_raw = tactical_base + min(3.0, brilliant_rate * 100.0) - min(12.0, mate_threat_rate * 12.0)
+    tactical_brilliant_bonus = min(3.0, brilliant_rate * 100.0)
+    tactical_mate_penalty = min(12.0, mate_threat_rate * 12.0)
+    tactical_raw = tactical_base + tactical_brilliant_bonus - tactical_mate_penalty
 
     weighted_material_error = (blunder_rate * 1.8) + (mistake_rate * 0.4)
     material_base = _score_from_error_rate(weighted_material_error)
-    material_raw = material_base - min(18.0, severe_material_rate * 12.0)
+    material_severe_penalty = min(18.0, severe_material_rate * 12.0)
+    material_raw = material_base - material_severe_penalty
 
     if window.win_games <= 0 or window.win_player_positions <= 0:
         conversion_raw = float(NEUTRAL_SCORE)
@@ -463,13 +496,16 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         )
         non_win_mate_rate = float(window.non_win_mate_threat_events) / float(max(1, window.non_win_player_positions))
         defensive_base = _score_from_error_rate(pressure_rate)
-        defensive_raw = defensive_base - min(20.0, non_win_mate_rate * 10.0)
+        defensive_mate_penalty = min(20.0, non_win_mate_rate * 10.0)
+        defensive_raw = defensive_base - defensive_mate_penalty
         defensive_data = {
             "non_win_games": int(window.non_win_games),
             "non_win_player_plies": int(window.non_win_player_plies),
             "non_win_player_positions": int(window.non_win_player_positions),
             "pressure_rate": round(pressure_rate, 4),
             "non_win_mate_threat_rate": round(non_win_mate_rate, 4),
+            "non_win_mate_threat_penalty": round(defensive_mate_penalty, 2),
+            "base_score": round(defensive_base, 2),
             "raw_before_clamp": round(defensive_raw, 2),
         }
 
@@ -485,22 +521,67 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
         "defensive_resilience": _clamp_score(defensive_raw),
         "blunder_frequency": _clamp_score(blunder_raw),
     }
-    total_errors = int(window.total_inaccuracy + window.total_mistake + window.total_blunder)
-    scores, guardrails = _apply_score_guardrails(
-        scores,
-        total_errors=total_errors,
-        total_player_plies=int(window.total_player_plies),
+    labeled_total = int(
+        window.total_good
+        + window.total_inaccuracy
+        + window.total_mistake
+        + window.total_blunder
+        + window.total_brilliant
     )
+    total_errors = int(window.total_inaccuracy + window.total_mistake + window.total_blunder)
+    sanity_warning_reasons = _window_sanity_warning_reasons(
+        non_good_rate=non_good_rate,
+        blunder_rate=blunder_rate,
+        player_label_sum=labeled_total,
+        player_total_plies=int(window.total_player_plies),
+        total_errors=total_errors,
+    )
+    integrity_warning = bool(sanity_warning_reasons)
+    refuse_update = bool(integrity_warning and _refuse_trait_update_on_sanity_enabled())
+    if integrity_warning:
+        logger.warning(
+            "Trait window sanity warning: reasons=%s non_good_rate=%.4f blunder_rate=%.4f player_label_sum=%s total_player_plies=%s total_errors=%s",
+            ",".join(sanity_warning_reasons),
+            float(non_good_rate),
+            float(blunder_rate),
+            int(labeled_total),
+            int(window.total_player_plies),
+            int(total_errors),
+        )
+    if refuse_update:
+        scores = _neutral_scores()
+        guardrails = {
+            "total_errors": int(total_errors),
+            "total_player_plies": int(window.total_player_plies),
+            "error_rate": round(float(total_errors) / float(max(1, int(window.total_player_plies))), 6),
+            "error_rate_strict_cap_threshold": float(ERROR_RATE_STRICT_CAP_THRESHOLD),
+            "low_volume_threshold_player_plies": int(LOW_VOLUME_MOVE_CAP),
+            "error_cap_applied": False,
+            "error_rate_strict_cap_applied": False,
+            "low_volume_cap_applied": False,
+            "max_allowed_score": int(NEUTRAL_SCORE),
+            "sanity_refusal_applied": True,
+        }
+    else:
+        scores, guardrails = _apply_score_guardrails(
+            scores,
+            total_errors=total_errors,
+            total_player_plies=int(window.total_player_plies),
+        )
 
     components = {
         "coverage": round(coverage, 4),
         "integrity_violation": False,
+        "integrity_warning": bool(integrity_warning),
+        "integrity_warning_reasons": list(sanity_warning_reasons),
+        "trait_update_refused": bool(refuse_update),
         "missing_primary_data": bool(window.primary_games < window.payload_count),
         "excluded_invalid_payloads": int(window.excluded_invalid_payloads),
         "excluded_missing_primary_fields": int(window.excluded_missing_primary_fields),
         "excluded_integrity_payloads": int(window.excluded_integrity_payloads),
         "primary_games": int(window.primary_games),
         "total_player_plies": int(window.total_player_plies),
+        "player_label_sum": int(labeled_total),
         "total_errors": int(total_errors),
         "max_allowed_score": int(guardrails.get("max_allowed_score", 100)),
         "guardrails": guardrails,
@@ -542,12 +623,15 @@ def _compute_window_scores(window: _WindowAggregates) -> tuple[Dict[str, int], D
             "blunder_rate": round(blunder_rate, 4),
             "brilliant_rate": round(brilliant_rate, 4),
             "mate_threat_rate_per_position": round(mate_threat_rate, 4),
+            "brilliant_bonus": round(tactical_brilliant_bonus, 2),
+            "mate_threat_penalty": round(tactical_mate_penalty, 2),
             "base_score": round(tactical_base, 2),
             "raw_before_clamp": round(tactical_raw, 2),
         },
         "material_discipline_components": {
             "weighted_error_rate": round(weighted_material_error, 4),
             "severe_material_rate_per_position": round(severe_material_rate, 4),
+            "severe_material_penalty": round(material_severe_penalty, 2),
             "base_score": round(material_base, 2),
             "raw_before_clamp": round(material_raw, 2),
         },
@@ -590,6 +674,30 @@ def _apply_score_guardrails(
         "low_volume_cap_applied": bool(int(total_player_plies) < LOW_VOLUME_MOVE_CAP),
         "max_allowed_score": int(max_allowed),
     }
+
+
+def _window_sanity_warning_reasons(
+    *,
+    non_good_rate: float,
+    blunder_rate: float,
+    player_label_sum: int,
+    player_total_plies: int,
+    total_errors: int,
+) -> list[str]:
+    reasons: list[str] = []
+    if float(non_good_rate) > SANITY_NON_GOOD_RATE_MAX:
+        reasons.append("non_good_rate_gt_0_75")
+    if float(blunder_rate) > SANITY_BLUNDER_RATE_MAX:
+        reasons.append("blunder_rate_gt_0_30")
+    if int(player_label_sum) != int(player_total_plies):
+        reasons.append("player_label_sum_ne_player_total_plies")
+    if int(total_errors) > int(player_total_plies):
+        reasons.append("total_errors_gt_total_player_plies")
+    return reasons
+
+
+def _refuse_trait_update_on_sanity_enabled() -> bool:
+    return str(os.environ.get("TRAITS_REFUSE_ON_SANITY", "")).strip() == "1"
 
 
 def _coverage_blend(raw_score: float, coverage: float) -> float:
@@ -823,3 +931,13 @@ def _clamp_score(value: float) -> int:
 def _set_last_aggregate_scores_after_clamp(scores: Mapping[str, Any]) -> None:
     global _LAST_AGGREGATE_SCORES_AFTER_CLAMP
     _LAST_AGGREGATE_SCORES_AFTER_CLAMP = {str(k): int(v) for k, v in dict(scores).items()}
+
+
+def _set_last_aggregate_components(aggregate_components: Mapping[str, Any]) -> None:
+    global _LAST_AGGREGATE_COMPONENTS
+    _LAST_AGGREGATE_COMPONENTS = dict(aggregate_components)
+
+
+def _set_last_aggregate_snapshot(*, scores: Mapping[str, Any], aggregate_components: Mapping[str, Any]) -> None:
+    _set_last_aggregate_scores_after_clamp(scores)
+    _set_last_aggregate_components(aggregate_components)

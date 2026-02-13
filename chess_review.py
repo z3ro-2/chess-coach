@@ -48,7 +48,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 
@@ -715,6 +715,114 @@ def _normalized_trait_scores(raw_scores: Mapping[str, Any]) -> Dict[str, int]:
     return normalized
 
 
+def _clamp_score_int(value: Any) -> int:
+    try:
+        numeric = float(value)
+    except Exception:
+        numeric = 0.0
+    if numeric < 0.0:
+        return 0
+    if numeric > 100.0:
+        return 100
+    return int(round(numeric))
+
+
+def _trait_diagnostics_from_aggregate(
+    *,
+    final_scores: Mapping[str, Any],
+    aggregate_components: Mapping[str, Any] | None,
+) -> Dict[str, Dict[str, Any]]:
+    scores = _normalized_trait_scores(final_scores)
+    if not isinstance(aggregate_components, Mapping):
+        return {
+            key: {
+                "rate_inputs": {},
+                "raw_score": float(scores[key]),
+                "penalties_applied": {},
+                "guardrail_applied": {"applied": False, "max_allowed_score": 100, "reasons": []},
+                "final_clamp": {
+                    "pre_guardrail_clamp": int(scores[key]),
+                    "final_score": int(scores[key]),
+                },
+            }
+            for key in TRAIT_SCORE_KEYS
+        }
+
+    guardrails = aggregate_components.get("guardrails")
+    guardrails_map = guardrails if isinstance(guardrails, Mapping) else {}
+    max_allowed = int(guardrails_map.get("max_allowed_score", 100) or 100)
+    reasons: List[str] = []
+    if bool(guardrails_map.get("error_cap_applied", False)):
+        reasons.append("error_presence_cap")
+    if bool(guardrails_map.get("error_rate_strict_cap_applied", False)):
+        reasons.append("error_rate_strict_cap")
+    if bool(guardrails_map.get("low_volume_cap_applied", False)):
+        reasons.append("low_volume_cap")
+    if bool(guardrails_map.get("sanity_refusal_applied", False)):
+        reasons.append("sanity_refusal")
+
+    def _build(
+        key: str,
+        component: Mapping[str, Any] | None,
+        *,
+        rate_keys: Sequence[str],
+        penalty_keys: Sequence[str],
+    ) -> Dict[str, Any]:
+        comp = component if isinstance(component, Mapping) else {}
+        raw = float(comp.get("raw_before_clamp", scores[key]) or scores[key])
+        pre_guard = _clamp_score_int(raw)
+        final = int(scores[key])
+        rate_inputs = {name: comp.get(name) for name in rate_keys if name in comp}
+        penalties = {name: comp.get(name) for name in penalty_keys if name in comp}
+        return {
+            "rate_inputs": rate_inputs,
+            "raw_score": round(raw, 2),
+            "penalties_applied": penalties,
+            "guardrail_applied": {
+                "applied": bool(final < pre_guard),
+                "max_allowed_score": int(max_allowed),
+                "reasons": list(reasons),
+            },
+            "final_clamp": {
+                "pre_guardrail_clamp": int(pre_guard),
+                "final_score": int(final),
+            },
+        }
+
+    return {
+        "tactical_awareness": _build(
+            "tactical_awareness",
+            aggregate_components.get("tactical_awareness_components"),
+            rate_keys=("mistake_rate", "blunder_rate", "brilliant_rate", "mate_threat_rate_per_position"),
+            penalty_keys=("mate_threat_penalty",),
+        ),
+        "material_discipline": _build(
+            "material_discipline",
+            aggregate_components.get("material_discipline_components"),
+            rate_keys=("weighted_error_rate", "severe_material_rate_per_position"),
+            penalty_keys=("severe_material_penalty",),
+        ),
+        "conversion_ability": _build(
+            "conversion_ability",
+            aggregate_components.get("conversion_ability_components"),
+            rate_keys=("win_late_error_rate",),
+            penalty_keys=(),
+        ),
+        "defensive_resilience": _build(
+            "defensive_resilience",
+            aggregate_components.get("defensive_resilience_components"),
+            rate_keys=("pressure_rate", "non_win_mate_threat_rate"),
+            penalty_keys=("non_win_mate_threat_penalty",),
+        ),
+        "blunder_frequency": _build(
+            "blunder_frequency",
+            aggregate_components.get("blunder_frequency_components"),
+            rate_keys=("blunder_rate",),
+            penalty_keys=(),
+        ),
+    }
+
+
 def _traits_debug_enabled() -> bool:
     return str(os.environ.get("TRAITS_DEBUG", "")).strip() == "1"
 
@@ -725,7 +833,11 @@ def _compute_trait_scores_and_window_metrics(
     *,
     window_size: int,
 ) -> Dict[str, Any]:
-    from src.engine_traits import compute_engine_trait_scores, get_last_aggregate_scores_after_clamp
+    from src.engine_traits import (
+        compute_engine_trait_scores,
+        get_last_aggregate_components,
+        get_last_aggregate_scores_after_clamp,
+    )
 
     payloads = _load_engine_payloads_for_trait_window(conn, args, window_size=window_size)
     target_window = max(1, int(window_size))
@@ -736,6 +848,31 @@ def _compute_trait_scores_and_window_metrics(
     assert all(k in trait_scores for k in TRAIT_SCORE_KEYS)
     normalized_scores = _normalized_trait_scores(trait_scores)
     debug_scores_after_clamp = get_last_aggregate_scores_after_clamp()
+    aggregate_components = get_last_aggregate_components()
+    aggregate_map = aggregate_components if isinstance(aggregate_components, Mapping) else {}
+    integrity_warning = bool(aggregate_map.get("integrity_warning", False))
+    integrity_warning_reasons = [
+        str(reason)
+        for reason in list(aggregate_map.get("integrity_warning_reasons") or [])
+        if str(reason).strip()
+    ]
+    trait_update_refused = bool(aggregate_map.get("trait_update_refused", False))
+    trait_diagnostics = _trait_diagnostics_from_aggregate(
+        final_scores=normalized_scores,
+        aggregate_components=aggregate_map if isinstance(aggregate_map, Mapping) else None,
+    )
+    if integrity_warning:
+        trait_diagnostics = dict(trait_diagnostics)
+        trait_diagnostics["window_integrity"] = {
+            "warning": True,
+            "reasons": list(integrity_warning_reasons),
+            "trait_update_refused": bool(trait_update_refused),
+        }
+        logger.warning(
+            "Trait window integrity warning detected: reasons=%s trait_update_refused=%s",
+            ",".join(integrity_warning_reasons),
+            bool(trait_update_refused),
+        )
     confidence = _trait_confidence_from_moves(total_moves)
     confidence_reason = ""
     if v2_payload_count < target_window:
@@ -746,6 +883,15 @@ def _compute_trait_scores_and_window_metrics(
             int(v2_payload_count),
             int(target_window),
         )
+    if integrity_warning:
+        confidence = "LOW"
+        integrity_note = "trait window integrity warning"
+        if integrity_warning_reasons:
+            integrity_note = f"{integrity_note} ({','.join(integrity_warning_reasons)})"
+        if confidence_reason:
+            confidence_reason = f"{confidence_reason}; {integrity_note}"
+        else:
+            confidence_reason = integrity_note
     return {
         "scores": dict(normalized_scores),
         "scores_after_clamp": dict(debug_scores_after_clamp) if isinstance(debug_scores_after_clamp, Mapping) else None,
@@ -754,6 +900,10 @@ def _compute_trait_scores_and_window_metrics(
         "trait_window_moves": max(0, int(total_moves)),
         "confidence": str(confidence),
         "confidence_reason": str(confidence_reason),
+        "trait_diagnostics": dict(trait_diagnostics),
+        "integrity_warning": bool(integrity_warning),
+        "integrity_warning_reasons": list(integrity_warning_reasons),
+        "trait_update_refused": bool(trait_update_refused),
     }
 
 
@@ -939,6 +1089,7 @@ def _build_player_summary_prompt(
             "trait_window_games": int(trait_window.get("trait_window_games", 0) or 0),
             "trait_window_moves": int(trait_window.get("trait_window_moves", 0) or 0),
             "confidence": str(trait_window.get("confidence", "LOW") or "LOW"),
+            "trait_diagnostics": dict(trait_window.get("trait_diagnostics") or {}),
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -991,6 +1142,7 @@ Output constraints:
 - Do not compute, infer, or recompute any metric.
 - Do not do arithmetic, percentages, ranking, or score derivation.
 - Copy numeric values exactly from provided JSON.
+- Copy `trait_window.trait_diagnostics` exactly as provided JSON. Do not summarize it.
 
 Use this exact template:
 
@@ -1005,6 +1157,7 @@ draw_pct: <performance_summary.draw_pct>
 trait_window_games: <trait_window.trait_window_games>
 trait_window_moves: <trait_window.trait_window_moves>
 confidence: <trait_window.confidence>
+trait_diagnostics: <trait_window.trait_diagnostics>
 ---
 
 ## Snapshot
@@ -1045,6 +1198,7 @@ def _generate_player_summary_markdown(
     trait_window_moves: int,
     trait_confidence: str,
     summary_context: Mapping[str, Any],
+    trait_diagnostics: Optional[Mapping[str, Any]] = None,
 ) -> str:
     _ = processed_count
     _ = cadence
@@ -1058,6 +1212,7 @@ def _generate_player_summary_markdown(
         "trait_window_games": int(trait_window_size),
         "trait_window_moves": int(trait_window_moves),
         "confidence": str(trait_confidence),
+        "trait_diagnostics": dict(trait_diagnostics or {}),
     }
     system_msg, user_msg = _build_player_summary_prompt(
         summary_context=summary_context,
@@ -1115,6 +1270,7 @@ def _maybe_generate_player_summary(
     trait_window_games = int(trait_window_metrics.get("trait_window_games", 0) or 0)
     trait_window_moves = int(trait_window_metrics.get("trait_window_moves", 0) or 0)
     trait_confidence = str(trait_window_metrics.get("confidence", "LOW") or "LOW")
+    trait_diagnostics = dict(trait_window_metrics.get("trait_diagnostics") or {})
     trait_confidence_reason = str(trait_window_metrics.get("confidence_reason", "") or "").strip()
     if trait_confidence_reason:
         logger.warning("Player summary trait window note: %s", trait_confidence_reason)
@@ -1130,6 +1286,7 @@ def _maybe_generate_player_summary(
         trait_window_moves=trait_window_moves,
         trait_confidence=trait_confidence,
         summary_context=summary_context,
+        trait_diagnostics=trait_diagnostics,
     )
     summary_path = args.out / "player_summary.md"
     write_text(summary_path, summary_md)

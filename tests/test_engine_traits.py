@@ -8,6 +8,7 @@ from src.engine_traits import (
     compute_engine_trait_scores,
     conversion_ability,
     defensive_resilience,
+    get_last_aggregate_components,
     material_discipline,
     tactical_awareness,
 )
@@ -511,3 +512,46 @@ def test_tactical_awareness_never_exceeds_guardrail_max_allowed_score() -> None:
     )
     scores, components = _compute_window_scores(window)
     assert scores["tactical_awareness"] <= int(components["max_allowed_score"])
+
+
+def test_window_sanity_warning_detects_extreme_error_rates() -> None:
+    payload = _payload(
+        your_color="white",
+        result="0-1",
+        total_plies=200,
+        player_label_counts={"good": 19, "inaccuracy": 30, "mistake": 20, "blunder": 31, "brilliant": 0},
+        key_positions=[],
+    )
+    compute_engine_trait_scores([payload])
+    components = get_last_aggregate_components()
+    assert isinstance(components, dict)
+    assert components["integrity_warning"] is True
+    assert "non_good_rate_gt_0_75" in components["integrity_warning_reasons"]
+    assert "blunder_rate_gt_0_30" in components["integrity_warning_reasons"]
+    assert components["trait_update_refused"] is False
+
+
+def test_sanity_warning_can_refuse_trait_update(monkeypatch) -> None:
+    window = _WindowAggregates(
+        payload_count=1,
+        primary_games=10,
+        total_player_plies=100,
+        total_good=2,
+        total_inaccuracy=50,
+        total_mistake=30,
+        total_blunder=25,
+        total_brilliant=0,
+    )
+    monkeypatch.setenv("TRAITS_REFUSE_ON_SANITY", "1")
+    scores, components = _compute_window_scores(window)
+    assert components["integrity_warning"] is True
+    assert components["trait_update_refused"] is True
+    assert "player_label_sum_ne_player_total_plies" in components["integrity_warning_reasons"]
+    assert "total_errors_gt_total_player_plies" in components["integrity_warning_reasons"]
+    assert scores == {
+        "tactical_awareness": 50,
+        "material_discipline": 50,
+        "conversion_ability": 50,
+        "defensive_resilience": 50,
+        "blunder_frequency": 50,
+    }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from io import StringIO
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from engine.payload_schema import (
     ENGINE_PAYLOAD_SCHEMA_VERSION,
@@ -50,6 +50,7 @@ def run_analysis_pipeline(
         "schema_version": int(engine_output.get("schema_version", ENGINE_PAYLOAD_SCHEMA_VERSION) or ENGINE_PAYLOAD_SCHEMA_VERSION),
         "game_summary": summary,
         "key_positions": list(engine_output.get("key_positions") or []),
+        "all_positions": list(engine_output.get("all_positions") or []),
     }
     validation = validate_engine_payload(
         engine_output,
@@ -113,7 +114,7 @@ def _run_stockfish_oracle(*, game: Any, args: Any, logger: Any) -> Optional[Mapp
             stockfish_path=str(getattr(args, "stockfish_path", "") or ""),
             depth=int(getattr(args, "engine_depth", 15) or 15),
         )
-        return oracle.analyze_game(str(getattr(game, "pgn", "") or ""))
+        return oracle.analyze_game(str(getattr(game, "pgn", "") or ""), include_trace=True)
     except Exception as exc:
         logger.error("Stockfish oracle failed: %s", exc)
         return None
@@ -224,6 +225,8 @@ def _analysis_payload_invariant_errors(
         errors.append("key_positions_missing_or_invalid")
     elif len(key_positions) != 4:
         errors.append(f"key_positions_must_have_exactly_four actual:{len(key_positions)}")
+    else:
+        errors.extend(_key_positions_top_swing_errors(engine_output=engine_output, key_positions=key_positions))
 
     your_color = str(summary.get("your_color", "")).strip().lower()
     if your_color not in {"white", "black"}:
@@ -267,6 +270,67 @@ def _analysis_payload_invariant_errors(
         )
 
     return errors
+
+
+def _key_positions_top_swing_errors(
+    *,
+    engine_output: Mapping[str, Any],
+    key_positions: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    all_positions_raw = engine_output.get("all_positions")
+    if not isinstance(all_positions_raw, list):
+        return ["all_positions_missing_or_invalid_for_key_position_consistency"]
+
+    all_positions = [row for row in all_positions_raw if isinstance(row, Mapping)]
+    if not all_positions:
+        return ["all_positions_missing_or_invalid_for_key_position_consistency"]
+
+    expected = _expected_top_swing_positions(all_positions=all_positions, required=4)
+    expected_ids = [_position_identity(row) for row in expected]
+    actual_ids = [_position_identity(row) for row in key_positions]
+    if actual_ids != expected_ids:
+        return ["key_positions_not_top_eval_swings"]
+    return []
+
+
+def _expected_top_swing_positions(*, all_positions: Sequence[Mapping[str, Any]], required: int) -> list[Mapping[str, Any]]:
+    ranked = sorted(
+        all_positions,
+        key=lambda row: (
+            -_position_abs_eval_swing(row),
+            int(row.get("move_number", 0) or 0),
+            str(row.get("player", "") or ""),
+            str(row.get("played_san", "") or ""),
+            str(row.get("best_san", "") or ""),
+        ),
+    )
+    selected: list[Mapping[str, Any]] = list(ranked[:required])
+    if len(selected) < required and selected:
+        seed = list(selected)
+        idx = 0
+        while len(selected) < required:
+            selected.append(seed[idx % len(seed)])
+            idx += 1
+    return selected
+
+
+def _position_abs_eval_swing(row: Mapping[str, Any]) -> float:
+    raw = row.get("abs_eval_swing", row.get("_abs_eval_swing", 0.0))
+    try:
+        return abs(float(raw or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _position_identity(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        int(row.get("move_number", 0) or 0),
+        str(row.get("player", "") or ""),
+        str(row.get("played_san", "") or ""),
+        str(row.get("best_san", "") or ""),
+        str(row.get("label", "") or ""),
+        str(row.get("tactical_flag", "") or ""),
+    )
 
 
 def _to_player_only_prompt_payload(llm_payload: Mapping[str, Any]) -> dict[str, Any]:

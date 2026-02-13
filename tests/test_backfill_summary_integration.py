@@ -129,6 +129,7 @@ def _render_summary_from_prompt(user_msg: str) -> str:
         f"trait_window_games: {trait_window['trait_window_games']}\n"
         f"trait_window_moves: {trait_window['trait_window_moves']}\n"
         f"confidence: {trait_window['confidence']}\n"
+        f"trait_diagnostics: {json.dumps(trait_window.get('trait_diagnostics', {}), ensure_ascii=True, separators=(',', ':'))}\n"
         "---\n\n"
         "## Snapshot\n"
         f"- Total games: {performance['total_games']}\n"

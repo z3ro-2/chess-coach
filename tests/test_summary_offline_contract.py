@@ -43,7 +43,8 @@ def _assert_strict_summary_format(markdown: str) -> None:
     assert lines[8].startswith("trait_window_games:")
     assert lines[9].startswith("trait_window_moves:")
     assert lines[10].startswith("confidence:")
-    assert lines[11].strip() == "---"
+    assert lines[11].startswith("trait_diagnostics:")
+    assert lines[12].strip() == "---"
 
     headings = [line.strip() for line in lines if line.startswith("## ")]
     assert headings == [
@@ -211,6 +212,7 @@ draw_pct: 25.0
 trait_window_games: 20
 trait_window_moves: 420
 confidence: MEDIUM
+trait_diagnostics: {}
 ---
 
 ## Snapshot
@@ -340,6 +342,7 @@ def test_llm_output_format_conforms_to_strict_template(
     assert "trait_window_games" in captured["user_msg"]
     assert "trait_window_moves" in captured["user_msg"]
     assert "Confidence: <trait_window.confidence>" in captured["user_msg"]
+    assert "trait_diagnostics" in captured["user_msg"]
     _assert_strict_summary_format(out)
 
 

@@ -133,6 +133,7 @@ def test_generate_player_summary_prompt_uses_precomputed_percentages(monkeypatch
         "trait_window_games": 20,
         "trait_window_moves": 420,
         "confidence": "MEDIUM",
+        "trait_diagnostics": {},
     }
     assert weakness_summary["trait_name"] == "Conversion Ability"
     assert weakness_summary["score"] == 78
@@ -144,3 +145,70 @@ def test_trait_confidence_tiers_are_deterministic() -> None:
     assert chess_review._trait_confidence_from_moves(200) == "MEDIUM"
     assert chess_review._trait_confidence_from_moves(599) == "MEDIUM"
     assert chess_review._trait_confidence_from_moves(600) == "HIGH"
+
+
+def test_trait_diagnostics_contains_deterministic_explainability_fields() -> None:
+    final_scores = {
+        "tactical_awareness": 43,
+        "material_discipline": 58,
+        "conversion_ability": 80,
+        "defensive_resilience": 61,
+        "blunder_frequency": 70,
+    }
+    aggregate_components = {
+        "guardrails": {
+            "max_allowed_score": 88,
+            "error_cap_applied": True,
+            "error_rate_strict_cap_applied": False,
+            "low_volume_cap_applied": False,
+        },
+        "tactical_awareness_components": {
+            "mistake_rate": 0.11,
+            "blunder_rate": 0.07,
+            "brilliant_rate": 0.01,
+            "mate_threat_rate_per_position": 0.14,
+            "mate_threat_penalty": 1.68,
+            "raw_before_clamp": 43.4,
+        },
+        "material_discipline_components": {
+            "weighted_error_rate": 0.17,
+            "severe_material_rate_per_position": 0.08,
+            "severe_material_penalty": 0.96,
+            "raw_before_clamp": 58.2,
+        },
+        "conversion_ability_components": {
+            "win_late_error_rate": 0.10,
+            "raw_before_clamp": 80.0,
+        },
+        "defensive_resilience_components": {
+            "pressure_rate": 0.13,
+            "non_win_mate_threat_rate": 0.20,
+            "non_win_mate_threat_penalty": 2.0,
+            "raw_before_clamp": 61.1,
+        },
+        "blunder_frequency_components": {
+            "blunder_rate": 0.07,
+            "raw_before_clamp": 70.0,
+        },
+    }
+
+    diagnostics = chess_review._trait_diagnostics_from_aggregate(
+        final_scores=final_scores,
+        aggregate_components=aggregate_components,
+    )
+
+    assert set(diagnostics.keys()) == set(final_scores.keys())
+    for trait_name, detail in diagnostics.items():
+        assert set(detail.keys()) == {
+            "rate_inputs",
+            "raw_score",
+            "penalties_applied",
+            "guardrail_applied",
+            "final_clamp",
+        }
+        assert isinstance(detail["rate_inputs"], dict)
+        assert isinstance(detail["penalties_applied"], dict)
+        assert isinstance(detail["raw_score"], float)
+        assert detail["guardrail_applied"]["max_allowed_score"] == 88
+        assert "error_presence_cap" in detail["guardrail_applied"]["reasons"]
+        assert detail["final_clamp"]["final_score"] == final_scores[trait_name]
