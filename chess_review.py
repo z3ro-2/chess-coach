@@ -66,7 +66,11 @@ from src.config.output_paths import get_output_root
 from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
-from src.db.runtime_updates import fetch_player_runtime_snapshot, sync_game_record_and_traits
+from src.db.runtime_updates import (
+    consume_engine_failure_notification_once,
+    fetch_player_runtime_snapshot,
+    sync_game_record_and_traits,
+)
 from src.db.schema import ensure_postgres_core_schema
 from src.llm_diagnostics import hash_text_sha256, prompt_hash, split_model_name_version
 from src.telegram_commands import poll_telegram_commands
@@ -2068,6 +2072,25 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         )
     except Exception as exc:
         logger.error("Stockfish failure: %s", exc)
+        notify_decision = consume_engine_failure_notification_once(
+            player_username=args.username,
+            game_payload={
+                "game_url": game.game_url,
+                "pgn": game.pgn,
+                "end_time": game.end_time,
+                "time_control": game.time_control,
+                "rated": game.rated,
+                "rules": game.rules,
+                "result": game.result,
+                "white_username": game.white_username,
+                "black_username": game.black_username,
+                "white_rating": game.white_rating,
+                "black_rating": game.black_rating,
+                "player_color": game.your_color,
+            },
+        )
+        if not bool(notify_decision.get("should_notify", True)):
+            return None
         try:
             send_telegram_message(
                 f"❌ Engine failure for {game.game_url}\nStockfish could not produce analysis.\nReason: {str(exc)[:300]}",

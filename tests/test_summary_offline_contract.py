@@ -350,6 +350,45 @@ def test_engine_failure_aborts_pipeline_and_sends_telegram(
     assert "Engine failure" in telegram_calls[0]
 
 
+def test_engine_failure_second_attempt_does_not_send_duplicate_telegram(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    telegram_calls: list[str] = []
+    notify_states = iter(
+        [
+            {"available": True, "reason": "marked_notified", "should_notify": True, "updated": True},
+            {"available": True, "reason": "already_notified", "should_notify": False, "updated": False},
+        ]
+    )
+
+    monkeypatch.setattr(
+        chess_review,
+        "run_analysis_pipeline",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Stockfish engine failed or produced no output.")),
+    )
+    monkeypatch.setattr(chess_review, "consume_engine_failure_notification_once", lambda **_kwargs: next(notify_states))
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **_kwargs: telegram_calls.append(str(message)),
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        first = chess_review.process_game(conn, summary_args, sample_game)
+        second = chess_review.process_game(conn, summary_args, sample_game)
+    finally:
+        conn.close()
+
+    assert first is None
+    assert second is None
+    assert len(telegram_calls) == 1
+    assert "Engine failure" in telegram_calls[0]
+
+
 def test_engine_payload_invalid_aborts_process_and_sends_telegram(
     monkeypatch,
     tmp_path,
