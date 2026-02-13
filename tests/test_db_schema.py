@@ -21,7 +21,17 @@ def test_ensure_postgres_core_schema_includes_failure_notified_column(monkeypatc
         if table_name == "players":
             return {"id", "username"}
         if table_name == "games":
-            return {"id", "player_id", "failure_notified", "review_notified", "engine_failed"}
+            return {
+                "id",
+                "player_id",
+                "failure_notified",
+                "review_notified",
+                "success_notified",
+                "engine_failed",
+                "last_attempt_at",
+                "attempt_count",
+                "last_error",
+            }
         return set()
 
     monkeypatch.setattr(schema_module, "_connect_db", _connect_db_stub)
@@ -37,9 +47,17 @@ def test_ensure_postgres_core_schema_includes_failure_notified_column(monkeypatc
         "CREATE TABLE IF NOT EXISTS games" in q
         and "failure_notified BOOLEAN NOT NULL DEFAULT FALSE" in q
         and "review_notified BOOLEAN NOT NULL DEFAULT FALSE" in q
+        and "success_notified BOOLEAN NOT NULL DEFAULT FALSE" in q
         and "engine_failed BOOLEAN NOT NULL DEFAULT FALSE" in q
+        and "last_attempt_at TIMESTAMPTZ" in q
+        and "attempt_count INTEGER NOT NULL DEFAULT 0" in q
+        and "last_error TEXT" in q
         for q in executed
     )
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS failure_notified BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS review_notified BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS success_notified BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS engine_failed BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS last_error TEXT" in q for q in executed)

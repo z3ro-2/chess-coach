@@ -11,14 +11,14 @@ class _FakeResponse:
         return {"ok": True}
 
 
-def test_telegram_send_uses_html_parse_mode(monkeypatch) -> None:
+def test_telegram_send_plain_text_without_parse_mode(monkeypatch) -> None:
     calls: list[dict] = []
 
     def _fake_post(url: str, data=None, timeout=0, files=None):
         calls.append({"url": url, "data": dict(data or {}), "timeout": timeout, "files": files})
         return _FakeResponse()
 
-    monkeypatch.setattr(chess_review.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     chess_review.send_telegram_message(
         "# Diagnostics\n```json\n{\"k\": \"v\"}\n```\n- Review _timing_ (critical)\nhttps://example.com",
@@ -31,12 +31,9 @@ def test_telegram_send_uses_html_parse_mode(monkeypatch) -> None:
     assert len(calls) == 1
     call = calls[0]
     assert call["url"].endswith("/sendMessage")
-    assert call["data"]["parse_mode"] == "HTML"
+    assert "parse_mode" not in call["data"]
     assert call["data"]["disable_web_page_preview"] is True
-    assert "<pre>" in call["data"]["text"]
-    assert "```" not in call["data"]["text"]
-    assert "# Diagnostics" not in call["data"]["text"]
-    assert "• Review timing (critical)" in call["data"]["text"]
+    assert call["data"]["text"].startswith("# Diagnostics")
 
 
 def test_success_message_plain_text_url_preview_enabled(monkeypatch) -> None:
@@ -46,7 +43,7 @@ def test_success_message_plain_text_url_preview_enabled(monkeypatch) -> None:
         calls.append({"url": url, "data": dict(data or {}), "timeout": timeout, "files": files})
         return _FakeResponse()
 
-    monkeypatch.setattr(chess_review.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     game = chess_review.GameInfo(
         game_url="https://www.chess.com/game/live/123",
@@ -75,37 +72,23 @@ def test_success_message_plain_text_url_preview_enabled(monkeypatch) -> None:
 
     assert len(calls) == 1
     payload = calls[0]["data"]
-    assert payload["parse_mode"] == "HTML"
+    assert "parse_mode" not in payload
     assert payload["disable_web_page_preview"] is False
 
     text = str(payload["text"])
     assert "https://www.chess.com/game/live/123" in text
-    assert "<" not in text
-    assert ">" not in text
-    assert "#" not in text
-    assert "`" not in text
     assert text.splitlines()[-1].strip() == "https://www.chess.com/game/live/123"
 
 
-def test_names_with_ampersand_less_greater_do_not_cause_400_error(monkeypatch) -> None:
+def test_names_with_ampersand_less_greater_are_sent_plain_text(monkeypatch) -> None:
     calls: list[dict] = []
 
     def _fake_post(url: str, data=None, timeout=0, files=None):
         payload = dict(data or {})
-        text = str(payload.get("text", ""))
         calls.append({"url": url, "data": payload})
-        if "alice <coach>" in text or "bob & carol > dave" in text:
-            class _BadResponse:
-                status_code = 400
-                text = "bad request"
-
-                def json(self) -> dict:
-                    return {"ok": False}
-
-            return _BadResponse()
         return _FakeResponse()
 
-    monkeypatch.setattr(chess_review.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     game = chess_review.GameInfo(
         game_url="https://www.chess.com/game/live/456",
@@ -131,11 +114,10 @@ def test_names_with_ampersand_less_greater_do_not_cause_400_error(monkeypatch) -
         timeout=7,
         disable_notification=False,
         disable_web_page_preview=False,
-        preformatted_html=True,
     )
 
     assert len(calls) == 1
     text = str(calls[0]["data"]["text"])
-    assert "bob &amp; carol &gt; dave" in text
-    assert "1-0 &amp; sharp" in text
-    assert "10&lt;0" in text
+    assert "bob & carol > dave" in text
+    assert "1-0 & sharp" in text
+    assert "10<0" in text

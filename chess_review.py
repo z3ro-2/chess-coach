@@ -72,18 +72,21 @@ from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import (
+    consume_success_notification_once,
     fetch_player_runtime_snapshot,
     clear_engine_failed,
     load_retry_failure_game_payloads,
+    record_game_attempt,
     mark_engine_failed,
     mark_engine_failure_notified,
     mark_review_notified,
+    should_skip_game_due_to_attempt_backoff,
     should_notify_engine_failure,
-    should_notify_review_success,
     sync_game_record_and_traits,
 )
 from src.db.schema import ensure_postgres_core_schema
 from src.llm_diagnostics import hash_text_sha256, prompt_hash, split_model_name_version
+from src.telegram_client import TelegramClientError, create_telegram_client
 from src.telegram_commands import poll_telegram_commands
 from src.telegram_formatter import render_summary_for_telegram
 from src.utils.timezone import get_display_timezone
@@ -108,12 +111,8 @@ class TelegramError(RuntimeError):
     pass
 
 
-def _telegram_api_base(bot_token: str) -> str:
-    return f"https://api.telegram.org/bot{bot_token.strip()}"
-
-
 def escape_telegram_text(text: str) -> str:
-    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return str(text or "")
 
 
 def send_telegram_document(
@@ -128,36 +127,16 @@ def send_telegram_document(
 
     Uses: https://api.telegram.org/bot<TOKEN>/sendDocument
     """
-    if not bot_token:
-        raise TelegramError("Missing bot_token")
-    if not chat_id:
-        raise TelegramError("Missing chat_id")
-    if not file_path.exists():
-        raise TelegramError(f"File not found: {file_path}")
-
-    url = _telegram_api_base(bot_token) + "/sendDocument"
-    data = {
-        "chat_id": chat_id,
-        "caption": render_summary_for_telegram(caption)[:1024],  # Telegram caption limit (safe clamp)
-        "disable_notification": disable_notification,
-        "parse_mode": "HTML",
-    }
-
-    # Use multipart/form-data
-    with file_path.open("rb") as f:
-        files = {"document": (file_path.name, f, "text/markdown")}
-        resp = requests.post(url, data=data, files=files, timeout=timeout)
-
-    if resp.status_code >= 400:
-        raise TelegramError(f"Telegram API error {resp.status_code}: {resp.text[:800]}")
-
+    client = create_telegram_client(bot_token=bot_token, timeout=timeout)
     try:
-        payload = resp.json()
-    except Exception:
-        raise TelegramError(f"Telegram returned non-JSON: {resp.text[:800]}")
-
-    if not payload.get("ok", False):
-        raise TelegramError(f"Telegram sendDocument failed: {str(payload)[:800]}")
+        client.send_document(
+            chat_id=chat_id,
+            filepath=file_path,
+            caption=str(caption or ""),
+            disable_notification=disable_notification,
+        )
+    except TelegramClientError as exc:
+        raise TelegramError(str(exc)) from exc
 
 
 def send_telegram_message(
@@ -171,29 +150,17 @@ def send_telegram_message(
     preformatted_html: bool = False,
 ) -> None:
     """Send a plain text message to Telegram via a bot."""
-    if not bot_token:
-        raise TelegramError("Missing bot_token")
-    if not chat_id:
-        raise TelegramError("Missing chat_id")
-
-    url = _telegram_api_base(bot_token) + "/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": (str(message or "") if preformatted_html else render_summary_for_telegram(str(message or "")))[:4096],
-        "disable_notification": disable_notification,
-        "disable_web_page_preview": bool(disable_web_page_preview),
-        "parse_mode": "HTML",
-    }
-    resp = requests.post(url, data=payload, timeout=timeout)
-    if resp.status_code >= 400:
-        raise TelegramError(f"Telegram API error {resp.status_code}: {resp.text[:800]}")
-
+    del preformatted_html  # Backward-compat parameter; sending is plain-text only.
+    client = create_telegram_client(bot_token=bot_token, timeout=timeout)
     try:
-        body = resp.json()
-    except Exception:
-        raise TelegramError(f"Telegram returned non-JSON: {resp.text[:800]}")
-    if not body.get("ok", False):
-        raise TelegramError(f"Telegram sendMessage failed: {str(body)[:800]}")
+        client.send_text(
+            chat_id=chat_id,
+            text=str(message or ""),
+            disable_preview=bool(disable_web_page_preview),
+            disable_notification=disable_notification,
+        )
+    except TelegramClientError as exc:
+        raise TelegramError(str(exc)) from exc
 
 
 def _telegram_error_status_code(exc: Exception) -> int | None:
@@ -290,6 +257,76 @@ def build_telegram_success_message(game: "GameInfo") -> str:
         f"\n"
         f"{game.game_url}"
     )
+
+
+def build_telegram_success_summary_text(game: "GameInfo") -> str:
+    dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    who = escape_telegram_text(str(game.your_color or "").strip().lower() or "unknown")
+    opponent = escape_telegram_text(str(game.opponent or ""))
+    result = escape_telegram_text(str(game.result or ""))
+    time_control = escape_telegram_text(str(game.time_control or ""))
+    return (
+        f"Chess review generated\n"
+        f"{dt}\n\n"
+        f"You: {who} vs {opponent}\n"
+        f"Result: {result} | TC: {time_control}"
+    )
+
+
+def run_telegram_smoketest(args: argparse.Namespace) -> int:
+    game_url = str(getattr(args, "tg_smoketest_game_url", "") or "").strip()
+    md_value = getattr(args, "tg_smoketest_md", None)
+    md_path = Path(md_value) if md_value is not None else None
+    caption = str(getattr(args, "tg_smoketest_caption", "") or "").strip() or "Chess review generated (smoketest)"
+
+    if not game_url:
+        raise ValueError("--game-url is required with --tg-smoketest.")
+    if md_path is None:
+        raise ValueError("--md is required with --tg-smoketest.")
+
+    text_payload = {
+        "chat_id": str(getattr(args, "telegram_chat_id", "") or ""),
+        "text": game_url,
+        "disable_web_page_preview": False,
+        "disable_notification": bool(getattr(args, "telegram_disable_notification", False)),
+    }
+    doc_payload = {
+        "chat_id": str(getattr(args, "telegram_chat_id", "") or ""),
+        "file_path": str(md_path),
+        "caption": caption,
+        "disable_notification": bool(getattr(args, "telegram_disable_notification", False)),
+    }
+
+    if bool(getattr(args, "dry_run", False)):
+        print("TG-SMOKETEST action=send_text payload=" + json.dumps(text_payload, ensure_ascii=True, sort_keys=True))
+        print("TG-SMOKETEST action=send_document payload=" + json.dumps(doc_payload, ensure_ascii=True, sort_keys=True))
+        return 0
+
+    bot_token = str(getattr(args, "telegram_bot_token", "") or "").strip()
+    chat_id = str(getattr(args, "telegram_chat_id", "") or "").strip()
+    if not bot_token or not chat_id:
+        raise ValueError("--telegram-bot-token and --telegram-chat-id are required unless --dry-run is used.")
+    if not md_path.exists():
+        raise FileNotFoundError(f"Smoke test markdown file not found: {md_path}")
+
+    send_telegram_message(
+        game_url,
+        bot_token=bot_token,
+        chat_id=chat_id,
+        timeout=int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+        disable_notification=bool(getattr(args, "telegram_disable_notification", False)),
+        disable_web_page_preview=False,
+    )
+    send_telegram_document(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        file_path=md_path,
+        caption=caption,
+        timeout=int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+        disable_notification=bool(getattr(args, "telegram_disable_notification", False)),
+    )
+    print("TG-SMOKETEST sent: URL preview + document attachment")
+    return 0
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -2037,6 +2074,7 @@ def call_ollama_generate(
 
     url = base_url.rstrip("/") + "/api/generate"
     headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
+    json_mode_requested = _env_bool("OLLAMA_JSON_MODE", False)
 
     # Some Ollama models support system prompts via the prompt itself; keep it simple.
     prompt = f"{system_msg}\n\n{user_msg}"
@@ -2049,12 +2087,26 @@ def call_ollama_generate(
         "num_predict": int(num_predict),
         "stream": False,
     }
+    if json_mode_requested:
+        payload["format"] = "json"
+
     resp = requests.post(
         url,
         headers=headers,
         data=json.dumps(payload),
         timeout=timeout,
     )
+    if resp.status_code >= 400 and json_mode_requested and payload.get("format") == "json":
+        body = str(resp.text or "").lower()
+        if "format" in body and ("unknown" in body or "unsupported" in body or "invalid" in body):
+            fallback_payload = dict(payload)
+            fallback_payload.pop("format", None)
+            resp = requests.post(
+                url,
+                headers=headers,
+                data=json.dumps(fallback_payload),
+                timeout=timeout,
+            )
     if resp.status_code >= 400:
         raise LLMError(f"Ollama error {resp.status_code}: {resp.text[:800]}")
 
@@ -2231,21 +2283,38 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
     # Optional: Telegram notification with the generated Markdown attached
     telegram_notified = False
     if getattr(args, "telegram_bot_token", None) and getattr(args, "telegram_chat_id", None):
-        notify_decision = should_notify_review_success(
+        notify_decision = consume_success_notification_once(
             player_username=args.username,
             game_payload=game_payload_for_runtime,
         )
         if bool(notify_decision.get("should_notify", True)):
             try:
                 send_telegram_message(
-                    build_telegram_success_message(game),
+                    game.game_url,
                     bot_token=args.telegram_bot_token,
                     chat_id=args.telegram_chat_id,
                     timeout=args.timeout,
                     disable_notification=getattr(args, "telegram_disable_notification", False),
                     disable_web_page_preview=False,
-                    preformatted_html=True,
                 )
+                if md_path.exists():
+                    send_telegram_document(
+                        bot_token=args.telegram_bot_token,
+                        chat_id=args.telegram_chat_id,
+                        file_path=md_path,
+                        caption=build_telegram_success_summary_text(game),
+                        timeout=args.timeout,
+                        disable_notification=getattr(args, "telegram_disable_notification", False),
+                    )
+                else:
+                    send_telegram_message(
+                        f"Review markdown missing; expected at: {md_path}",
+                        bot_token=args.telegram_bot_token,
+                        chat_id=args.telegram_chat_id,
+                        timeout=args.timeout,
+                        disable_notification=getattr(args, "telegram_disable_notification", False),
+                        disable_web_page_preview=True,
+                    )
                 mark_review_notified(
                     player_username=args.username,
                     game_payload=game_payload_for_runtime,
@@ -2450,9 +2519,23 @@ def _print_backfill_summary(result: Mapping[str, Any]) -> None:
 def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     reset_llm_attempt_counters()
     retry_mode = bool(getattr(args, "retry_failures", False))
+    max_attempts = max(1, int(getattr(args, "attempt_backoff_max_attempts", 5) or 5))
+    window_hours = max(1, int(getattr(args, "attempt_backoff_window_hours", 6) or 6))
+    ignore_backoff = bool(getattr(args, "ignore_attempt_backoff", False))
     if retry_mode:
-        logger.info("Retry mode enabled: selecting games where engine_failed=true OR review_notified=false.")
-        rows = load_retry_failure_game_payloads(player_username=args.username, limit=max(1, int(getattr(args, "backfill", 100) or 100)))
+        logger.info(
+            "Retry mode enabled: selecting games where engine_failed=true OR review_notified=false (backoff max_attempts=%s window_hours=%s ignore=%s).",
+            max_attempts,
+            window_hours,
+            ignore_backoff,
+        )
+        rows = load_retry_failure_game_payloads(
+            player_username=args.username,
+            limit=max(1, int(getattr(args, "backfill", 100) or 100)),
+            max_attempts=max_attempts,
+            window_hours=window_hours,
+            ignore_backoff=ignore_backoff,
+        )
         parsed = [g for g in (_game_info_from_retry_payload(row, args.username) for row in rows) if g is not None]
         parsed.sort(key=lambda g: g.end_time)
         _poll_debug("retry-failures candidates loaded: %s", int(len(parsed)))
@@ -2486,8 +2569,39 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     created = 0
     for g in parsed:
+        game_payload = {
+            "game_url": g.game_url,
+            "pgn": g.pgn,
+            "end_time": g.end_time,
+            "time_control": g.time_control,
+            "rated": g.rated,
+            "rules": g.rules,
+            "result": g.result,
+            "white_username": g.white_username,
+            "black_username": g.black_username,
+            "white_rating": g.white_rating,
+            "black_rating": g.black_rating,
+            "player_color": g.your_color,
+        }
         if (not retry_mode) and is_processed(conn, g.game_url):
             _poll_debug("game skipped url=%s reason=already processed", g.game_url)
+            continue
+
+        backoff_state = should_skip_game_due_to_attempt_backoff(
+            player_username=args.username,
+            game_payload=game_payload,
+            max_attempts=max_attempts,
+            window_hours=window_hours,
+            ignore_backoff=ignore_backoff,
+        )
+        if bool(backoff_state.get("skip", False)):
+            _poll_debug(
+                "game skipped url=%s reason=attempt_backoff attempt_count=%s max=%s window_hours=%s",
+                g.game_url,
+                int(backoff_state.get("attempt_count", 0) or 0),
+                max_attempts,
+                window_hours,
+            )
             continue
 
         if not str(g.time_control or "").strip():
@@ -2502,25 +2616,13 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
         last_err: Optional[Exception] = None
         for attempt in range(1, args.retries + 1):
+            attempt_error: str | None = None
             try:
                 out = process_game(conn, args, g)
                 if out:
                     clear_engine_failed(
                         player_username=args.username,
-                        game_payload={
-                            "game_url": g.game_url,
-                            "pgn": g.pgn,
-                            "end_time": g.end_time,
-                            "time_control": g.time_control,
-                            "rated": g.rated,
-                            "rules": g.rules,
-                            "result": g.result,
-                            "white_username": g.white_username,
-                            "black_username": g.black_username,
-                            "white_rating": g.white_rating,
-                            "black_rating": g.black_rating,
-                            "player_color": g.your_color,
-                        },
+                        game_payload=game_payload,
                     )
                     print(f"[ok] Wrote: {out}")
                     created += 1
@@ -2529,29 +2631,23 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 last_err = None
                 break
             except Exception as e:
+                attempt_error = str(e)
                 last_err = e
                 mark_engine_failed(
                     player_username=args.username,
-                    game_payload={
-                        "game_url": g.game_url,
-                        "pgn": g.pgn,
-                        "end_time": g.end_time,
-                        "time_control": g.time_control,
-                        "rated": g.rated,
-                        "rules": g.rules,
-                        "result": g.result,
-                        "white_username": g.white_username,
-                        "black_username": g.black_username,
-                        "white_rating": g.white_rating,
-                        "black_rating": g.black_rating,
-                        "player_color": g.your_color,
-                    },
+                    game_payload=game_payload,
                 )
                 print(
                     f"[warn] attempt {attempt}/{args.retries} failed for {g.game_url}: {e}",
                     file=sys.stderr,
                 )
                 time.sleep(min(3 * attempt, 12))
+            finally:
+                record_game_attempt(
+                    player_username=args.username,
+                    game_payload=game_payload,
+                    last_error=attempt_error,
+                )
 
         if last_err is not None:
             print(f"[error] Giving up on {g.game_url}: {last_err}", file=sys.stderr)
@@ -2860,9 +2956,50 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--timezone", default="America/Chicago", help="Timezone for filenames (IANA)")
 
     p.add_argument("--retries", type=int, default=3, help="Retries per game when LLM/network fails")
+    p.add_argument(
+        "--attempt-backoff-max-attempts",
+        type=int,
+        default=_env_int("ATTEMPT_BACKOFF_MAX_ATTEMPTS", 5),
+        help="Skip auto-processing when attempts reach this count within --attempt-backoff-window-hours.",
+    )
+    p.add_argument(
+        "--attempt-backoff-window-hours",
+        type=int,
+        default=_env_int("ATTEMPT_BACKOFF_WINDOW_HOURS", 6),
+        help="Backoff window in hours for attempt throttling.",
+    )
+    p.add_argument(
+        "--ignore-attempt-backoff",
+        action="store_true",
+        help="Manual override: ignore attempt backoff and process eligible games anyway.",
+    )
 
     p.add_argument("--update-index", action="store_true", help="Update index.md after new reviews")
     p.add_argument("--dry-run", action="store_true", help="Detect new games but do not call LLM or write files")
+    p.add_argument(
+        "--tg-smoketest",
+        action="store_true",
+        help="Send a Telegram smoke test (URL-only preview message, then markdown attachment).",
+    )
+    p.add_argument(
+        "--game-url",
+        dest="tg_smoketest_game_url",
+        default="",
+        help="Game URL used for --tg-smoketest URL-preview message.",
+    )
+    p.add_argument(
+        "--md",
+        dest="tg_smoketest_md",
+        type=Path,
+        default=None,
+        help="Markdown file path to attach during --tg-smoketest.",
+    )
+    p.add_argument(
+        "--tg-caption",
+        dest="tg_smoketest_caption",
+        default="",
+        help="Optional caption override for --tg-smoketest document send.",
+    )
     p.add_argument(
         "--player-summary-every-n",
         type=int,
@@ -2912,10 +3049,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     args = p.parse_args(argv)
 
-    if not args.username:
-        p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
-    if args.out is None:
-        p.error("CHESS_OUTPUT_DIR is not set; set it or pass --out explicitly.")
+    if not args.tg_smoketest:
+        if not args.username:
+            p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
+        if args.out is None:
+            p.error("CHESS_OUTPUT_DIR is not set; set it or pass --out explicitly.")
+    else:
+        if not str(args.tg_smoketest_game_url or "").strip():
+            p.error("--tg-smoketest requires --game-url.")
+        if args.tg_smoketest_md is None:
+            p.error("--tg-smoketest requires --md.")
     if args.bootstrap_games is not None and args.bootstrap_games <= 0:
         p.error("--bootstrap-games must be > 0.")
     if args.player_summary_every_n <= 0:
@@ -2928,6 +3071,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         p.error("--timeout must be > 0.")
     if args.backfill < 0:
         p.error("--backfill must be >= 0.")
+    if args.attempt_backoff_max_attempts <= 0:
+        p.error("--attempt-backoff-max-attempts must be > 0.")
+    if args.attempt_backoff_window_hours <= 0:
+        p.error("--attempt-backoff-window-hours must be > 0.")
 
     # Normalize rules filter: allow disabling with empty string
     if args.rules_filter is not None:
@@ -2941,6 +3088,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
+    if bool(getattr(args, "tg_smoketest", False)):
+        return int(run_telegram_smoketest(args))
     if not bool(getattr(args, "enable_engine", False)):
         raise RuntimeError("Engine cannot be disabled in strict mode.")
     args.out = Path(args.out)

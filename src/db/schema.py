@@ -74,7 +74,11 @@ def ensure_postgres_core_schema(*, database_url: str | None = None) -> dict[str,
               player_color TEXT,
               failure_notified BOOLEAN NOT NULL DEFAULT FALSE,
               review_notified BOOLEAN NOT NULL DEFAULT FALSE,
+              success_notified BOOLEAN NOT NULL DEFAULT FALSE,
               engine_failed BOOLEAN NOT NULL DEFAULT FALSE,
+              last_attempt_at TIMESTAMPTZ,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
               created_at TIMESTAMPTZ DEFAULT NOW()
             )
             """,
@@ -97,7 +101,35 @@ def ensure_postgres_core_schema(*, database_url: str | None = None) -> dict[str,
             conn,
             """
             ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS success_notified BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
             ADD COLUMN IF NOT EXISTS engine_failed BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS last_error TEXT
             """,
         )
         _execute(conn, "CREATE INDEX IF NOT EXISTS idx_games_player_id ON games(player_id)")

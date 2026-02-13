@@ -438,3 +438,57 @@ def test_retry_failures_flag_processes_seeded_failed_game_once(monkeypatch, tmp_
 
     assert created == 1
     assert calls["process"] == 1
+
+
+def test_retry_failures_skips_game_when_attempt_backoff_threshold_exceeded(monkeypatch, tmp_path) -> None:
+    ingest_check_module.close_ingest_db_check()
+    calls = {"process": 0}
+
+    row = {
+        "game_url": "https://www.chess.com/game/live/9002",
+        "pgn": '[Event "Live Chess"]\n[White "logan"]\n[Black "opponent"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+        "end_time": int(time.time()),
+        "time_control": "600",
+        "rated": True,
+        "rules": "chess",
+        "result": "1-0",
+        "white_username": "logan",
+        "black_username": "opponent",
+        "white_rating": 1200,
+        "black_rating": 1190,
+        "player_color": "white",
+    }
+
+    monkeypatch.setattr(chess_review, "load_retry_failure_game_payloads", lambda **_kwargs: [row])
+    monkeypatch.setattr(
+        chess_review,
+        "should_skip_game_due_to_attempt_backoff",
+        lambda **_kwargs: {"available": True, "reason": "attempt_backoff", "skip": True, "attempt_count": 7},
+    )
+    monkeypatch.setattr(chess_review, "record_game_attempt", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "clear_engine_failed", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "mark_engine_failed", lambda **_kwargs: {"available": False})
+
+    def _process_stub(_conn, _args, _game):
+        calls["process"] += 1
+        return tmp_path / "output" / "md" / "x.md"
+
+    monkeypatch.setattr(chess_review, "process_game", _process_stub)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = True
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = False
+        args.retries = 1
+        args.attempt_backoff_max_attempts = 3
+        args.attempt_backoff_window_hours = 24
+        args.ignore_attempt_backoff = False
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    assert calls["process"] == 0

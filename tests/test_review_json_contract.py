@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from types import SimpleNamespace
 
@@ -416,6 +417,42 @@ def test_fallback_counter_increments_when_triggered(monkeypatch) -> None:
     after = pipeline_module.get_fallback_usage_count()
     assert "Deterministic fallback review:" in output
     assert after == before + 1
+
+
+def test_llm_diagnostics_includes_prompt_file_metadata(monkeypatch) -> None:
+    key_positions = _four_positions()
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary(),
+            "key_positions": key_positions,
+            "all_positions": _trace_for_positions(key_positions),
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: None)
+
+    output = run_analysis_pipeline(
+        game=_Game(),
+        args=SimpleNamespace(enable_engine=True),
+        llm_runner=lambda _sys, _user: json.dumps(_valid_review_json(), ensure_ascii=True, separators=(",", ":")),
+        logger=logging.getLogger("test"),
+    )
+
+    marker = "## LLM Diagnostics"
+    assert marker in output
+    tail = output.split(marker, 1)[1]
+    payload_line = next((line.strip() for line in tail.splitlines() if line.strip().startswith("{")), "")
+    parsed = json.loads(payload_line)
+    prompt_files = parsed.get("prompt_files")
+    assert isinstance(prompt_files, dict)
+    assert isinstance(prompt_files.get("system"), dict)
+    assert isinstance(prompt_files.get("user"), dict)
+    assert str(prompt_files["system"].get("path", "")).endswith("review_system.md")
+    assert str(prompt_files["user"].get("path", "")).endswith("review_user_strict.md")
+    assert isinstance(prompt_files["system"].get("sha256"), str) and prompt_files["system"]["sha256"]
+    assert isinstance(prompt_files["user"].get("sha256"), str) and prompt_files["user"]["sha256"]
 
 
 def test_two_violations_increment_fallback_counter(monkeypatch) -> None:

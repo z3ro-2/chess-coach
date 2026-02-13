@@ -361,9 +361,10 @@ def test_success_path_emits_structured_json_log(monkeypatch, tmp_path, summary_a
         ),
     )
     monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(chess_review, "should_notify_review_success", lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True})
+    monkeypatch.setattr(chess_review, "consume_success_notification_once", lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True})
     monkeypatch.setattr(chess_review, "mark_review_notified", lambda **_kwargs: {"available": True, "reason": "marked_notified", "updated": True})
     monkeypatch.setattr(chess_review, "send_telegram_message", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "send_telegram_document", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
     monkeypatch.setattr(chess_review, "record_player_rating_for_game", lambda **_kwargs: False)
     monkeypatch.setattr(chess_review, "_write_player_stats_markdown", lambda *_args, **_kwargs: tmp_path / "output" / "player_stats.md")
@@ -404,7 +405,8 @@ def test_review_notified_gating_first_success_sends_second_skips(
     summary_args,
     sample_game,
 ) -> None:
-    telegram_calls: list[str] = []
+    telegram_text_calls: list[dict] = []
+    telegram_doc_calls: list[dict] = []
     mark_calls: list[dict] = []
     notify_states = iter(
         [
@@ -419,13 +421,22 @@ def test_review_notified_gating_first_success_sends_second_skips(
     monkeypatch.setattr(chess_review, "_record_processed_game_meta", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
     monkeypatch.setattr(chess_review, "record_player_rating_for_game", lambda **_kwargs: False)
-    monkeypatch.setattr(chess_review, "should_notify_review_success", lambda **_kwargs: next(notify_states))
+    monkeypatch.setattr(chess_review, "consume_success_notification_once", lambda **_kwargs: next(notify_states))
     monkeypatch.setattr(
         chess_review,
         "mark_review_notified",
         lambda **kwargs: mark_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_notified", "updated": True},
     )
-    monkeypatch.setattr(chess_review, "send_telegram_message", lambda message, **_kwargs: telegram_calls.append(str(message)))
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **kwargs: telegram_text_calls.append({"message": str(message), "kwargs": dict(kwargs)}),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_document",
+        lambda **kwargs: telegram_doc_calls.append(dict(kwargs)),
+    )
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
@@ -436,8 +447,53 @@ def test_review_notified_gating_first_success_sends_second_skips(
 
     assert first is not None
     assert second is not None
-    assert len(telegram_calls) == 1
+    assert len(telegram_text_calls) == 1
+    assert telegram_text_calls[0]["message"] == sample_game.game_url
+    assert telegram_text_calls[0]["kwargs"]["disable_web_page_preview"] is False
+    assert len(telegram_doc_calls) == 1
+    assert str(telegram_doc_calls[0]["file_path"]).endswith(".md")
+    assert "Chess review generated" in str(telegram_doc_calls[0]["caption"])
     assert len(mark_calls) == 1
+
+
+def test_success_notification_sends_document_with_md_path(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    text_calls: list[dict] = []
+    doc_calls: list[dict] = []
+
+    monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# game review")
+    monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chess_review, "mark_processed", lambda **_kwargs: None)
+    monkeypatch.setattr(chess_review, "_record_processed_game_meta", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
+    monkeypatch.setattr(chess_review, "record_player_rating_for_game", lambda **_kwargs: False)
+    monkeypatch.setattr(chess_review, "consume_success_notification_once", lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True})
+    monkeypatch.setattr(chess_review, "mark_review_notified", lambda **_kwargs: {"available": True, "reason": "marked_notified", "updated": True})
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **kwargs: text_calls.append({"message": str(message), "kwargs": dict(kwargs)}),
+    )
+    monkeypatch.setattr(chess_review, "send_telegram_document", lambda **kwargs: doc_calls.append(dict(kwargs)))
+    monkeypatch.setattr(chess_review, "_write_player_stats_markdown", lambda *_args, **_kwargs: tmp_path / "output" / "player_stats.md")
+    monkeypatch.setattr(chess_review, "_maybe_generate_player_summary", lambda *_args, **_kwargs: None)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, sample_game)
+    finally:
+        conn.close()
+
+    assert out is not None
+    assert len(text_calls) == 1
+    assert text_calls[0]["message"] == sample_game.game_url
+    assert text_calls[0]["kwargs"]["disable_web_page_preview"] is False
+    assert len(doc_calls) == 1
+    assert doc_calls[0]["file_path"] == out
 
 
 def test_failure_notified_flag_set_after_success(

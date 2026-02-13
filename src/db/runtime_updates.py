@@ -248,6 +248,191 @@ def mark_review_notified(
         cleanup()
 
 
+def consume_success_notification_once(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Atomically consume the review-success notification budget for one game.
+
+    First invocation flips success_notified=false->true and returns should_notify=True.
+    Subsequent invocations return should_notify=False.
+    """
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "should_notify": True, "consumed": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping success-notification consume: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "should_notify": True, "consumed": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns or "success_notified" not in game_columns:
+            return {"available": False, "reason": "schema_missing", "should_notify": True, "consumed": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "should_notify": True, "consumed": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE games SET success_notified = TRUE WHERE id = %s AND COALESCE(success_notified, FALSE) = FALSE",
+                (game_id,),
+            )
+            consumed = bool(int(getattr(cursor, "rowcount", 0) or 0) > 0)
+        finally:
+            cursor.close()
+
+        conn.commit()
+        if consumed:
+            return {"available": True, "reason": "consumed", "should_notify": True, "consumed": True}
+        return {"available": True, "reason": "already_consumed", "should_notify": False, "consumed": False}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping success-notification consume due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "should_notify": True, "consumed": False}
+    finally:
+        cleanup()
+
+
+def record_game_attempt(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+    last_error: str | None,
+) -> dict[str, Any]:
+    """Increment attempt_count and stamp last_attempt_at for this game."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping game attempt stamp: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        required = {"attempt_count", "last_attempt_at", "last_error"}
+        if not player_columns or not game_columns or not required.issubset(game_columns):
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        _execute(
+            conn,
+            """
+            UPDATE games
+            SET attempt_count = COALESCE(attempt_count, 0) + 1,
+                last_attempt_at = NOW(),
+                last_error = %s
+            WHERE id = %s
+            """,
+            ((str(last_error)[:4000] if last_error else None), game_id),
+        )
+        conn.commit()
+        return {"available": True, "reason": "updated", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping game attempt stamp due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
+    finally:
+        cleanup()
+
+
+def should_skip_game_due_to_attempt_backoff(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+    max_attempts: int,
+    window_hours: int,
+    ignore_backoff: bool = False,
+) -> dict[str, Any]:
+    """Return skip=true when attempt threshold is exceeded within recent window."""
+    if bool(ignore_backoff):
+        return {"available": True, "reason": "override", "skip": False}
+
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "skip": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping attempt-backoff check: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "skip": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        required = {"attempt_count", "last_attempt_at"}
+        if not player_columns or not game_columns or not required.issubset(game_columns):
+            return {"available": False, "reason": "schema_missing", "skip": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "skip": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        row = _fetchone(
+            conn,
+            """
+            SELECT
+              COALESCE(attempt_count, 0) AS attempt_count,
+              CASE
+                WHEN COALESCE(attempt_count, 0) >= %s
+                 AND last_attempt_at IS NOT NULL
+                 AND last_attempt_at >= (NOW() - (%s * INTERVAL '1 hour'))
+                THEN TRUE
+                ELSE FALSE
+              END AS blocked
+            FROM games
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (max(1, int(max_attempts)), max(1, int(window_hours)), game_id),
+        )
+        conn.commit()
+        blocked = bool(row and row.get("blocked"))
+        if blocked:
+            return {
+                "available": True,
+                "reason": "attempt_backoff",
+                "skip": True,
+                "attempt_count": int(row.get("attempt_count", 0) or 0) if row else 0,
+            }
+        return {"available": True, "reason": "ok", "skip": False}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping attempt-backoff check due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "skip": False}
+    finally:
+        cleanup()
+
+
 def mark_engine_failed(
     *,
     player_username: str,
@@ -332,7 +517,14 @@ def clear_engine_failed(
         cleanup()
 
 
-def load_retry_failure_game_payloads(*, player_username: str, limit: int = 200) -> list[dict[str, Any]]:
+def load_retry_failure_game_payloads(
+    *,
+    player_username: str,
+    limit: int = 200,
+    max_attempts: int = 5,
+    window_hours: int = 6,
+    ignore_backoff: bool = False,
+) -> list[dict[str, Any]]:
     """Load game payloads where engine_failed=true or review_notified=false."""
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not _is_postgres_url(database_url):
@@ -353,6 +545,19 @@ def load_retry_failure_game_payloads(*, player_username: str, limit: int = 200) 
         if player_row is None:
             return []
         player_id = int(player_row["id"])
+        has_attempt_backoff_fields = {"attempt_count", "last_attempt_at"}.issubset(game_columns)
+        attempt_filter_sql = ""
+        params: list[Any] = [player_id]
+        if has_attempt_backoff_fields and not bool(ignore_backoff):
+            attempt_filter_sql = """
+              AND (
+                    last_attempt_at IS NULL
+                    OR COALESCE(attempt_count, 0) < %s
+                    OR last_attempt_at < (NOW() - (%s * INTERVAL '1 hour'))
+                  )
+            """
+            params.extend([max(1, int(max_attempts)), max(1, int(window_hours))])
+        params.append(max(1, int(limit)))
         rows = _fetchall(
             conn,
             """
@@ -361,10 +566,13 @@ def load_retry_failure_game_payloads(*, player_username: str, limit: int = 200) 
             FROM games
             WHERE player_id = %s
               AND (engine_failed = TRUE OR COALESCE(review_notified, FALSE) = FALSE)
+            """
+            + attempt_filter_sql
+            + """
             ORDER BY end_time DESC, id DESC
             LIMIT %s
             """,
-            (player_id, max(1, int(limit))),
+            tuple(params),
         )
         out: list[dict[str, Any]] = []
         for row in rows:

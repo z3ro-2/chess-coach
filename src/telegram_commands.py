@@ -12,7 +12,7 @@ import requests
 
 from src.commands import list_command_names, run_command
 from src.config.provider_config import set_provider
-from src.telegram_formatter import render_summary_for_telegram
+from src.telegram_client import create_telegram_client
 
 logger = logging.getLogger(__name__)
 
@@ -181,18 +181,8 @@ def _telegram_get_updates(bot_token: str, *, params: dict[str, Any], timeout: in
 
 
 def _telegram_send_message(*, bot_token: str, chat_id: str, text: str, timeout: int) -> None:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": chat_id,
-            "text": render_summary_for_telegram(text)[:4096],
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=timeout,
-    )
-    resp.raise_for_status()
+    client = create_telegram_client(bot_token=bot_token, timeout=timeout)
+    client.send_text(chat_id=chat_id, text=text, disable_preview=True)
 
 
 def _telegram_send_document(
@@ -203,16 +193,5 @@ def _telegram_send_document(
     caption: str,
     timeout: int,
 ) -> None:
-    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    with file_path.open("rb") as file_handle:
-        resp = requests.post(
-            url,
-            data={
-                "chat_id": chat_id,
-                "caption": render_summary_for_telegram(caption)[:1024],
-                "parse_mode": "HTML",
-            },
-            files={"document": (file_path.name, file_handle, "text/markdown")},
-            timeout=timeout,
-        )
-    resp.raise_for_status()
+    client = create_telegram_client(bot_token=bot_token, timeout=timeout)
+    client.send_document(chat_id=chat_id, filepath=file_path, caption=caption)

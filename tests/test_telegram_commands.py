@@ -48,7 +48,7 @@ def test_telegram_command_parsing_and_dispatch(monkeypatch, tmp_path) -> None:
         return _FakeResponse({"ok": True, "result": {}})
 
     monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
-    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
@@ -76,7 +76,7 @@ def test_telegram_command_parsing_and_dispatch(monkeypatch, tmp_path) -> None:
     assert any(item["url"].endswith("/sendMessage") for item in posted_messages)
     send_message_calls = [item for item in posted_messages if item["url"].endswith("/sendMessage")]
     assert send_message_calls
-    assert all(str(call.get("data", {}).get("parse_mode", "")) == "HTML" for call in send_message_calls)
+    assert all("parse_mode" not in dict(call.get("data", {})) for call in send_message_calls)
 
 
 def test_setprovider_gpt_updates_runtime_provider(monkeypatch, tmp_path) -> None:
@@ -99,7 +99,7 @@ def test_setprovider_gpt_updates_runtime_provider(monkeypatch, tmp_path) -> None
         return _FakeResponse({"ok": True, "result": {}})
 
     monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
-    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
@@ -145,7 +145,7 @@ def test_setprovider_ollama_updates_runtime_provider(monkeypatch, tmp_path) -> N
         return _FakeResponse({"ok": True, "result": {}})
 
     monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
-    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
@@ -191,7 +191,7 @@ def test_setprovider_invalid_value_returns_error(monkeypatch, tmp_path) -> None:
         return _FakeResponse({"ok": True, "result": {}})
 
     monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
-    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
@@ -237,7 +237,7 @@ def test_setprovider_requires_authorized_chat(monkeypatch, tmp_path) -> None:
         return _FakeResponse({"ok": True, "result": {}})
 
     monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
-    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:
@@ -296,7 +296,7 @@ def test_summary_command_message_includes_trait_scores(monkeypatch, tmp_path) ->
         return _FakeResponse({"ok": True, "result": {}})
 
     monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
-    monkeypatch.setattr(telegram_commands.requests, "post", _fake_post)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
     monkeypatch.setattr(
         telegram_commands,
         "run_command",

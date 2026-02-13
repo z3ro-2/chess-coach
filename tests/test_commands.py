@@ -144,6 +144,60 @@ def test_status_includes_last_review_time(monkeypatch, tmp_path) -> None:
     assert "Last review time: 2024-01-23 08:55:00 UTC" in text
 
 
+def test_tg_smoketest_dry_run_prints_actions_in_order(tmp_path, capsys) -> None:
+    md_path = tmp_path / "review.md"
+    md_path.write_text("# review", encoding="utf-8")
+    args = SimpleNamespace(
+        tg_smoketest=True,
+        tg_smoketest_game_url="https://www.chess.com/game/live/123456",
+        tg_smoketest_md=md_path,
+        tg_smoketest_caption="smoke caption",
+        dry_run=True,
+        telegram_chat_id="42",
+        telegram_disable_notification=False,
+        telegram_bot_token="",
+        timeout=5,
+    )
+
+    rc = chess_review.run_telegram_smoketest(args)
+    assert rc == 0
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert lines[0].startswith("TG-SMOKETEST action=send_text payload=")
+    assert lines[1].startswith("TG-SMOKETEST action=send_document payload=")
+
+    first_payload = json.loads(lines[0].split("payload=", 1)[1])
+    second_payload = json.loads(lines[1].split("payload=", 1)[1])
+
+    assert first_payload["text"] == "https://www.chess.com/game/live/123456"
+    assert first_payload["disable_web_page_preview"] is False
+    assert "parse_mode" not in first_payload
+    assert second_payload["file_path"] == str(md_path)
+
+
+def test_parse_args_allows_tg_smoketest_without_username(monkeypatch, tmp_path) -> None:
+    md_path = tmp_path / "review.md"
+    md_path.write_text("# review", encoding="utf-8")
+    monkeypatch.delenv("CHESS_USERNAME", raising=False)
+    monkeypatch.delenv("CHESS_OUTPUT_DIR", raising=False)
+
+    args = chess_review.parse_args(
+        [
+            "--tg-smoketest",
+            "--game-url",
+            "https://www.chess.com/game/live/1",
+            "--md",
+            str(md_path),
+            "--dry-run",
+        ]
+    )
+
+    assert args.tg_smoketest is True
+    assert str(args.tg_smoketest_game_url) == "https://www.chess.com/game/live/1"
+    assert Path(args.tg_smoketest_md) == md_path
+
+
 def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     calls: list[str] = []

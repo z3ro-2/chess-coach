@@ -40,19 +40,39 @@ def _resolve_project_root(start_file: str) -> Path:
 
 
 BASE_DIR = _resolve_project_root(__file__)
-PROMPTS_DIR = BASE_DIR / "prompts"
+_PROMPTS_DIR_ENV = str(os.environ.get("PROMPTS_DIR", "") or "").strip()
+if _PROMPTS_DIR_ENV:
+    _candidate_prompts_dir = Path(_PROMPTS_DIR_ENV)
+    if not _candidate_prompts_dir.is_absolute():
+        _candidate_prompts_dir = (BASE_DIR / _candidate_prompts_dir).resolve()
+    PROMPTS_DIR = _candidate_prompts_dir
+else:
+    PROMPTS_DIR = (BASE_DIR / "prompts").resolve()
 
 
 def load_prompt_file(name: str) -> str:
-    path = PROMPTS_DIR / name
-    content = path.read_text(encoding="utf-8")
-    logger.info(
-        "Prompt loaded filename=%s path=%s sha256=%s",
-        str(name),
-        str(path.resolve()),
-        hash_text_sha256(content),
-    )
+    content, _meta = _load_prompt_file_with_metadata(name)
     return content
+
+
+def _load_prompt_file_with_metadata(name: str) -> tuple[str, dict[str, Any]]:
+    path = (PROMPTS_DIR / name).resolve()
+    content = path.read_text(encoding="utf-8")
+    stat = path.stat()
+    meta: dict[str, Any] = {
+        "filename": str(name),
+        "path": str(path),
+        "mtime_epoch": float(stat.st_mtime),
+        "sha256": hash_text_sha256(content),
+    }
+    logger.info(
+        "Prompt loaded filename=%s path=%s mtime=%s sha256=%s",
+        meta["filename"],
+        meta["path"],
+        meta["mtime_epoch"],
+        meta["sha256"],
+    )
+    return content, meta
 
 
 def run_analysis_pipeline(
@@ -118,8 +138,12 @@ def run_analysis_pipeline(
     if len(list(engine_output.get("key_positions") or [])) != 4:
         raise RuntimeError("Engine payload invalid: key_positions_must_have_exactly_four")
 
-    system_template = load_prompt_file("review_system.md")
-    user_template = load_prompt_file("review_user_strict.md")
+    system_template, system_meta = _load_prompt_file_with_metadata("review_system.md")
+    user_template, user_meta = _load_prompt_file_with_metadata("review_user_strict.md")
+    prompt_file_info = {
+        "system": system_meta,
+        "user": user_meta,
+    }
     user_prompt = user_template.replace(
         "{payload}",
         json.dumps(llm_payload, ensure_ascii=True, separators=(",", ":")),
@@ -137,6 +161,7 @@ def run_analysis_pipeline(
         hash_temperature=hash_temperature,
         hash_top_p=hash_top_p,
         hash_max_tokens=hash_max_tokens,
+        prompt_file_info=prompt_file_info,
         game_id=str(getattr(game, "game_url", "") or "unknown"),
         logger=logger,
     )
@@ -229,6 +254,7 @@ def _call_llm_review_json_with_retry(
     hash_temperature: float,
     hash_top_p: float,
     hash_max_tokens: int,
+    prompt_file_info: Mapping[str, Any],
     game_id: str,
     logger: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -269,6 +295,7 @@ def _call_llm_review_json_with_retry(
                 "format_violation": False,
                 "retry_attempted": False,
                 "fallback_used": False,
+                "prompt_files": dict(prompt_file_info),
             },
         )
     except LLMFormatViolationError as first_exc:
@@ -315,6 +342,7 @@ def _call_llm_review_json_with_retry(
                     "format_violation": True,
                     "retry_attempted": True,
                     "fallback_used": False,
+                    "prompt_files": dict(prompt_file_info),
                 },
             )
         except LLMFormatViolationError:
@@ -334,6 +362,7 @@ def _call_llm_review_json_with_retry(
                     "format_violation": True,
                     "retry_attempted": True,
                     "fallback_used": True,
+                    "prompt_files": dict(prompt_file_info),
                 },
             )
 
@@ -427,6 +456,7 @@ def _append_llm_diagnostics_markdown(
             "model_version": diagnostics.get("model_version"),
             "prompt_hash": str(diagnostics.get("prompt_hash", "") or ""),
             "output_hash": str(diagnostics.get("output_hash", "") or ""),
+            "prompt_files": diagnostics.get("prompt_files"),
             "format_violation": bool(diagnostics.get("format_violation", False)),
             "retry_attempted": bool(diagnostics.get("retry_attempted", False)),
         },

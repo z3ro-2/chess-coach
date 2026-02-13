@@ -60,6 +60,70 @@ def test_call_ollama_generate_raises_config_error_on_invalid_config_type(monkeyp
         )
 
 
+def test_call_ollama_generate_sends_json_format_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("OLLAMA_MODEL", "llama3.2:3b")
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.33")
+    monkeypatch.setenv("LLM_TOP_P", "0.77")
+    monkeypatch.setenv("LLM_MAX_TOKENS", "321")
+    monkeypatch.setenv("OLLAMA_JSON_MODE", "1")
+    captured: dict[str, object] = {}
+
+    def _fake_post(url, headers, data, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(str(data))
+        return _FakeResponse()
+
+    monkeypatch.setattr(chess_review.requests, "post", _fake_post)
+    out = chess_review.call_ollama_generate(
+        base_url="http://127.0.0.1:11434",
+        model="ignored-by-config",
+        system_msg="SYS",
+        user_msg="USR",
+        timeout=9,
+    )
+    assert out == "ok"
+    payload = dict(captured["payload"])  # type: ignore[arg-type]
+    assert payload["format"] == "json"
+
+
+def test_call_ollama_generate_retries_without_json_format_when_unsupported(monkeypatch) -> None:
+    monkeypatch.setenv("OLLAMA_MODEL", "llama3.2:3b")
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.33")
+    monkeypatch.setenv("LLM_TOP_P", "0.77")
+    monkeypatch.setenv("LLM_MAX_TOKENS", "321")
+    monkeypatch.setenv("OLLAMA_JSON_MODE", "1")
+    calls: list[dict[str, object]] = []
+
+    class _BadResponse:
+        status_code = 400
+        text = "invalid format option"
+
+        def json(self):
+            return {"error": "invalid format option"}
+
+    def _fake_post(url, headers, data, timeout):
+        payload = json.loads(str(data))
+        calls.append(payload)
+        if len(calls) == 1:
+            return _BadResponse()
+        return _FakeResponse()
+
+    monkeypatch.setattr(chess_review.requests, "post", _fake_post)
+    out = chess_review.call_ollama_generate(
+        base_url="http://127.0.0.1:11434",
+        model="ignored-by-config",
+        system_msg="SYS",
+        user_msg="USR",
+        timeout=9,
+    )
+    assert out == "ok"
+    assert len(calls) == 2
+    assert calls[0].get("format") == "json"
+    assert "format" not in calls[1]
+
+
 def test_llm_audit_log_appears_during_backend_review_generation(monkeypatch, caplog) -> None:
     set_provider("ollama")
     monkeypatch.setenv("OLLAMA_URL", "http://localhost:11434")

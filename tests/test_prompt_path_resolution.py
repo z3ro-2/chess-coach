@@ -45,4 +45,20 @@ def test_prompt_load_logs_path_and_hash(caplog) -> None:
     resolved = str((pipeline_module.PROMPTS_DIR / "review_system.md").resolve())
     assert f"filename=review_system.md" in caplog.text
     assert f"path={resolved}" in caplog.text
+    assert "mtime=" in caplog.text
     assert f"sha256={expected_hash}" in caplog.text
+
+
+def test_load_prompt_file_logs_runtime_prompts_dir(monkeypatch, tmp_path, caplog) -> None:
+    runtime_prompts = tmp_path / "data" / "prompts"
+    runtime_prompts.mkdir(parents=True, exist_ok=True)
+    prompt_file = runtime_prompts / "review_system.md"
+    prompt_file.write_text("runtime system prompt", encoding="utf-8")
+
+    caplog.set_level("INFO")
+    monkeypatch.setattr(pipeline_module, "PROMPTS_DIR", runtime_prompts)
+
+    content = pipeline_module.load_prompt_file("review_system.md")
+
+    assert content == "runtime system prompt"
+    assert f"path={str(prompt_file.resolve())}" in caplog.text
