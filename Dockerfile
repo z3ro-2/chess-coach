@@ -42,4 +42,4 @@ RUN chmod +x /docker-entrypoint.sh
 RUN mkdir -p /data /data/md /data/pgn
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
-CMD ["-m", "src.main"]
+CMD ["python", "chess_review.py"]
