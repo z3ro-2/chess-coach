@@ -52,7 +52,10 @@ def test_status_command_without_postgres(monkeypatch, tmp_path) -> None:
         conn.close()
 
     text = str(result["text"])
-    assert "Postgres OK: no" in text
+    assert "Engine: OK" in text
+    assert "LLM Provider: ollama" in text
+    assert "Postgres: not connected" in text
+    assert "SQLite: connected" in text
     assert "Games since last summary:" in text
     assert "Pending games count:" in text
 
@@ -80,12 +83,14 @@ def test_status_includes_llm_info(monkeypatch, tmp_path) -> None:
         conn.close()
 
     text = str(result["text"])
-    assert "LLM model: llama3.1:8b" in text
-    assert "LLM temperature: 0.05" in text
-    assert "LLM top_p: 0.7" in text
-    assert "Last prompt_hash: abc123" in text
-    assert "Last output_hash: def456" in text
-    assert "Last generation: success" in text
+    assert "Engine: OK" in text
+    assert "LLM Provider: ollama" in text
+    assert "Model: llama3.1:8b" in text
+    assert "Prompt hash: abc123" in text
+    assert "Fallback rate: " in text
+    assert "Last review time: none" in text
+    assert "Postgres: not connected" in text
+    assert "SQLite: connected" in text
 
 
 def test_status_includes_pending_games(monkeypatch, tmp_path) -> None:
@@ -108,6 +113,35 @@ def test_status_includes_pending_games(monkeypatch, tmp_path) -> None:
 
     text = str(result["text"])
     assert "Pending games count: 1" in text
+
+
+def test_status_includes_last_review_time(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _args(tmp_path)
+        args.out.mkdir(parents=True, exist_ok=True)
+        game = _sample_game()
+        md_path = args.out / "md" / "g.md"
+        pgn_path = args.out / "pgn" / "g.pgn"
+        chess_review.write_text(md_path, "# review")
+        chess_review.write_text(pgn_path, game.pgn)
+        chess_review.mark_processed(
+            conn=conn,
+            game_url=game.game_url,
+            end_time=game.end_time,
+            md_path=md_path,
+            pgn_path=pgn_path,
+            provider=args.provider,
+            model=args.ollama_model,
+            content_hash="h",
+        )
+        result = run_command("status", conn, args)
+    finally:
+        conn.close()
+
+    text = str(result["text"])
+    assert "Last review time: 2024-01-23 08:55:00 UTC" in text
 
 
 def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monkeypatch, tmp_path) -> None:

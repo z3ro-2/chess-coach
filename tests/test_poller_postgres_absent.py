@@ -384,3 +384,57 @@ def test_polling_debug_logs_suppressed_when_flag_disabled(monkeypatch, tmp_path,
 
     assert created == 0
     assert "[POLL-DEBUG]" not in "\n".join(record.getMessage() for record in caplog.records)
+
+
+def test_retry_failures_flag_processes_seeded_failed_game_once(monkeypatch, tmp_path) -> None:
+    ingest_check_module.close_ingest_db_check()
+    calls = {"process": 0}
+
+    row = {
+        "game_url": "https://www.chess.com/game/live/9001",
+        "pgn": '[Event "Live Chess"]\n[White "logan"]\n[Black "opponent"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+        "end_time": int(time.time()),
+        "time_control": "600",
+        "rated": True,
+        "rules": "chess",
+        "result": "1-0",
+        "white_username": "logan",
+        "black_username": "opponent",
+        "white_rating": 1200,
+        "black_rating": 1190,
+        "player_color": "white",
+    }
+
+    monkeypatch.setattr(
+        chess_review,
+        "load_retry_failure_game_payloads",
+        lambda **_kwargs: [row],
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "fetch_recent_games",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("retry-failures should not call fetch_recent_games")),
+    )
+    monkeypatch.setattr(chess_review, "clear_engine_failed", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "mark_engine_failed", lambda **_kwargs: {"available": False})
+
+    def _process_stub(_conn, _args, game):
+        calls["process"] += 1
+        return tmp_path / "output" / "md" / f"{game.game_url.split('/')[-1]}.md"
+
+    monkeypatch.setattr(chess_review, "process_game", _process_stub)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = True
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = False
+        args.retries = 1
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 1
+    assert calls["process"] == 1

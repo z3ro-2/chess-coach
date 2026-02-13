@@ -331,7 +331,7 @@ def test_player_summary_retry_on_first_format_violation(monkeypatch, tmp_path) -
         summary_context={"date_utc": "2026-02-12", "your_color": "white", "opponent": "opponent", "result": "1-0"},
     )
     assert len(calls) == 2
-    assert "Your previous response violated format. Return ONLY valid JSON matching schema." in calls[1]
+    assert "Your previous output violated format. Output ONLY valid JSON. No commentary. No markdown. No explanation." in calls[1]
     assert "Recovered after retry." in out
 
 

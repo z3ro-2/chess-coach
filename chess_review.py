@@ -54,7 +54,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 import requests
-from analysis_pipeline import LLMFormatViolationError, run_analysis_pipeline
+from analysis_pipeline import (
+    LLMFormatViolationError,
+    get_llm_attempt_counters,
+    reset_llm_attempt_counters,
+    run_analysis_pipeline,
+)
 from engine.payload_schema import (
     ENGINE_PAYLOAD_SCHEMA_VERSION,
     enrich_summary_with_player_fields,
@@ -68,8 +73,13 @@ from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import (
     fetch_player_runtime_snapshot,
+    clear_engine_failed,
+    load_retry_failure_game_payloads,
+    mark_engine_failed,
     mark_engine_failure_notified,
+    mark_review_notified,
     should_notify_engine_failure,
+    should_notify_review_success,
     sync_game_record_and_traits,
 )
 from src.db.schema import ensure_postgres_core_schema
@@ -100,6 +110,10 @@ class TelegramError(RuntimeError):
 
 def _telegram_api_base(bot_token: str) -> str:
     return f"https://api.telegram.org/bot{bot_token.strip()}"
+
+
+def escape_telegram_text(text: str) -> str:
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def send_telegram_document(
@@ -153,6 +167,8 @@ def send_telegram_message(
     chat_id: str,
     timeout: int = DEFAULT_TIMEOUT,
     disable_notification: bool = False,
+    disable_web_page_preview: bool = True,
+    preformatted_html: bool = False,
 ) -> None:
     """Send a plain text message to Telegram via a bot."""
     if not bot_token:
@@ -163,9 +179,9 @@ def send_telegram_message(
     url = _telegram_api_base(bot_token) + "/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": render_summary_for_telegram(str(message or ""))[:4096],
+        "text": (str(message or "") if preformatted_html else render_summary_for_telegram(str(message or "")))[:4096],
         "disable_notification": disable_notification,
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": bool(disable_web_page_preview),
         "parse_mode": "HTML",
     }
     resp = requests.post(url, data=payload, timeout=timeout)
@@ -240,15 +256,38 @@ def _send_engine_failure_telegram_with_retry(*, message: str, args: argparse.Nam
         return False
 
 
-def build_telegram_caption(game: "GameInfo") -> str:
-    """Short caption for the Telegram message."""
-    # Keep it compact and readable.
-    dt = game.end_dt_utc.strftime("%Y-%m-%d %H:%M UTC")
-    who = "White" if game.your_color == "white" else "Black"
+def _extract_llm_diagnostics_from_review_markdown(review_md: str) -> dict[str, Any]:
+    marker = "## LLM Diagnostics"
+    text = str(review_md or "")
+    if marker not in text:
+        return {}
+    tail = text.split(marker, 1)[1]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def build_telegram_success_message(game: "GameInfo") -> str:
+    """Plain-text success message with raw URL as last line for preview."""
+    dt = game.end_dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    who = escape_telegram_text(str(game.your_color or "").strip().lower() or "unknown")
+    opponent = escape_telegram_text(str(game.opponent or ""))
+    result = escape_telegram_text(str(game.result or ""))
+    time_control = escape_telegram_text(str(game.time_control or ""))
     return (
-        f"Chess review ready — {dt}\n"
-        f"You: {who} vs {game.opponent}\n"
-        f"Result: {game.result} | TC: {game.time_control}\n"
+        f"♟ Chess review ready\n"
+        f"{dt}\n\n"
+        f"You: {who} vs {opponent}\n"
+        f"Result: {result} | TC: {time_control}\n"
+        f"\n"
         f"{game.game_url}"
     )
 
@@ -1389,7 +1428,7 @@ def _call_player_summary_json_with_retry(
         )
         retry_user_msg = (
             f"{user_msg}\n\n"
-            "Your previous response violated format. Return ONLY valid JSON matching schema."
+            "Your previous output violated format. Output ONLY valid JSON. No commentary. No markdown. No explanation."
         )
         retry_prompt_hash = prompt_hash(
             system_msg,
@@ -1421,13 +1460,6 @@ def _call_player_summary_json_with_retry(
                 },
             )
         except LLMFormatViolationError:
-            logger.info(
-                "LLM generation diagnostics model_name=%s model_version=%s prompt_hash=%s output_hash=%s",
-                model_name,
-                model_version or "",
-                retry_prompt_hash,
-                retry_output_hash,
-            )
             logger.error(
                 "Player summary format violation persisted after retry; "
                 "format_violation=true retry_attempted=true"
@@ -2151,6 +2183,10 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
             "black_rating": game.black_rating,
             "player_color": game.your_color,
         }
+        mark_engine_failed(
+            player_username=args.username,
+            game_payload=game_payload_for_notify,
+        )
         notify_decision = should_notify_engine_failure(
             player_username=args.username,
             game_payload=game_payload_for_notify,
@@ -2175,22 +2211,49 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         return None
 
     write_text(md_path, review_md)
+    llm_diag = _extract_llm_diagnostics_from_review_markdown(review_md)
+
+    game_payload_for_runtime = {
+        "game_url": game.game_url,
+        "pgn": game.pgn,
+        "end_time": game.end_time,
+        "time_control": game.time_control,
+        "rated": game.rated,
+        "rules": game.rules,
+        "result": game.result,
+        "white_username": game.white_username,
+        "black_username": game.black_username,
+        "white_rating": game.white_rating,
+        "black_rating": game.black_rating,
+        "player_color": game.your_color,
+    }
 
     # Optional: Telegram notification with the generated Markdown attached
+    telegram_notified = False
     if getattr(args, "telegram_bot_token", None) and getattr(args, "telegram_chat_id", None):
-        try:
-            caption = build_telegram_caption(game)
-            send_telegram_document(
-                bot_token=args.telegram_bot_token,
-                chat_id=args.telegram_chat_id,
-                file_path=md_path,
-                caption=caption,
-                timeout=args.timeout,
-                disable_notification=getattr(args, "telegram_disable_notification", False),
-            )
-        except Exception as e:
-            # Do not fail the whole pipeline if Telegram is down/misconfigured.
-            print(f"[warn] Telegram notification failed: {e}", file=sys.stderr)
+        notify_decision = should_notify_review_success(
+            player_username=args.username,
+            game_payload=game_payload_for_runtime,
+        )
+        if bool(notify_decision.get("should_notify", True)):
+            try:
+                send_telegram_message(
+                    build_telegram_success_message(game),
+                    bot_token=args.telegram_bot_token,
+                    chat_id=args.telegram_chat_id,
+                    timeout=args.timeout,
+                    disable_notification=getattr(args, "telegram_disable_notification", False),
+                    disable_web_page_preview=False,
+                    preformatted_html=True,
+                )
+                mark_review_notified(
+                    player_username=args.username,
+                    game_payload=game_payload_for_runtime,
+                )
+                telegram_notified = True
+            except Exception as e:
+                # Do not fail the whole pipeline if Telegram is down/misconfigured.
+                print(f"[warn] Telegram notification failed: {e}", file=sys.stderr)
 
     h = compute_content_hash(game, provider, used_model)
     mark_processed(
@@ -2207,20 +2270,7 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
 
     runtime_sync = sync_game_record_and_traits(
         player_username=args.username,
-        game_payload={
-            "game_url": game.game_url,
-            "pgn": game.pgn,
-            "end_time": game.end_time,
-            "time_control": game.time_control,
-            "rated": game.rated,
-            "rules": game.rules,
-            "result": game.result,
-            "white_username": game.white_username,
-            "black_username": game.black_username,
-            "white_rating": game.white_rating,
-            "black_rating": game.black_rating,
-            "player_color": game.your_color,
-        },
+        game_payload=game_payload_for_runtime,
     )
     if not runtime_sync.get("available"):
         logger.debug("Runtime Postgres sync skipped: %s", runtime_sync.get("reason"))
@@ -2249,6 +2299,17 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
     if args.update_index:
         update_index(args.out)
 
+    success_payload = {
+        "game_id": short_id_from_url(game.game_url),
+        "engine_success": True,
+        "llm_used": bool(llm_diag),
+        "format_violation": bool(llm_diag.get("format_violation", False)),
+        "retry_attempted": bool(llm_diag.get("retry_attempted", False)),
+        "fallback_used": "Deterministic fallback review:" in str(review_md or ""),
+        "telegram_notified": bool(telegram_notified),
+    }
+    logger.info("%s", json.dumps(success_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+
     return md_path
 
 
@@ -2264,6 +2325,48 @@ def _select_backfill_games(args: argparse.Namespace) -> Tuple[List[GameInfo], in
     )
     parsed.sort(key=lambda g: (g.end_time, g.game_url), reverse=True)
     return parsed[:backfill_n], considered_count
+
+
+def _game_info_from_retry_payload(row: Mapping[str, Any], username: str) -> Optional[GameInfo]:
+    game_url = str(row.get("game_url", "") or "").strip()
+    if not game_url:
+        return None
+    pgn = str(row.get("pgn") or row.get("raw_pgn") or row.get("game_pgn") or "").strip()
+    if not pgn:
+        return None
+    try:
+        end_time = int(row.get("end_time", 0) or 0)
+    except Exception:
+        return None
+    if end_time <= 0:
+        return None
+    your_color = str(row.get("player_color", "") or "").strip().lower()
+    white_username = str(row.get("white_username", "") or "")
+    black_username = str(row.get("black_username", "") or "")
+    user_u = _normalize_username(username)
+    if your_color not in {"white", "black"}:
+        if _normalize_username(white_username) == user_u:
+            your_color = "white"
+        elif _normalize_username(black_username) == user_u:
+            your_color = "black"
+        else:
+            return None
+    opponent = black_username if your_color == "white" else white_username
+    return GameInfo(
+        game_url=game_url,
+        pgn=pgn,
+        end_time=end_time,
+        time_control=str(row.get("time_control", "") or ""),
+        rated=bool(row.get("rated", False)),
+        rules=str(row.get("rules", "chess") or "chess"),
+        white_username=white_username,
+        black_username=black_username,
+        white_rating=int(row.get("white_rating")) if row.get("white_rating") is not None else None,
+        black_rating=int(row.get("black_rating")) if row.get("black_rating") is not None else None,
+        result=str(row.get("result", "*") or "*"),
+        your_color=your_color,
+        opponent=opponent,
+    )
 
 
 def run_backfill(conn: sqlite3.Connection, args: argparse.Namespace) -> Dict[str, Any]:
@@ -2345,36 +2448,45 @@ def _print_backfill_summary(result: Mapping[str, Any]) -> None:
 
 
 def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
-    raw_games = fetch_recent_games(args.username, args.lookback_days)
-    _poll_debug("total games fetched from chess.com: %s", int(len(raw_games)))
+    reset_llm_attempt_counters()
+    retry_mode = bool(getattr(args, "retry_failures", False))
+    if retry_mode:
+        logger.info("Retry mode enabled: selecting games where engine_failed=true OR review_notified=false.")
+        rows = load_retry_failure_game_payloads(player_username=args.username, limit=max(1, int(getattr(args, "backfill", 100) or 100)))
+        parsed = [g for g in (_game_info_from_retry_payload(row, args.username) for row in rows) if g is not None]
+        parsed.sort(key=lambda g: g.end_time)
+        _poll_debug("retry-failures candidates loaded: %s", int(len(parsed)))
+    else:
+        raw_games = fetch_recent_games(args.username, args.lookback_days)
+        _poll_debug("total games fetched from chess.com: %s", int(len(raw_games)))
 
-    parsed: List[GameInfo] = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
+        parsed = []
+        cutoff = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
 
-    for rg in raw_games:
-        raw_url = str((rg or {}).get("url", "") or "")
-        raw_end_time = (rg or {}).get("end_time")
-        _poll_debug("fetched game url=%s end_time=%s", raw_url, raw_end_time)
-        gi, parse_skip_reason = _parse_game_with_reason(rg, args.username)
-        if gi is None:
-            _poll_debug("game skipped url=%s reason=%s", raw_url, str(parse_skip_reason or "parse failure"))
-            continue
+        for rg in raw_games:
+            raw_url = str((rg or {}).get("url", "") or "")
+            raw_end_time = (rg or {}).get("end_time")
+            _poll_debug("fetched game url=%s end_time=%s", raw_url, raw_end_time)
+            gi, parse_skip_reason = _parse_game_with_reason(rg, args.username)
+            if gi is None:
+                _poll_debug("game skipped url=%s reason=%s", raw_url, str(parse_skip_reason or "parse failure"))
+                continue
 
-        if args.rules_filter and gi.rules != args.rules_filter:
-            _poll_debug("game skipped url=%s reason=rules_filter mismatch", gi.game_url)
-            continue
+            if args.rules_filter and gi.rules != args.rules_filter:
+                _poll_debug("game skipped url=%s reason=rules_filter mismatch", gi.game_url)
+                continue
 
-        if gi.end_dt_utc < cutoff:
-            _poll_debug("game skipped url=%s reason=outside lookback window", gi.game_url)
-            continue
+            if gi.end_dt_utc < cutoff:
+                _poll_debug("game skipped url=%s reason=outside lookback window", gi.game_url)
+                continue
 
-        parsed.append(gi)
+            parsed.append(gi)
 
     parsed.sort(key=lambda g: g.end_time)
 
     created = 0
     for g in parsed:
-        if is_processed(conn, g.game_url):
+        if (not retry_mode) and is_processed(conn, g.game_url):
             _poll_debug("game skipped url=%s reason=already processed", g.game_url)
             continue
 
@@ -2393,6 +2505,23 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             try:
                 out = process_game(conn, args, g)
                 if out:
+                    clear_engine_failed(
+                        player_username=args.username,
+                        game_payload={
+                            "game_url": g.game_url,
+                            "pgn": g.pgn,
+                            "end_time": g.end_time,
+                            "time_control": g.time_control,
+                            "rated": g.rated,
+                            "rules": g.rules,
+                            "result": g.result,
+                            "white_username": g.white_username,
+                            "black_username": g.black_username,
+                            "white_rating": g.white_rating,
+                            "black_rating": g.black_rating,
+                            "player_color": g.your_color,
+                        },
+                    )
                     print(f"[ok] Wrote: {out}")
                     created += 1
                 else:
@@ -2401,6 +2530,23 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 break
             except Exception as e:
                 last_err = e
+                mark_engine_failed(
+                    player_username=args.username,
+                    game_payload={
+                        "game_url": g.game_url,
+                        "pgn": g.pgn,
+                        "end_time": g.end_time,
+                        "time_control": g.time_control,
+                        "rated": g.rated,
+                        "rules": g.rules,
+                        "result": g.result,
+                        "white_username": g.white_username,
+                        "black_username": g.black_username,
+                        "white_rating": g.white_rating,
+                        "black_rating": g.black_rating,
+                        "player_color": g.your_color,
+                    },
+                )
                 print(
                     f"[warn] attempt {attempt}/{args.retries} failed for {g.game_url}: {e}",
                     file=sys.stderr,
@@ -2409,6 +2555,17 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
         if last_err is not None:
             print(f"[error] Giving up on {g.game_url}: {last_err}", file=sys.stderr)
+
+    counters = get_llm_attempt_counters()
+    total = int(counters.get("llm_total_attempts", 0) or 0)
+    fallback = int(counters.get("llm_fallback_count", 0) or 0)
+    rate = (float(fallback) / float(total)) if total > 0 else 0.0
+    logger.info(
+        "LLM fallback stats llm_fallback_count=%s llm_total_attempts=%s fallback_rate=%.4f",
+        fallback,
+        total,
+        rate,
+    )
 
     return created
 
@@ -2674,6 +2831,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     p.add_argument("--poll-seconds", type=int, default=300, help="Polling interval (seconds)")
     p.add_argument("--once", action="store_true", help="Run one poll cycle then exit")
+    p.add_argument(
+        "--retry-failures",
+        action="store_true",
+        help="Retry games flagged in Postgres where engine_failed=true OR review_notified=false.",
+    )
     p.add_argument(
         "--backfill",
         type=int,

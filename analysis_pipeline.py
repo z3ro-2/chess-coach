@@ -22,6 +22,9 @@ from src.llm_diagnostics import prompt_hash, split_model_name_version, hash_text
 from src.utils.timezone import get_display_timezone
 
 logger = logging.getLogger(__name__)
+_FALLBACK_USAGE_COUNT = 0
+_LLM_FALLBACK_COUNT = 0
+_LLM_TOTAL_ATTEMPTS = 0
 
 
 class LLMFormatViolationError(RuntimeError):
@@ -134,6 +137,7 @@ def run_analysis_pipeline(
         hash_temperature=hash_temperature,
         hash_top_p=hash_top_p,
         hash_max_tokens=hash_max_tokens,
+        game_id=str(getattr(game, "game_url", "") or "unknown"),
         logger=logger,
     )
     review_json["confidence"] = _derive_system_confidence_for_game_review(llm_payload)
@@ -150,7 +154,11 @@ def run_analysis_pipeline(
         except Exception:
             logger.debug("Suggested move validation skipped due to validation error.", exc_info=True)
 
-    review_markdown = _append_llm_diagnostics_markdown(review_markdown, llm_diag)
+    review_markdown = _append_llm_diagnostics_markdown(
+        review_markdown,
+        llm_diag,
+        engine_depth=int(summary.get("engine_depth", 0) or 0) if summary else None,
+    )
     return review_markdown
 
 
@@ -221,8 +229,11 @@ def _call_llm_review_json_with_retry(
     hash_temperature: float,
     hash_top_p: float,
     hash_max_tokens: int,
+    game_id: str,
     logger: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    global _LLM_TOTAL_ATTEMPTS
+    _LLM_TOTAL_ATTEMPTS += 1
     first_prompt_hash = prompt_hash(
         system_template,
         user_prompt,
@@ -257,6 +268,7 @@ def _call_llm_review_json_with_retry(
                 "output_hash": first_output_hash,
                 "format_violation": False,
                 "retry_attempted": False,
+                "fallback_used": False,
             },
         )
     except LLMFormatViolationError as first_exc:
@@ -266,7 +278,7 @@ def _call_llm_review_json_with_retry(
         )
         retry_prompt = (
             f"{user_prompt}\n\n"
-            "Your previous response violated format. Return ONLY valid JSON matching schema."
+            "Your previous output violated format. Output ONLY valid JSON. No commentary. No markdown. No explanation."
         )
         retry_prompt_hash = prompt_hash(
             system_template,
@@ -302,21 +314,16 @@ def _call_llm_review_json_with_retry(
                     "output_hash": retry_output_hash,
                     "format_violation": True,
                     "retry_attempted": True,
+                    "fallback_used": False,
                 },
             )
         except LLMFormatViolationError:
-            logger.info(
-                "LLM generation diagnostics model_name=%s model_version=%s prompt_hash=%s output_hash=%s",
-                model_name,
-                model_version or "",
-                retry_prompt_hash,
-                retry_output_hash,
-            )
             logger.error(
                 "LLM format violation persisted for game review after retry; "
                 "format_violation=true retry_attempted=true"
             )
             payload = _extract_payload_from_user_prompt(user_prompt)
+            _record_fallback_trigger(logger=logger, game_id=game_id)
             return (
                 _deterministic_game_review_fallback_json(payload),
                 {
@@ -326,8 +333,42 @@ def _call_llm_review_json_with_retry(
                     "output_hash": retry_output_hash,
                     "format_violation": True,
                     "retry_attempted": True,
+                    "fallback_used": True,
                 },
             )
+
+
+def _record_fallback_trigger(*, logger: Any, game_id: str) -> None:
+    global _FALLBACK_USAGE_COUNT, _LLM_FALLBACK_COUNT
+    _FALLBACK_USAGE_COUNT += 1
+    _LLM_FALLBACK_COUNT += 1
+    logger.warning(
+        "Deterministic fallback triggered counter=%s game_id=%s",
+        int(_FALLBACK_USAGE_COUNT),
+        str(game_id or "unknown"),
+    )
+
+
+def get_fallback_usage_count() -> int:
+    return int(_FALLBACK_USAGE_COUNT)
+
+
+def reset_fallback_usage_count() -> None:
+    global _FALLBACK_USAGE_COUNT
+    _FALLBACK_USAGE_COUNT = 0
+
+
+def get_llm_attempt_counters() -> dict[str, int]:
+    return {
+        "llm_fallback_count": int(_LLM_FALLBACK_COUNT),
+        "llm_total_attempts": int(_LLM_TOTAL_ATTEMPTS),
+    }
+
+
+def reset_llm_attempt_counters() -> None:
+    global _LLM_FALLBACK_COUNT, _LLM_TOTAL_ATTEMPTS
+    _LLM_FALLBACK_COUNT = 0
+    _LLM_TOTAL_ATTEMPTS = 0
 
 
 def _resolve_model_identity(args: Any) -> tuple[str, Optional[str]]:
@@ -373,7 +414,12 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _append_llm_diagnostics_markdown(markdown_text: str, diagnostics: Mapping[str, Any]) -> str:
+def _append_llm_diagnostics_markdown(
+    markdown_text: str,
+    diagnostics: Mapping[str, Any],
+    *,
+    engine_depth: int | None = None,
+) -> str:
     clean = str(markdown_text or "").rstrip()
     payload = json.dumps(
         {
@@ -386,9 +432,23 @@ def _append_llm_diagnostics_markdown(markdown_text: str, diagnostics: Mapping[st
         },
         sort_keys=True,
         ensure_ascii=True,
-        separators=(",", ":"),
+            separators=(",", ":"),
     )
-    return f"{clean}\n\n## LLM Diagnostics\n{payload}\n"
+    model_name = str(diagnostics.get("model_name", "unknown") or "unknown")
+    model_version = str(diagnostics.get("model_version", "") or "").strip()
+    model_display = model_name if not model_version else f"{model_name}:{model_version}"
+    fallback_used = bool(diagnostics.get("fallback_used", False))
+    retry_attempted = bool(diagnostics.get("retry_attempted", False))
+    depth_text = "unknown" if engine_depth is None else str(int(engine_depth))
+    return (
+        f"{clean}\n\n## LLM Diagnostics\n{payload}\n\n"
+        "## System Info\n"
+        f"Engine depth: {depth_text}\n"
+        f"Model: {model_display}\n"
+        f"Prompt hash: {str(diagnostics.get('prompt_hash', '') or '')}\n"
+        f"Fallback used: {'true' if fallback_used else 'false'}\n"
+        f"Retry attempted: {'true' if retry_attempted else 'false'}\n"
+    )
 
 
 def _derive_system_confidence_for_game_review(llm_payload: Mapping[str, Any]) -> str:

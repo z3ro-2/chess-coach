@@ -66,30 +66,28 @@ def _status_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
     since_last_summary = max(0, processed_count - last_summary_count)
 
     if last_row is None:
-        last_game_text = "none"
+        last_review_time = "none"
     else:
-        game_url = str(last_row[0])
         end_time = int(last_row[1])
-        last_game_text = (
-            f"{datetime.fromtimestamp(end_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} | {game_url}"
-        )
+        last_review_time = datetime.fromtimestamp(end_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     postgres_ok = _postgres_reachable()
-    pending_games = _pending_games_count(conn)
+    sqlite_ok = _sqlite_ok(conn)
     llm_info = _status_llm_info(args, out_dir=Path(args.out))
+    fallback_rate = _llm_fallback_rate_percent()
+    llm_provider = str(get_provider() or getattr(args, "provider", "ollama") or "ollama").strip().lower() or "ollama"
+
     lines = [
-        "Status",
-        f"- Last processed game: {last_game_text}",
-        f"- Games since last summary: {since_last_summary}",
-        f"- Postgres OK: {'yes' if postgres_ok else 'no'}",
-        f"- Pending games count: {pending_games}",
-        f"- LLM model: {llm_info['model']}",
-        f"- LLM temperature: {llm_info['temperature']}",
-        f"- LLM top_p: {llm_info['top_p']}",
-        f"- Last prompt_hash: {llm_info['prompt_hash']}",
-        f"- Last output_hash: {llm_info['output_hash']}",
-        f"- Last generation: {llm_info['last_generation']}",
-        f"- Output directory: {Path(args.out)}",
+        "Engine: OK",
+        f"LLM Provider: {llm_provider}",
+        f"Model: {llm_info['model']}",
+        f"Prompt hash: {llm_info['prompt_hash']}",
+        f"Fallback rate: {fallback_rate:.1f}%",
+        f"Last review time: {last_review_time}",
+        f"Postgres: {'connected' if postgres_ok else 'not connected'}",
+        f"SQLite: {'connected' if sqlite_ok else 'not connected'}",
+        f"Pending games count: {_pending_games_count(conn)}",
+        f"Games since last summary: {since_last_summary}",
     ]
     return {"text": "\n".join(lines), "file": None}
 
@@ -346,3 +344,17 @@ def _load_last_llm_diagnostics(out_dir: Path) -> dict[str, Any]:
         if re.match(r"^[A-Za-z0-9_\\-]+\\s*=", stripped):
             continue
     return {}
+
+
+def _llm_fallback_rate_percent() -> float:
+    try:
+        from analysis_pipeline import get_llm_attempt_counters
+
+        counters = get_llm_attempt_counters()
+        total = int(counters.get("llm_total_attempts", 0) or 0)
+        fallback = int(counters.get("llm_fallback_count", 0) or 0)
+        if total <= 0:
+            return 0.0
+        return (float(fallback) / float(total)) * 100.0
+    except Exception:
+        return 0.0

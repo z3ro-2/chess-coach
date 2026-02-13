@@ -161,6 +161,222 @@ def mark_engine_failure_notified(
         cleanup()
 
 
+def should_notify_review_success(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Check if review-success Telegram notification should be sent."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "should_notify": True}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping review-success notification dedupe: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "should_notify": True}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns or "review_notified" not in game_columns:
+            return {"available": False, "reason": "schema_missing", "should_notify": True}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "should_notify": True}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        row = _fetchone(conn, "SELECT review_notified FROM games WHERE id = %s LIMIT 1", (game_id,))
+        already_notified = bool(row and row.get("review_notified"))
+        conn.commit()
+        if already_notified:
+            return {"available": True, "reason": "already_notified", "should_notify": False}
+        return {"available": True, "reason": "notify_pending", "should_notify": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping review-success notification dedupe due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "should_notify": True}
+    finally:
+        cleanup()
+
+
+def mark_review_notified(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Mark the game row as having sent review-success Telegram notification."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping review-success notification mark: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns or "review_notified" not in game_columns:
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        _execute(conn, "UPDATE games SET review_notified = TRUE WHERE id = %s", (game_id,))
+        conn.commit()
+        return {"available": True, "reason": "marked_notified", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping review-success notification mark due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
+    finally:
+        cleanup()
+
+
+def mark_engine_failed(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Mark game row as engine_failed for retry-failures selection."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping engine_failed mark: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns or "engine_failed" not in game_columns:
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        _execute(conn, "UPDATE games SET engine_failed = TRUE WHERE id = %s", (game_id,))
+        conn.commit()
+        return {"available": True, "reason": "marked_engine_failed", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping engine_failed mark due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
+    finally:
+        cleanup()
+
+
+def clear_engine_failed(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Clear engine_failed after successful processing."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping engine_failed clear: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns or "engine_failed" not in game_columns:
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        _execute(conn, "UPDATE games SET engine_failed = FALSE WHERE id = %s", (game_id,))
+        conn.commit()
+        return {"available": True, "reason": "cleared_engine_failed", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping engine_failed clear due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
+    finally:
+        cleanup()
+
+
+def load_retry_failure_game_payloads(*, player_username: str, limit: int = 200) -> list[dict[str, Any]]:
+    """Load game payloads where engine_failed=true or review_notified=false."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return []
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping retry-failures fetch: DB unavailable.", exc_info=True)
+        return []
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns:
+            return []
+        if "engine_failed" not in game_columns or "review_notified" not in game_columns:
+            return []
+        player_row = _find_player_row(conn, player_username, player_columns)
+        if player_row is None:
+            return []
+        player_id = int(player_row["id"])
+        rows = _fetchall(
+            conn,
+            """
+            SELECT game_url, pgn, raw_pgn, game_pgn, end_time, time_control, rated, rules, result,
+                   white_username, black_username, white_rating, black_rating, player_color
+            FROM games
+            WHERE player_id = %s
+              AND (engine_failed = TRUE OR COALESCE(review_notified, FALSE) = FALSE)
+            ORDER BY end_time DESC, id DESC
+            LIMIT %s
+            """,
+            (player_id, max(1, int(limit))),
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(dict(row))
+        return out
+    except Exception:
+        logger.debug("Skipping retry-failures fetch due to unexpected error.", exc_info=True)
+        return []
+    finally:
+        cleanup()
+
+
 def fetch_player_runtime_snapshot(
     *,
     player_username: str,

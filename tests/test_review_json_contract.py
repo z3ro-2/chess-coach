@@ -307,7 +307,7 @@ def test_run_analysis_pipeline_retries_once_on_format_violation(monkeypatch) -> 
         logger=logging.getLogger("test"),
     )
     assert len(calls) == 2
-    assert "Your previous response violated format. Return ONLY valid JSON matching schema." in calls[1]
+    assert "Your previous output violated format. Output ONLY valid JSON. No commentary. No markdown. No explanation." in calls[1]
     assert "Retry succeeded." in output
 
 
@@ -388,6 +388,63 @@ def test_llm_retry_logic_on_epoch_change(monkeypatch) -> None:
     assert len(calls) == 2
     assert hash_calls["n"] >= 2
     assert "Epoch retry succeeded." in output
+
+
+def test_fallback_counter_increments_when_triggered(monkeypatch) -> None:
+    key_positions = _four_positions()
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary(),
+            "key_positions": key_positions,
+            "all_positions": _trace_for_positions(key_positions),
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: None)
+    pipeline_module.reset_fallback_usage_count()
+    before = pipeline_module.get_fallback_usage_count()
+
+    output = run_analysis_pipeline(
+        game=_Game(),
+        args=SimpleNamespace(enable_engine=True),
+        llm_runner=lambda _sys, _user: "Not JSON output",
+        logger=logging.getLogger("test"),
+    )
+
+    after = pipeline_module.get_fallback_usage_count()
+    assert "Deterministic fallback review:" in output
+    assert after == before + 1
+
+
+def test_two_violations_increment_fallback_counter(monkeypatch) -> None:
+    key_positions = _four_positions()
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_stockfish_oracle",
+        lambda **_kwargs: {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary(),
+            "key_positions": key_positions,
+            "all_positions": _trace_for_positions(key_positions),
+        },
+    )
+    monkeypatch.setattr(pipeline_module, "_board_from_pgn", lambda _pgn_text: None)
+    pipeline_module.reset_llm_attempt_counters()
+    before = pipeline_module.get_llm_attempt_counters()
+
+    output = run_analysis_pipeline(
+        game=_Game(),
+        args=SimpleNamespace(enable_engine=True),
+        llm_runner=lambda _sys, _user: "not-json",
+        logger=logging.getLogger("test"),
+    )
+
+    after = pipeline_module.get_llm_attempt_counters()
+    assert "Deterministic fallback review:" in output
+    assert int(after["llm_total_attempts"]) == int(before["llm_total_attempts"]) + 1
+    assert int(after["llm_fallback_count"]) == int(before["llm_fallback_count"]) + 1
 
 
 def test_structure_drift_two_non_compliant_outputs_trigger_fallback(monkeypatch) -> None:

@@ -1,5 +1,9 @@
 Return raw JSON only.
+Return a single JSON object only.
 Do not output prose outside JSON.
+Do not include any text before or after the JSON object.
+Do not include explanations.
+Do not wrap in markdown.
 Do not wrap output in code fences.
 Do not wrap output in markdown, code fences, prose, or comments.
 Do not include any text outside JSON.
