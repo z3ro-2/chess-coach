@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import chess_review
 from src.commands import run_command
+import json
 
 
 def _args(tmp_path: Path) -> SimpleNamespace:
@@ -73,7 +74,22 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
         user_msg = str(kwargs.get("user_msg", ""))
         calls.append(user_msg)
         if "Format the deterministic player summary." in user_msg:
-            return "# forced summary"
+            return json.dumps(
+                {
+                    "overall_profile": "Stable competitive profile.",
+                    "strengths": ["Keeps pieces active.", "Maintains structure."],
+                    "weaknesses": ["Conversion can be sharper."],
+                    "improvement_priorities": [
+                        "Drill conversion patterns.",
+                        "Review tactical misses.",
+                        "Play structured endgame practice.",
+                    ],
+                    "style_assessment": "Practical and active.",
+                    "confidence": "MEDIUM",
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
         return "# review"
 
     monkeypatch.setattr(chess_review, "call_ollama_generate", _fake_ollama_generate)
@@ -135,7 +151,22 @@ def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monk
 
 def test_summary_command_reports_trait_integrity_warning(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setattr(chess_review, "call_ollama_generate", lambda **_kwargs: "# forced summary")
+    monkeypatch.setattr(
+        chess_review,
+        "call_ollama_generate",
+        lambda **_kwargs: json.dumps(
+            {
+                "overall_profile": "Cautionary profile due to integrity warning.",
+                "strengths": ["Keeps fighting in difficult positions."],
+                "weaknesses": ["Data quality concerns limit reliability."],
+                "improvement_priorities": ["Re-run clean trait window.", "Validate payload integrity.", "Resume training after clean window."],
+                "style_assessment": "Uncertain due to integrity warning.",
+                "confidence": "LOW",
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+    )
 
     def _fake_trait_window_metrics(_conn, _args, *, window_size: int):
         assert window_size == 5
@@ -191,3 +222,47 @@ def test_summary_command_reports_trait_integrity_warning(monkeypatch, tmp_path) 
 
     text = str(result["text"])
     assert "Trait integrity warning: non_good_rate_gt_0_75" in text
+
+
+def test_llm_config_command_uses_env_values(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OLLAMA_URL", "http://localhost:11434")
+    monkeypatch.setenv("OLLAMA_MODEL", "llama3.2:3b")
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.25")
+    monkeypatch.setenv("LLM_TOP_P", "0.85")
+    monkeypatch.setenv("LLM_MAX_TOKENS", "2048")
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        result = run_command("llm-config", conn, _args(tmp_path))
+    finally:
+        conn.close()
+    parsed = json.loads(str(result["text"]))
+    assert parsed == {
+        "LLM_MAX_TOKENS": 2048,
+        "LLM_TEMPERATURE": 0.25,
+        "LLM_TOP_P": 0.85,
+        "OLLAMA_MODEL": "llama3.2:3b",
+        "OLLAMA_URL": "http://localhost:11434",
+    }
+
+
+def test_llm_config_command_shows_defaults_when_env_missing(monkeypatch, tmp_path) -> None:
+    for key in ("OLLAMA_URL", "OLLAMA_MODEL", "LLM_TEMPERATURE", "LLM_TOP_P", "LLM_MAX_TOKENS"):
+        monkeypatch.delenv(key, raising=False)
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        result = run_command("llm-config", conn, _args(tmp_path))
+    finally:
+        conn.close()
+    parsed = json.loads(str(result["text"]))
+    assert parsed == {
+        "LLM_MAX_TOKENS": 1400,
+        "LLM_TEMPERATURE": 0.4,
+        "LLM_TOP_P": 1.0,
+        "OLLAMA_MODEL": "llama3.1:8b",
+        "OLLAMA_URL": "http://127.0.0.1:11434",
+    }
+    assert isinstance(parsed["OLLAMA_URL"], str) and parsed["OLLAMA_URL"].startswith("http")
+    assert isinstance(parsed["OLLAMA_MODEL"], str) and bool(parsed["OLLAMA_MODEL"].strip())
+    assert isinstance(parsed["LLM_TEMPERATURE"], float)
+    assert isinstance(parsed["LLM_TOP_P"], float)
+    assert isinstance(parsed["LLM_MAX_TOKENS"], int)

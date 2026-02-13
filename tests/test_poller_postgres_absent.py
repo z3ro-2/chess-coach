@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from types import SimpleNamespace
 
 import analysis_pipeline as pipeline_module
@@ -177,7 +178,22 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
         user_msg = str(kwargs.get("user_msg", ""))
         calls.append(user_msg)
         if "Format the deterministic player summary." in user_msg:
-            return "# player summary"
+            return json.dumps(
+                {
+                    "overall_profile": "Steady profile with room for tactical cleanup.",
+                    "strengths": ["Finds active plans.", "Maintains practical chances."],
+                    "weaknesses": ["Tactical conversion inconsistencies."],
+                    "improvement_priorities": [
+                        "Daily tactical puzzle block.",
+                        "Post-game blunder review checklist.",
+                        "Conversion drills from winning positions.",
+                    ],
+                    "style_assessment": "Active style with occasional tactical drift.",
+                    "confidence": "MEDIUM",
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
         return "# summary fallback"
 
     monkeypatch.setattr(chess_review, "call_ollama_generate", _fake_ollama_generate)
@@ -211,7 +227,9 @@ def test_player_summary_triggers_every_n_and_does_not_retrigger_after_restart(mo
         assert chess_review.process_game(conn, args, game2) is not None
         summary_path = tmp_path / "output" / "player_summary.md"
         assert summary_path.exists()
-        assert summary_path.read_text(encoding="utf-8").strip() == "# player summary"
+        summary_text = summary_path.read_text(encoding="utf-8")
+        assert "## Snapshot" in summary_text
+        assert "## Training Priority" in summary_text
     finally:
         conn.close()
 

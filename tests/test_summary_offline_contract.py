@@ -200,44 +200,8 @@ def sample_game() -> chess_review.GameInfo:
 
 
 @pytest.fixture
-def strict_template_output() -> str:
-    return """---
-date_utc: 2026-02-12
-your_color: white
-opponent: opponent
-result: 1-0
-win_pct: 50.0
-loss_pct: 25.0
-draw_pct: 25.0
-trait_window_games: 20
-trait_window_moves: 420
-confidence: MEDIUM
-trait_diagnostics: {}
----
-
-## Snapshot
-- Total games: 4
-- Record: 2–1–1
-- Win rate: 50.0%
-- Trait window games: 20
-- Trait window moves analyzed: 420
-- Confidence: MEDIUM
-
-## Engine-Derived Traits
-- Tactical Awareness: 70
-- Material Discipline: 64
-- Conversion Ability: 50
-- Defensive Resilience: 50
-- Blunder Frequency: 96
-
-## Primary Weaknesses
-- Conversion Ability: Lowest deterministic engine-derived score in the rolling window (50/100).
-
-## Training Priority
-- Review each blunder and identify the missed tactical cue.
-- Run daily tactical sets focused on hanging pieces and tactical misses.
-- Add a conversion checklist when up material by +3 or more.
-"""
+def strict_summary_json_output() -> str:
+    return """{"overall_profile":"Disciplined but conversion-limited profile.","strengths":["Tactical awareness remains competitive.","Blunder frequency trend is stable."],"weaknesses":["Conversion Ability: Lowest deterministic engine-derived score in the rolling window (50/100)."],"improvement_priorities":["Review each blunder and identify the missed tactical cue.","Run daily tactical sets focused on hanging pieces and tactical misses.","Add a conversion checklist when up material by +3 or more."],"style_assessment":"Practical style with strong tactical intent but uneven technique.","confidence":"MEDIUM"}"""
 
 
 def test_player_summary_math_correctness_with_fixture(known_recent_meta) -> None:
@@ -294,7 +258,7 @@ def test_llm_output_format_conforms_to_strict_template(
     tmp_path,
     known_recent_meta,
     predictable_key_payloads,
-    strict_template_output,
+    strict_summary_json_output,
 ) -> None:
     set_provider("ollama")
     captured: dict[str, str] = {}
@@ -302,7 +266,7 @@ def test_llm_output_format_conforms_to_strict_template(
     def _fake_ollama_generate(**kwargs):
         captured["system_msg"] = str(kwargs.get("system_msg", ""))
         captured["user_msg"] = str(kwargs.get("user_msg", ""))
-        return strict_template_output
+        return strict_summary_json_output
 
     monkeypatch.setattr(chess_review, "call_ollama_generate", _fake_ollama_generate)
     trait_scores = compute_engine_trait_scores(predictable_key_payloads)
@@ -336,12 +300,13 @@ def test_llm_output_format_conforms_to_strict_template(
         summary_context=summary_context,
     )
 
-    assert out == strict_template_output
+    assert out.startswith("---\n")
     assert "Do not compute, infer, or recompute any metric." in captured["user_msg"]
     assert "Do not do arithmetic, percentages, ranking, or score derivation." in captured["user_msg"]
     assert "trait_window_games" in captured["user_msg"]
     assert "trait_window_moves" in captured["user_msg"]
-    assert "Confidence: <trait_window.confidence>" in captured["user_msg"]
+    assert "Return raw JSON only." in captured["user_msg"]
+    assert "overall_profile" in captured["user_msg"]
     assert "trait_diagnostics" in captured["user_msg"]
     _assert_strict_summary_format(out)
 

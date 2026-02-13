@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import json
 from io import StringIO
 from types import SimpleNamespace
 
@@ -116,6 +117,39 @@ def _four_positions() -> list[dict[str, object]]:
             "best_san": "Nc6",
         },
     ]
+
+
+def _valid_review_json_text() -> str:
+    return json.dumps(
+        {
+            "game_overview": "You missed tactical chances and dropped accuracy in key moments.",
+            "critical_mistakes": [
+                {
+                    "move_number": 1,
+                    "description": "You chose a slower development move.",
+                    "why_it_matters": "It ceded initiative early.",
+                    "improvement_tip": "Prioritize rapid piece development.",
+                },
+                {
+                    "move_number": 2,
+                    "description": "You allowed central tension to favor your opponent.",
+                    "why_it_matters": "It reduced your active options.",
+                    "improvement_tip": "Challenge the center earlier.",
+                },
+            ],
+            "strengths": [
+                "You kept material balance early.",
+                "You played forcing replies in tactical spots.",
+            ],
+            "training_focus": [
+                "Practice opening development principles.",
+                "Review tactical motifs around piece activity.",
+            ],
+            "confidence": "MEDIUM",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 def _trace_positions_for_key_positions(
@@ -403,8 +437,8 @@ def test_main_rejects_disable_engine(monkeypatch) -> None:
 
 def test_strict_prompt_template_contains_required_phrase() -> None:
     template = pipeline_module.load_prompt_file("review_user_strict.md")
-    assert "## Four Critical Positions" in template
-    assert "Exactly 4 critical positions. No more, no fewer." in template
+    assert "Return raw JSON only." in template
+    assert "Required JSON schema" in template
 
 
 def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch) -> None:
@@ -428,7 +462,7 @@ def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch)
     def _llm_runner(system_msg: str, user_msg: str) -> str:
         captured["system"] = system_msg
         captured["user"] = user_msg
-        return "# strict"
+        return _valid_review_json_text()
 
     result = run_analysis_pipeline(
         game=game,
@@ -437,13 +471,61 @@ def test_engine_enabled_uses_prompt_templates_and_includes_best_san(monkeypatch)
         logger=logging.getLogger("test"),
     )
 
-    assert result == "# strict"
-    assert "Do not suggest any move not present in payload." in captured["user"]
+    assert "# Game Review" in result
+    assert "## Critical Mistakes" in result
+    assert "Return raw JSON only." in captured["user"]
     assert '"best_san":"Nf3"' in captured["user"]
+    assert '"distilled_insights":' in captured["user"]
+    assert '"top_3_worst_moves":' in captured["user"]
+    assert '"largest_eval_swing":' in captured["user"]
+    assert '"phase_error_distribution":' in captured["user"]
     assert '"engine_depth":15' in captured["user"]
-    assert '"player_error_rate_per_ply":' in captured["user"]
-    assert '"player_plies_analyzed":' in captured["user"]
+    assert '"player_error_rate_per_ply":' not in captured["user"]
+    assert '"player_label_counts_plies":' not in captured["user"]
     assert '"label_counts_white"' not in captured["user"]
+
+
+def test_distilled_insights_are_correct_and_raw_counts_omitted() -> None:
+    key_positions = _four_positions()
+    llm_payload = build_llm_safe_payload(
+        {
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary_with_side_counts(),
+            "key_positions": key_positions,
+            "all_positions": _trace_positions_for_key_positions(key_positions),
+        },
+        game_context={
+            "date_utc": "2026-02-13",
+            "your_color": "white",
+            "opponent": "opponent",
+            "result": "1-0",
+            "time_control": "600",
+            "rated": True,
+            "rules": "chess",
+            "url": "https://www.chess.com/game/live/123",
+        },
+    )
+    distilled = pipeline_module._to_player_only_prompt_payload(  # type: ignore[attr-defined]
+        llm_payload=llm_payload,
+        engine_output={
+            "schema_version": ENGINE_PAYLOAD_SCHEMA_VERSION,
+            "game_summary": _v2_summary_with_side_counts(),
+            "key_positions": key_positions,
+            "all_positions": _trace_positions_for_key_positions(key_positions),
+        },
+    )
+    insights = distilled["distilled_insights"]
+    assert len(insights["top_3_worst_moves"]) == 2
+    assert insights["largest_eval_swing"]["move_number"] == 1
+    assert insights["largest_eval_swing"]["abs_eval_swing"] == 4.0
+    assert insights["tactical_error_summary"]["by_flag"] == {"hanging_piece": 1, "tactical_miss": 1}
+    assert insights["material_loss_summary"]["material_loss_events"] == 1
+    assert insights["material_loss_summary"]["total_material_loss"] == 3.0
+    assert insights["phase_error_distribution"]["opening"] == 2
+    assert insights["phase_error_distribution"]["middlegame"] == 0
+    assert insights["phase_error_distribution"]["endgame"] == 0
+    assert "game_summary" not in distilled
+    assert "key_positions" not in distilled
 
 
 def test_run_analysis_pipeline_rejects_missing_per_side_fields_before_llm(monkeypatch) -> None:
@@ -546,7 +628,24 @@ def test_engine_mode_rejects_san_not_in_allowed_set(monkeypatch) -> None:
     output = run_analysis_pipeline(
         game=game,
         args=args,
-        llm_runner=lambda _sys, _user: "Play d4, but avoid e4 and consider d5.",
+        llm_runner=lambda _sys, _user: json.dumps(
+            {
+                "game_overview": "Play d4, avoid e4 and consider d5.",
+                "critical_mistakes": [
+                    {
+                        "move_number": 1,
+                        "description": "You chose d4 instead of e4.",
+                        "why_it_matters": "e4 here would be less principled.",
+                        "improvement_tip": "Prefer d4 over e4 in this structure.",
+                    }
+                ],
+                "strengths": ["You found active ideas like Nc3."],
+                "training_focus": ["Reinforce central control with d4 and c4."],
+                "confidence": "LOW",
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
         logger=logging.getLogger("test"),
     )
 
@@ -577,7 +676,7 @@ def test_run_analysis_pipeline_rejects_shuffled_key_positions(monkeypatch) -> No
         run_analysis_pipeline(
             game=game,
             args=args,
-            llm_runner=lambda _system_msg, _user_msg: llm_called.update(value=True) or "unexpected",
+            llm_runner=lambda _system_msg, _user_msg: llm_called.update(value=True) or _valid_review_json_text(),
             logger=logging.getLogger("test"),
         )
     assert llm_called["value"] is False

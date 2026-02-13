@@ -117,39 +117,24 @@ def _render_summary_from_prompt(user_msg: str) -> str:
     trait_scores = json.loads(blocks[2])
     trait_window = json.loads(blocks[3])
 
-    return (
-        "---\n"
-        f"date_utc: {summary_context['date_utc']}\n"
-        f"your_color: {summary_context['your_color']}\n"
-        f"opponent: {summary_context['opponent']}\n"
-        f"result: {summary_context['result']}\n"
-        f"win_pct: {performance['win_pct']}\n"
-        f"loss_pct: {performance['loss_pct']}\n"
-        f"draw_pct: {performance['draw_pct']}\n"
-        f"trait_window_games: {trait_window['trait_window_games']}\n"
-        f"trait_window_moves: {trait_window['trait_window_moves']}\n"
-        f"confidence: {trait_window['confidence']}\n"
-        f"trait_diagnostics: {json.dumps(trait_window.get('trait_diagnostics', {}), ensure_ascii=True, separators=(',', ':'))}\n"
-        "---\n\n"
-        "## Snapshot\n"
-        f"- Total games: {performance['total_games']}\n"
-        f"- Record: {performance['wins']}–{performance['losses']}–{performance['draws']}\n"
-        f"- Win rate: {performance['win_pct']}%\n"
-        f"- Trait window games: {trait_window['trait_window_games']}\n"
-        f"- Trait window moves analyzed: {trait_window['trait_window_moves']}\n"
-        f"- Confidence: {trait_window['confidence']}\n\n"
-        "## Engine-Derived Traits\n"
-        f"- Tactical Awareness: {trait_scores['tactical_awareness']}\n"
-        f"- Material Discipline: {trait_scores['material_discipline']}\n"
-        f"- Conversion Ability: {trait_scores['conversion_ability']}\n"
-        f"- Defensive Resilience: {trait_scores['defensive_resilience']}\n"
-        f"- Blunder Frequency: {trait_scores['blunder_frequency']}\n\n"
-        "## Primary Weaknesses\n"
-        "- Placeholder weakness text.\n\n"
-        "## Training Priority\n"
-        "- Review blunders.\n"
-        "- Drill tactics.\n"
-        "- Practice conversion.\n"
+    return json.dumps(
+        {
+            "overall_profile": "Stable profile with clear tactical development path.",
+            "strengths": [
+                "Engine-derived tactical profile is consistent across the window.",
+                "Blunder frequency remains comparatively controlled.",
+            ],
+            "weaknesses": ["Conversion Ability remains the primary weakness."],
+            "improvement_priorities": [
+                "Review blunders.",
+                "Drill tactics.",
+                "Practice conversion.",
+            ],
+            "style_assessment": "Active style with tactical intent and conversion gaps.",
+            "confidence": str(trait_window["confidence"]),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
     )
 
 

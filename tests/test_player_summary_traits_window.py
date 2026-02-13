@@ -353,6 +353,48 @@ def test_trait_window_metrics_flag_integrity_warning_in_diagnostics(tmp_path) ->
     assert "non_good_rate_gt_0_75" in diagnostics["window_integrity"]["reasons"]
 
 
+def test_system_confidence_low_when_engine_coverage_low() -> None:
+    confidence, reason = chess_review._derive_system_confidence_for_trait_window(
+        total_moves=800,
+        trait_window_games=20,
+        target_window_games=20,
+        aggregate_components={"coverage": 0.60, "guardrails": {"sanity_refusal_applied": False}},
+        integrity_warning=False,
+        integrity_warning_reasons=[],
+        trait_update_refused=False,
+    )
+    assert confidence == "LOW"
+    assert "engine coverage low" in reason
+
+
+def test_system_confidence_low_when_integrity_warning_present() -> None:
+    confidence, reason = chess_review._derive_system_confidence_for_trait_window(
+        total_moves=800,
+        trait_window_games=20,
+        target_window_games=20,
+        aggregate_components={"coverage": 1.0, "guardrails": {"sanity_refusal_applied": False}},
+        integrity_warning=True,
+        integrity_warning_reasons=["non_good_rate_gt_0_75"],
+        trait_update_refused=False,
+    )
+    assert confidence == "LOW"
+    assert "trait window integrity warning" in reason
+
+
+def test_system_confidence_high_with_full_clean_coverage() -> None:
+    confidence, reason = chess_review._derive_system_confidence_for_trait_window(
+        total_moves=800,
+        trait_window_games=20,
+        target_window_games=20,
+        aggregate_components={"coverage": 1.0, "guardrails": {"sanity_refusal_applied": False}},
+        integrity_warning=False,
+        integrity_warning_reasons=[],
+        trait_update_refused=False,
+    )
+    assert confidence == "HIGH"
+    assert reason == ""
+
+
 def test_load_recent_game_reviews_for_traits_has_stable_tiebreak_order(tmp_path) -> None:
     conn = chess_review.init_db(tmp_path / "state.sqlite")
     try:

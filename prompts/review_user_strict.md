@@ -1,89 +1,62 @@
-Return Markdown only.
+Return raw JSON only.
+Do not output prose outside JSON.
+Do not wrap output in code fences.
 
-You are a deterministic chess analysis formatter.
+You are generating a structured chess game review.
 
-You MUST strictly follow the structure below.
-You MUST NOT add, remove, rename, or reorder any headings.
-You MUST NOT include commentary outside the defined sections.
-You MUST NOT include markdown code fences.
-You MUST NOT include explanations outside the allowed fields.
-You MUST NOT invent moves, evaluations, or narrative not present in the payload.
-If required data is missing, write: "Not available in payload."
+You MUST strictly follow the required JSON schema.
+You MUST NOT add extra keys.
+You MUST NOT omit required keys.
+You MUST NOT include null values.
+You MUST NOT include markdown, commentary, or explanation.
+Output must begin with '{' and end with '}'.
 
-Use this exact structure and headings with no additions:
+Required JSON schema (exact keys, exact structure):
 
----
-engine: Stockfish
-engine_depth: &lt;game_summary.engine_depth&gt;
-date_utc: &lt;game_summary.date_utc&gt;
-your_color: &lt;game_summary.your_color&gt;
-opponent: &lt;game_summary.opponent&gt;
-result: &lt;game_summary.result&gt;
-time_control: &lt;game_summary.time_control&gt;
-rated: &lt;game_summary.rated&gt;
-url: &lt;game_summary.url&gt;
----
+{
+  "game_overview": string,
+  "critical_mistakes": [
+    {
+      "move_number": integer,
+      "description": string,
+      "why_it_matters": string,
+      "improvement_tip": string
+    }
+  ],
+  "strengths": [string],
+  "training_focus": [string],
+  "confidence": "LOW" | "MEDIUM" | "HIGH"
+}
 
-# Game Review
+Field Rules:
 
-## Summary
-- Write exactly 3 concise bullet points.
-- Each bullet must be 1 short sentence.
-- Bullets must reflect actual engine findings from payload only.
-- No generic advice.
+- game_overview:
+  2–4 concise sentences summarizing how the game unfolded.
+  Base strictly on engine facts and distilled_insights.
 
-## Four Critical Positions
+- critical_mistakes:
+  Use ONLY moves present in distilled_insights.top_3_worst_moves.
+  If no qualifying mistakes exist, return an empty list [].
+  Do not invent moves.
+  Do not infer unlisted mistakes.
 
-Select exactly 4 positions from payload.key_positions.
-If more than 4 exist, select the 4 most severe by label priority:
-blunder &gt; mistake &gt; inaccuracy &gt; good &gt; brilliant.
-If fewer than 4 exist, use only what exists and fill remaining with:
-Move N/A – Not available in payload.
+- strengths:
+  1–4 short bullet-style strings describing what the player did well.
+  Must be grounded in distilled_insights.
 
-For each position:
+- training_focus:
+  1–4 short actionable training recommendations.
+  Must directly correspond to the mistakes or error patterns shown in distilled_insights.
 
-### 1. Move &lt;move_number&gt; – &lt;player&gt;
-Label: &lt;blunder|mistake|inaccuracy|good|brilliant&gt;
-Played: `&lt;played_san&gt;`
-Engine: `&lt;best_san&gt;`
-Explanation: 1–2 short sentences. Must describe concrete consequence (material loss, mate threat, positional collapse, etc.). No speculation.
+- confidence:
+  Choose one of: LOW, MEDIUM, HIGH.
+  Base it strictly on the quality and completeness of distilled_insights.
 
-### 2. Move &lt;move_number&gt; – &lt;player&gt;
-Label: &lt;blunder|mistake|inaccuracy|good|brilliant&gt;
-Played: `&lt;played_san&gt;`
-Engine: `&lt;best_san&gt;`
-Explanation: 1–2 short sentences.
+Authoritative Data Source:
 
-### 3. Move &lt;move_number&gt; – &lt;player&gt;
-Label: &lt;blunder|mistake|inaccuracy|good|brilliant&gt;
-Played: `&lt;played_san&gt;`
-Engine: `&lt;best_san&gt;`
-Explanation: 1–2 short sentences.
-
-### 4. Move &lt;move_number&gt; – &lt;player&gt;
-Label: &lt;blunder|mistake|inaccuracy|good|brilliant&gt;
-Played: `&lt;played_san&gt;`
-Engine: `&lt;best_san&gt;`
-Explanation: 1–2 short sentences.
-
-## Recurring Tactical Pattern
-- Exactly 1 short paragraph (max 4 sentences).
-- Must reference observed errors in payload (blunders, mate threats, material swings, etc.).
-- No motivational language.
-
-## Training Plan
-- Exactly 3 bullet points.
-- Each bullet must be specific and actionable (e.g., "Practice basic back-rank mate patterns for 15 minutes daily").
-- Must directly connect to recurring tactical pattern.
-- No generic advice like "study more openings".
-
-Hard enforcement rules:
-- Exactly 4 critical position sections.
-- No additional headings.
-- No extra commentary before or after document.
-- Do not invent moves.
-- Do not exceed 2 sentences in any Explanation field.
-- If unsure, default to strict literal interpretation of payload.
+Use distilled_insights as the authoritative source.
+Do not invent facts.
+Do not reference data not present in the payload.
 
 Payload JSON:
 {payload}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,7 @@ def _command_registry() -> dict[str, CommandFn]:
         "summary": _summary_command,
         "stats": _stats_command,
         "health": _health_command,
+        "llm-config": _llm_config_command,
         "help": _help_command,
     }
 
@@ -46,6 +48,7 @@ def _command_descriptions() -> dict[str, str]:
         "summary": "Force-generate player_summary.md and advance summary cadence state.",
         "stats": "Rebuild player_stats.md from current state.",
         "health": "Check SQLite, Postgres, Telegram, and LLM endpoint reachability.",
+        "llm-config": "Print loaded LLM environment configuration as JSON.",
         "help": "List available commands.",
     }
 
@@ -169,6 +172,13 @@ def _health_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         f"- LLM endpoint: {llm_status}",
     ]
     return {"text": "\n".join(lines), "file": None}
+
+
+def _llm_config_command(_conn: sqlite3.Connection, _args: Any) -> CommandResult:
+    import chess_review as app
+
+    cfg = app.get_loaded_llm_config()
+    return {"text": json.dumps(cfg, ensure_ascii=True, sort_keys=True), "file": None}
 
 
 def _help_command(_conn: sqlite3.Connection, _args: Any) -> CommandResult:

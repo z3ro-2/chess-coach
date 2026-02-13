@@ -46,6 +46,7 @@ import sqlite3
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -53,7 +54,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 import requests
-from analysis_pipeline import run_analysis_pipeline
+from analysis_pipeline import LLMFormatViolationError, run_analysis_pipeline
 from engine.payload_schema import (
     ENGINE_PAYLOAD_SCHEMA_VERSION,
     enrich_summary_with_player_fields,
@@ -67,6 +68,7 @@ from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import fetch_player_runtime_snapshot, sync_game_record_and_traits
 from src.db.schema import ensure_postgres_core_schema
+from src.llm_diagnostics import hash_text_sha256, prompt_hash, split_model_name_version
 from src.telegram_commands import poll_telegram_commands
 from src.utils.timezone import get_display_timezone
 
@@ -706,6 +708,45 @@ def _trait_confidence_from_moves(total_moves: int) -> str:
     return "LOW"
 
 
+def _derive_system_confidence_for_trait_window(
+    *,
+    total_moves: int,
+    trait_window_games: int,
+    target_window_games: int,
+    aggregate_components: Mapping[str, Any],
+    integrity_warning: bool,
+    integrity_warning_reasons: Sequence[str],
+    trait_update_refused: bool,
+) -> tuple[str, str]:
+    reasons: List[str] = []
+    coverage_raw = aggregate_components.get("coverage", 1.0)
+    try:
+        coverage = float(coverage_raw)
+    except Exception:
+        coverage = 0.0
+    guardrails = aggregate_components.get("guardrails")
+    guardrails_map = guardrails if isinstance(guardrails, Mapping) else {}
+    sanity_refusal_applied = bool(guardrails_map.get("sanity_refusal_applied", False))
+
+    confidence = _trait_confidence_from_moves(total_moves)
+    if int(trait_window_games) < int(target_window_games):
+        confidence = "LOW"
+        reasons.append(f"insufficient v2 payloads ({int(trait_window_games)}/{int(target_window_games)})")
+    if coverage < 0.95:
+        confidence = "LOW"
+        reasons.append(f"engine coverage low ({coverage:.2f})")
+    if integrity_warning:
+        confidence = "LOW"
+        integrity_note = "trait window integrity warning"
+        if integrity_warning_reasons:
+            integrity_note = f"{integrity_note} ({','.join(integrity_warning_reasons)})"
+        reasons.append(integrity_note)
+    if trait_update_refused or sanity_refusal_applied:
+        confidence = "LOW"
+        reasons.append("sanity refusal applied")
+    return confidence, "; ".join(reasons)
+
+
 def _normalized_trait_scores(raw_scores: Mapping[str, Any]) -> Dict[str, int]:
     assert isinstance(raw_scores, Mapping)
     assert all(key in raw_scores for key in TRAIT_SCORE_KEYS)
@@ -873,31 +914,28 @@ def _compute_trait_scores_and_window_metrics(
             ",".join(integrity_warning_reasons),
             bool(trait_update_refused),
         )
-    confidence = _trait_confidence_from_moves(total_moves)
-    confidence_reason = ""
-    if v2_payload_count < target_window:
-        confidence = "LOW"
-        confidence_reason = f"insufficient v2 payloads ({int(v2_payload_count)}/{int(target_window)})"
+    confidence, confidence_reason = _derive_system_confidence_for_trait_window(
+        total_moves=int(total_moves),
+        trait_window_games=int(v2_payload_count),
+        target_window_games=int(target_window),
+        aggregate_components=aggregate_map if isinstance(aggregate_map, Mapping) else {},
+        integrity_warning=bool(integrity_warning),
+        integrity_warning_reasons=integrity_warning_reasons,
+        trait_update_refused=bool(trait_update_refused),
+    )
+    if int(v2_payload_count) < int(target_window):
         logger.warning(
             "Trait window confidence forced LOW: insufficient v2 payloads (%s/%s).",
             int(v2_payload_count),
             int(target_window),
         )
-    if integrity_warning:
-        confidence = "LOW"
-        integrity_note = "trait window integrity warning"
-        if integrity_warning_reasons:
-            integrity_note = f"{integrity_note} ({','.join(integrity_warning_reasons)})"
-        if confidence_reason:
-            confidence_reason = f"{confidence_reason}; {integrity_note}"
-        else:
-            confidence_reason = integrity_note
     return {
         "scores": dict(normalized_scores),
         "scores_after_clamp": dict(debug_scores_after_clamp) if isinstance(debug_scores_after_clamp, Mapping) else None,
         "trait_window_games": int(v2_payload_count),
         "trait_window_requested_games": int(target_window),
         "trait_window_moves": max(0, int(total_moves)),
+        "system_confidence": str(confidence),
         "confidence": str(confidence),
         "confidence_reason": str(confidence_reason),
         "trait_diagnostics": dict(trait_diagnostics),
@@ -1047,7 +1085,7 @@ def _build_player_summary_prompt(
 ) -> Tuple[str, str]:
     system_msg = (
         "You are a strict chess summary formatter. "
-        "Use only provided JSON values and return Markdown in the exact requested structure."
+        "Use only provided JSON values and return raw JSON only."
     )
     normalized_trait_scores = _normalized_trait_scores(trait_scores)
     summary_context_json = json.dumps(
@@ -1132,58 +1170,307 @@ Authoritative primary_weakness JSON (use exact values):
 ```
 
 Output constraints:
-- Return Markdown only.
-- Use exactly this YAML + section structure and headings.
-- Do not add any headings besides:
-  - `## Snapshot`
-  - `## Engine-Derived Traits`
-  - `## Primary Weaknesses`
-  - `## Training Priority`
+- Return raw JSON only.
+- Do not output prose outside JSON.
+- Do not use code fences in output.
 - Do not compute, infer, or recompute any metric.
 - Do not do arithmetic, percentages, ranking, or score derivation.
-- Copy numeric values exactly from provided JSON.
-- Copy `trait_window.trait_diagnostics` exactly as provided JSON. Do not summarize it.
-
-Use this exact template:
-
----
-date_utc: <summary_context.date_utc>
-your_color: <summary_context.your_color>
-opponent: <summary_context.opponent>
-result: <summary_context.result>
-win_pct: <performance_summary.win_pct>
-loss_pct: <performance_summary.loss_pct>
-draw_pct: <performance_summary.draw_pct>
-trait_window_games: <trait_window.trait_window_games>
-trait_window_moves: <trait_window.trait_window_moves>
-confidence: <trait_window.confidence>
-trait_diagnostics: <trait_window.trait_diagnostics>
----
-
-## Snapshot
-- Total games: <performance_summary.total_games>
-- Record: <performance_summary.wins>–<performance_summary.losses>–<performance_summary.draws>
-- Win rate: <performance_summary.win_pct>%
-- Trait window games: <trait_window.trait_window_games>
-- Trait window moves analyzed: <trait_window.trait_window_moves>
-- Confidence: <trait_window.confidence>
-
-## Engine-Derived Traits
-- Tactical Awareness: <trait_scores.tactical_awareness>
-- Material Discipline: <trait_scores.material_discipline>
-- Conversion Ability: <trait_scores.conversion_ability>
-- Defensive Resilience: <trait_scores.defensive_resilience>
-- Blunder Frequency: <trait_scores.blunder_frequency>
-
-## Primary Weaknesses
-- <primary_weakness.trait_name>: <primary_weakness.reason>
-
-## Training Priority
-- <action 1>
-- <action 2>
-- <action 3>
+- Output must include exactly these top-level keys (no extra keys):
+  - overall_profile: string
+  - strengths: list[string]
+  - weaknesses: list[string]
+  - improvement_priorities: list[string]
+  - style_assessment: string
+  - confidence: one of LOW, MEDIUM, HIGH
 """
     return system_msg, user_msg
+
+
+def validate_player_summary_json(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    required_keys = {
+        "overall_profile",
+        "strengths",
+        "weaknesses",
+        "improvement_priorities",
+        "style_assessment",
+        "confidence",
+    }
+    if set(data.keys()) != required_keys:
+        return False
+    if not isinstance(data.get("overall_profile"), str):
+        return False
+    if not isinstance(data.get("style_assessment"), str):
+        return False
+    confidence = str(data.get("confidence") or "").strip()
+    if confidence not in {"LOW", "MEDIUM", "HIGH"}:
+        return False
+    for key in ("strengths", "weaknesses", "improvement_priorities"):
+        values = data.get(key)
+        if not isinstance(values, list):
+            return False
+        if any(not isinstance(item, str) for item in values):
+            return False
+    return True
+
+
+def _parse_player_summary_json_or_raise(raw_output: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(str(raw_output))
+    except Exception as exc:
+        raise LLMFormatViolationError("Player summary format violation: output is not valid JSON.") from exc
+    if not isinstance(parsed, dict) or not validate_player_summary_json(parsed):
+        raise LLMFormatViolationError("Player summary format violation: JSON schema validation failed.")
+    return dict(parsed)
+
+
+def _deterministic_player_summary_fallback_json(confidence: str, trait_scores: Mapping[str, Any]) -> Dict[str, Any]:
+    safe_confidence = str(confidence or "LOW")
+    if safe_confidence not in {"LOW", "MEDIUM", "HIGH"}:
+        safe_confidence = "LOW"
+    normalized_scores = {
+        key: int(trait_scores.get(key, 0) or 0)
+        for key in TRAIT_SCORE_KEYS
+    }
+    weakest = sorted(TRAIT_SCORE_KEYS, key=lambda key: (normalized_scores[key], key))[:2]
+    strongest = sorted(TRAIT_SCORE_KEYS, key=lambda key: (-normalized_scores[key], key))[:2]
+    trait_titles = {
+        "tactical_awareness": "Tactical Awareness",
+        "material_discipline": "Material Discipline",
+        "conversion_ability": "Conversion Ability",
+        "defensive_resilience": "Defensive Resilience",
+        "blunder_frequency": "Blunder Frequency",
+    }
+    suggestion_by_trait = {
+        "tactical_awareness": "Solve daily tactical motifs with a checks-captures-threats checklist.",
+        "material_discipline": "Review each material loss and label whether it was tactical or strategic.",
+        "conversion_ability": "Practice conversion drills from +2 to +5 advantage positions.",
+        "defensive_resilience": "Run defensive calculation exercises from worse positions.",
+        "blunder_frequency": "Annotate every blunder trigger and create a pre-move blunder checklist.",
+    }
+    return {
+        "overall_profile": (
+            "Deterministic fallback summary from engine traits only. "
+            f"Current weakest traits: {trait_titles[weakest[0]]} and {trait_titles[weakest[1]]}."
+        ),
+        "strengths": [
+            f"{trait_titles[strongest[0]]}: {normalized_scores[strongest[0]]}/100",
+            f"{trait_titles[strongest[1]]}: {normalized_scores[strongest[1]]}/100",
+        ],
+        "weaknesses": [
+            f"{trait_titles[weakest[0]]}: {normalized_scores[weakest[0]]}/100",
+            f"{trait_titles[weakest[1]]}: {normalized_scores[weakest[1]]}/100",
+        ],
+        "improvement_priorities": [
+            suggestion_by_trait[weakest[0]],
+            suggestion_by_trait[weakest[1]],
+        ],
+        "style_assessment": "Deterministic style assessment unavailable; use trait deltas and engine diagnostics.",
+        "confidence": safe_confidence,
+    }
+
+
+def _call_player_summary_json_with_retry(
+    *,
+    llm_caller: Callable[[str, str], str],
+    model_name: str,
+    model_version: Optional[str],
+    hash_temperature: float,
+    hash_top_p: float,
+    hash_max_tokens: int,
+    system_msg: str,
+    user_msg: str,
+    trait_confidence: str,
+    trait_scores: Mapping[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    first_prompt_hash = prompt_hash(
+        system_msg,
+        user_msg,
+        model_name,
+        hash_temperature,
+        hash_top_p,
+        hash_max_tokens,
+    )
+    try:
+        first_output = llm_caller(system_msg, user_msg)
+        first_output_hash = hash_text_sha256(first_output)
+        logger.info(
+            "LLM generation diagnostics model_name=%s model_version=%s prompt_hash=%s output_hash=%s",
+            model_name,
+            model_version or "",
+            first_prompt_hash,
+            first_output_hash,
+        )
+        return (
+            _parse_player_summary_json_or_raise(first_output),
+            {
+                "model_name": model_name,
+                "model_version": model_version,
+                "prompt_hash": first_prompt_hash,
+                "output_hash": first_output_hash,
+                "format_violation": False,
+                "retry_attempted": False,
+            },
+        )
+    except LLMFormatViolationError as first_exc:
+        logger.warning(
+            "Player summary format violation detected; format_violation=true retry_attempted=true error=%s",
+            first_exc,
+        )
+        retry_user_msg = (
+            f"{user_msg}\n\n"
+            "Your previous response violated format. Return ONLY valid JSON matching schema."
+        )
+        retry_prompt_hash = prompt_hash(
+            system_msg,
+            retry_user_msg,
+            model_name,
+            hash_temperature,
+            hash_top_p,
+            hash_max_tokens,
+        )
+        try:
+            retry_output = llm_caller(system_msg, retry_user_msg)
+            retry_output_hash = hash_text_sha256(retry_output)
+            logger.info(
+                "LLM generation diagnostics model_name=%s model_version=%s prompt_hash=%s output_hash=%s",
+                model_name,
+                model_version or "",
+                retry_prompt_hash,
+                retry_output_hash,
+            )
+            return (
+                _parse_player_summary_json_or_raise(retry_output),
+                {
+                    "model_name": model_name,
+                    "model_version": model_version,
+                    "prompt_hash": retry_prompt_hash,
+                    "output_hash": retry_output_hash,
+                    "format_violation": True,
+                    "retry_attempted": True,
+                },
+            )
+        except LLMFormatViolationError:
+            logger.info(
+                "LLM generation diagnostics model_name=%s model_version=%s prompt_hash=%s output_hash=%s",
+                model_name,
+                model_version or "",
+                retry_prompt_hash,
+                retry_output_hash,
+            )
+            logger.error(
+                "Player summary format violation persisted after retry; "
+                "format_violation=true retry_attempted=true"
+            )
+            return (
+                _deterministic_player_summary_fallback_json(trait_confidence, trait_scores),
+                {
+                    "model_name": model_name,
+                    "model_version": model_version,
+                    "prompt_hash": retry_prompt_hash,
+                    "output_hash": retry_output_hash,
+                    "format_violation": True,
+                    "retry_attempted": True,
+                },
+            )
+
+
+def format_player_summary_markdown(validated_json: Mapping[str, Any]) -> str:
+    summary_context = dict(validated_json.get("summary_context") or {})
+    performance_summary = dict(validated_json.get("performance_summary") or {})
+    trait_scores = dict(validated_json.get("trait_scores") or {})
+    trait_window = dict(validated_json.get("trait_window") or {})
+    summary_json = dict(validated_json.get("summary_json") or {})
+    lines: List[str] = [
+        "---",
+        f"date_utc: {str(summary_context.get('date_utc', 'unknown') or 'unknown')}",
+        f"your_color: {str(summary_context.get('your_color', 'unknown') or 'unknown')}",
+        f"opponent: {str(summary_context.get('opponent', 'unknown') or 'unknown')}",
+        f"result: {str(summary_context.get('result', '*') or '*')}",
+        f"win_pct: {float(performance_summary.get('win_pct', 0.0) or 0.0)}",
+        f"loss_pct: {float(performance_summary.get('loss_pct', 0.0) or 0.0)}",
+        f"draw_pct: {float(performance_summary.get('draw_pct', 0.0) or 0.0)}",
+        f"trait_window_games: {int(trait_window.get('trait_window_games', 0) or 0)}",
+        f"trait_window_moves: {int(trait_window.get('trait_window_moves', 0) or 0)}",
+        f"confidence: {str(trait_window.get('confidence', 'LOW') or 'LOW')}",
+        "trait_diagnostics: "
+        + json.dumps(
+            dict(trait_window.get("trait_diagnostics") or {}),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+        "---",
+        "",
+        "## Snapshot",
+        f"- Total games: {int(performance_summary.get('total_games', 0) or 0)}",
+        f"- Record: {int(performance_summary.get('wins', 0) or 0)}–{int(performance_summary.get('losses', 0) or 0)}–{int(performance_summary.get('draws', 0) or 0)}",
+        f"- Win rate: {float(performance_summary.get('win_pct', 0.0) or 0.0)}%",
+        f"- Trait window games: {int(trait_window.get('trait_window_games', 0) or 0)}",
+        f"- Trait window moves analyzed: {int(trait_window.get('trait_window_moves', 0) or 0)}",
+        f"- Confidence: {str(trait_window.get('confidence', 'LOW') or 'LOW')}",
+        f"- Overall profile: {str(summary_json.get('overall_profile', ''))}",
+        f"- Style assessment: {str(summary_json.get('style_assessment', ''))}",
+        "",
+        "## Engine-Derived Traits",
+        f"- Tactical Awareness: {int(trait_scores.get('tactical_awareness', 0) or 0)}",
+        f"- Material Discipline: {int(trait_scores.get('material_discipline', 0) or 0)}",
+        f"- Conversion Ability: {int(trait_scores.get('conversion_ability', 0) or 0)}",
+        f"- Defensive Resilience: {int(trait_scores.get('defensive_resilience', 0) or 0)}",
+        f"- Blunder Frequency: {int(trait_scores.get('blunder_frequency', 0) or 0)}",
+        "",
+        "## Primary Weaknesses",
+    ]
+    weaknesses = summary_json.get("weaknesses") or []
+    if weaknesses:
+        for item in weaknesses:
+            lines.append(f"- {str(item)}")
+    else:
+        lines.append("- None provided.")
+    lines.append("")
+    lines.append("## Training Priority")
+    priorities = summary_json.get("improvement_priorities") or []
+    if priorities:
+        for item in priorities:
+            lines.append(f"- {str(item)}")
+    else:
+        lines.append("- None provided.")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_player_summary_markdown_payload(
+    *,
+    summary_context: Mapping[str, Any],
+    performance_summary: Mapping[str, Any],
+    trait_scores: Mapping[str, Any],
+    trait_window: Mapping[str, Any],
+    summary_json: Mapping[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "summary_context": dict(summary_context or {}),
+        "performance_summary": dict(performance_summary or {}),
+        "trait_scores": dict(trait_scores or {}),
+        "trait_window": dict(trait_window or {}),
+        "summary_json": dict(summary_json or {}),
+    }
+
+
+def _render_player_summary_markdown_from_json(
+    *,
+    summary_context: Mapping[str, Any],
+    performance_summary: Mapping[str, Any],
+    trait_scores: Mapping[str, Any],
+    trait_window: Mapping[str, Any],
+    summary_json: Mapping[str, Any],
+) -> str:
+    payload = _build_player_summary_markdown_payload(
+        summary_context=summary_context,
+        performance_summary=performance_summary,
+        trait_scores=trait_scores,
+        trait_window=trait_window,
+        summary_json=summary_json,
+    )
+    return format_player_summary_markdown(payload)
 
 
 def _generate_player_summary_markdown(
@@ -1222,24 +1509,77 @@ def _generate_player_summary_markdown(
         primary_weakness=primary_weakness,
     )
     provider = get_provider()
+    configured_model = args.gpt_model if provider == "gpt" else args.ollama_model
+    model_name, model_version = split_model_name_version(str(configured_model or ""))
+    if not model_name:
+        model_name = "unknown"
+    if provider == "gpt":
+        hash_temperature = 0.4
+        hash_top_p = 1.0
+        hash_max_tokens = int(getattr(args, "max_tokens", 1400) or 1400)
+    else:
+        loaded_cfg = get_loaded_llm_config()
+        hash_temperature = float(loaded_cfg["LLM_TEMPERATURE"])
+        hash_top_p = float(loaded_cfg["LLM_TOP_P"])
+        hash_max_tokens = int(loaded_cfg["LLM_MAX_TOKENS"])
     if provider == "gpt":
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not set but --provider gpt was selected.")
-        return call_openai_chat(
-            api_key=api_key,
-            model=args.gpt_model,
+        summary_json, llm_diag = _call_player_summary_json_with_retry(
+            llm_caller=lambda sys_msg, usr_msg: call_openai_chat(
+                api_key=api_key,
+                model=args.gpt_model,
+                system_msg=sys_msg,
+                user_msg=usr_msg,
+                timeout=args.timeout,
+                max_tokens=args.max_tokens,
+            ),
+            model_name=model_name,
+            model_version=model_version,
+            hash_temperature=hash_temperature,
+            hash_top_p=hash_top_p,
+            hash_max_tokens=hash_max_tokens,
             system_msg=system_msg,
             user_msg=user_msg,
-            timeout=args.timeout,
-            max_tokens=args.max_tokens,
+            trait_confidence=trait_confidence,
+            trait_scores=trait_scores,
         )
-    return call_ollama_generate(
-        base_url=args.ollama_url,
-        model=args.ollama_model,
-        system_msg=system_msg,
-        user_msg=user_msg,
-        timeout=args.timeout,
+    else:
+        summary_json, llm_diag = _call_player_summary_json_with_retry(
+            llm_caller=lambda sys_msg, usr_msg: call_ollama_generate(
+                base_url=args.ollama_url,
+                model=args.ollama_model,
+                system_msg=sys_msg,
+                user_msg=usr_msg,
+                timeout=args.timeout,
+            ),
+            model_name=model_name,
+            model_version=model_version,
+            hash_temperature=hash_temperature,
+            hash_top_p=hash_top_p,
+            hash_max_tokens=hash_max_tokens,
+            system_msg=system_msg,
+            user_msg=user_msg,
+            trait_confidence=trait_confidence,
+            trait_scores=trait_scores,
+        )
+    trait_window = dict(trait_window)
+    trait_window["trait_diagnostics"] = dict(trait_window.get("trait_diagnostics") or {})
+    trait_window["trait_diagnostics"]["llm_diagnostics"] = {
+        "model_name": str(llm_diag.get("model_name", "unknown") or "unknown"),
+        "model_version": llm_diag.get("model_version"),
+        "prompt_hash": str(llm_diag.get("prompt_hash", "") or ""),
+        "output_hash": str(llm_diag.get("output_hash", "") or ""),
+        "format_violation": bool(llm_diag.get("format_violation", False)),
+        "retry_attempted": bool(llm_diag.get("retry_attempted", False)),
+    }
+    return _render_player_summary_markdown_from_json(
+        summary_context=summary_context,
+        performance_summary=performance_summary,
+        trait_scores=trait_scores,
+        trait_window=trait_window,
+        summary_json=summary_json,
     )
 
 
@@ -1503,6 +1843,10 @@ class LLMError(RuntimeError):
     pass
 
 
+class ConfigError(RuntimeError):
+    pass
+
+
 def call_openai_chat(
     api_key: str,
     model: str,
@@ -1547,13 +1891,54 @@ def call_ollama_generate(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
     """Ollama /api/generate call (non-streaming)."""
+    _ = model
+    loaded = get_loaded_llm_config()
+    try:
+        ollama_model = str(loaded["OLLAMA_MODEL"])
+        temperature = loaded["LLM_TEMPERATURE"]
+        top_p = loaded["LLM_TOP_P"]
+        num_predict = loaded["LLM_MAX_TOKENS"]
+    except Exception as exc:
+        raise ConfigError("Missing required Ollama runtime config values.") from exc
+    if not isinstance(ollama_model, str) or not ollama_model.strip():
+        raise ConfigError("OLLAMA_MODEL must be a non-empty string.")
+    if not isinstance(temperature, float):
+        raise ConfigError("LLM_TEMPERATURE must be a float.")
+    if not isinstance(top_p, float):
+        raise ConfigError("LLM_TOP_P must be a float.")
+    if not isinstance(num_predict, int):
+        raise ConfigError("LLM_MAX_TOKENS must be an int.")
+
+    logger.info(
+        "[LLM-AUDIT] %s",
+        json.dumps(
+            {
+                "ollama_url": str(loaded["OLLAMA_URL"]),
+                "ollama_model": str(ollama_model),
+                "temperature": float(temperature),
+                "top_p": float(top_p),
+                "max_tokens": int(num_predict),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
     url = base_url.rstrip("/") + "/api/generate"
     headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
 
     # Some Ollama models support system prompts via the prompt itself; keep it simple.
     prompt = f"{system_msg}\n\n{user_msg}"
 
-    payload = {"model": model, "prompt": prompt, "stream": False}
+    payload = {
+        "model": ollama_model,
+        "prompt": prompt,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "num_predict": int(num_predict),
+        "stream": False,
+    }
     resp = requests.post(
         url,
         headers=headers,
@@ -1929,6 +2314,57 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def get_loaded_llm_config() -> Dict[str, Any]:
+    def _load_float(name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return float(default)
+        try:
+            return float(raw)
+        except Exception as exc:
+            raise ConfigError(f"{name} must be a float.") from exc
+
+    def _load_int(name: str, default: int) -> int:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return int(default)
+        try:
+            return int(raw)
+        except Exception as exc:
+            raise ConfigError(f"{name} must be an int.") from exc
+
+    config: Dict[str, Any] = {
+        "OLLAMA_URL": str(os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").strip(),
+        "OLLAMA_MODEL": str(os.environ.get("OLLAMA_MODEL", "llama3.1:8b") or "llama3.1:8b").strip(),
+        "LLM_TEMPERATURE": _load_float("LLM_TEMPERATURE", 0.4),
+        "LLM_TOP_P": _load_float("LLM_TOP_P", 1.0),
+        "LLM_MAX_TOKENS": _load_int("LLM_MAX_TOKENS", 1400),
+    }
+
+    parsed = urlparse(config["OLLAMA_URL"])
+    if not parsed.scheme or not parsed.netloc:
+        raise ConfigError("OLLAMA_URL must be a valid URL.")
+    if not isinstance(config["OLLAMA_MODEL"], str) or not config["OLLAMA_MODEL"].strip():
+        raise ConfigError("OLLAMA_MODEL must be a non-empty string.")
+    if not isinstance(config["LLM_TEMPERATURE"], float):
+        raise ConfigError("LLM_TEMPERATURE must be a float.")
+    if not isinstance(config["LLM_TOP_P"], float):
+        raise ConfigError("LLM_TOP_P must be a float.")
+    if not isinstance(config["LLM_MAX_TOKENS"], int):
+        raise ConfigError("LLM_MAX_TOKENS must be an int.")
+    return config
 
 
 def _call_selected_llm_backend(*, args: argparse.Namespace, system_msg: str, user_msg: str) -> str:
