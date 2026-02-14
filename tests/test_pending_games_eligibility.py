@@ -200,3 +200,56 @@ def test_poll_env_config_changes_eligibility(monkeypatch) -> None:
     out = runtime_updates.get_pending_games_for_processing(limit=10)
 
     assert [row["game_url"] for row in out] == ["https://www.chess.com/game/live/attempt-three"]
+
+
+def test_get_pending_games_for_processing_respects_limit(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    rows = [
+        _base_row(game_url=f"https://www.chess.com/game/live/{idx}", played_at=now - timedelta(minutes=idx))
+        for idx in range(1, 7)
+    ]
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("POLL_COOLDOWN_SECONDS", "600")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(runtime_updates, "_table_columns", lambda _conn, _table: _required_game_columns())
+    monkeypatch.setattr(runtime_updates, "_fetchall", lambda _conn, _query, _params=(): list(rows))
+
+    out = runtime_updates.get_pending_games_for_processing(limit=3)
+
+    assert len(out) == 3
+
+
+def test_get_pending_games_for_processing_orders_by_played_at_then_created_at(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    same_played = now - timedelta(hours=1)
+    first_created = _base_row(game_url="https://www.chess.com/game/live/created-first", played_at=same_played)
+    first_created["created_at"] = now - timedelta(hours=2)
+    second_created = _base_row(game_url="https://www.chess.com/game/live/created-second", played_at=same_played)
+    second_created["created_at"] = now - timedelta(hours=1, minutes=30)
+    older_played = _base_row(game_url="https://www.chess.com/game/live/played-oldest", played_at=now - timedelta(hours=2))
+    older_played["created_at"] = now - timedelta(hours=2, minutes=10)
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("POLL_COOLDOWN_SECONDS", "600")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, _table: _required_game_columns() | {"created_at"},
+    )
+    monkeypatch.setattr(
+        runtime_updates,
+        "_fetchall",
+        lambda _conn, _query, _params=(): [second_created, older_played, first_created],
+    )
+
+    out = runtime_updates.get_pending_games_for_processing(limit=10)
+
+    assert [row["game_url"] for row in out] == [
+        "https://www.chess.com/game/live/played-oldest",
+        "https://www.chess.com/game/live/created-first",
+        "https://www.chess.com/game/live/created-second",
+    ]

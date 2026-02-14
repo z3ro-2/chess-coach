@@ -68,12 +68,12 @@ from engine.payload_schema import (
 from src.commands import list_command_names, run_command
 from src.config.provider_config import get_provider, set_provider
 from src.config.output_paths import get_output_root
+from src.db.eligibility import eligibility_rejection_reasons, is_game_eligible_for_processing
 from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import (
     cleanup_completed_games,
-    consume_success_notification_once,
     fetch_player_runtime_snapshot,
     clear_engine_failed,
     get_pending_games_for_processing,
@@ -81,6 +81,7 @@ from src.db.runtime_updates import (
     load_games_missing_pgn,
     load_retry_failure_game_payloads,
     mark_review_success_flags,
+    should_notify_review_success,
     record_game_attempt,
     mark_engine_failed,
     mark_engine_failure_notified,
@@ -336,13 +337,16 @@ def run_telegram_smoketest(args: argparse.Namespace) -> int:
 
 def run_queue_inspector(args: argparse.Namespace) -> int:
     diag = get_pending_games_for_processing_diagnostics(limit=10)
+    blocked_by_flags = int(diag.get("excluded_by_success_notified", 0) or 0) + int(
+        diag.get("excluded_by_engine_failed", 0) or 0
+    )
     print("Queue Inspector:")
-    print(f"- Total games in DB: {int(diag.get('total_games_in_db', 0) or 0)}")
-    print(f"- Total pending (success_notified = FALSE): {int(diag.get('total_pending_success_notified_false', 0) or 0)}")
-    print(f"- Total eligible: {int(diag.get('eligible_now', 0) or 0)}")
-    print(f"- Blocked by cooldown: {int(diag.get('excluded_by_cooldown', 0) or 0)}")
-    print(f"- Blocked by attempt cap: {int(diag.get('excluded_by_attempt_cap', 0) or 0)}")
-    print(f"- Blocked by engine_failed: {int(diag.get('excluded_by_engine_failed', 0) or 0)}")
+    print(f"- total_games: {int(diag.get('total_games_in_db', 0) or 0)}")
+    print(f"- pending_total: {int(diag.get('pending_total', 0) or 0)}")
+    print(f"- eligible_now: {int(diag.get('eligible_now', 0) or 0)}")
+    print(f"- blocked_by_cooldown: {int(diag.get('excluded_by_cooldown', 0) or 0)}")
+    print(f"- blocked_by_attempt_cap: {int(diag.get('excluded_by_attempt_cap', 0) or 0)}")
+    print(f"- blocked_by_flags: {blocked_by_flags}")
     print("- Top 10 pending rows:")
     rows = list(diag.get("top_newest_pending") or [])
     if not rows:
@@ -2254,11 +2258,17 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         "black_rating": game.black_rating,
         "player_color": game.your_color,
     }
-    record_game_attempt(
+    attempt_result = record_game_attempt(
         player_username=args.username,
         game_payload=game_payload_for_runtime,
         last_error=None,
     )
+    if not bool(attempt_result.get("updated", False)):
+        logger.warning(
+            "Attempt tracking update unavailable before analysis for %s (reason=%s)",
+            game.game_url,
+            str(attempt_result.get("reason", "unknown")),
+        )
 
     provider = get_provider()
     used_model = args.ollama_model if provider == "ollama" else args.gpt_model
@@ -2307,12 +2317,16 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
 
     # Optional: Telegram notification with the generated Markdown attached
     telegram_notified = False
+    should_mark_success_flags = True
     if getattr(args, "telegram_bot_token", None) and getattr(args, "telegram_chat_id", None):
-        notify_decision = consume_success_notification_once(
+        notify_decision = should_notify_review_success(
             player_username=args.username,
             game_payload=game_payload_for_runtime,
         )
-        if bool(notify_decision.get("should_notify", True)):
+        should_notify_success = bool(notify_decision.get("should_notify", True))
+        if not should_notify_success:
+            should_mark_success_flags = False
+        if should_notify_success:
             try:
                 send_telegram_message(
                     game.game_url,
@@ -2344,11 +2358,13 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
             except Exception as e:
                 # Do not fail the whole pipeline if Telegram is down/misconfigured.
                 print(f"[warn] Telegram notification failed: {e}", file=sys.stderr)
+                should_mark_success_flags = False
 
-    mark_review_success_flags(
-        player_username=args.username,
-        game_payload=game_payload_for_runtime,
-    )
+    if should_mark_success_flags:
+        mark_review_success_flags(
+            player_username=args.username,
+            game_payload=game_payload_for_runtime,
+        )
 
     h = compute_content_hash(game, provider, used_model)
     mark_processed(
@@ -2548,7 +2564,7 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     max_attempts = max(1, int(getattr(args, "attempt_backoff_max_attempts", 5) or 5))
     window_hours = max(1, int(getattr(args, "attempt_backoff_window_hours", 6) or 6))
     ignore_backoff = bool(getattr(args, "ignore_attempt_backoff", False))
-    pending_limit = max(1, int(getattr(args, "backfill", 100) or 100))
+    pending_limit = max(1, int(_env_int("POLL_BATCH_SIZE", 5)))
     cleanup_result = cleanup_completed_games(player_username=args.username)
     _poll_debug(
         "queue cleanup reason=%s marked_count=%s",
@@ -2556,6 +2572,24 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         int(cleanup_result.get("marked_count", 0) or 0),
     )
     pending_diag = get_pending_games_for_processing_diagnostics(limit=pending_limit)
+    pending_total = int(pending_diag.get("pending_total", 0) or 0)
+    eligible_now = int(pending_diag.get("eligible_now", 0) or 0)
+    excluded_by_success_notified = int(pending_diag.get("excluded_by_success_notified", 0) or 0)
+    excluded_by_engine_failed = int(pending_diag.get("excluded_by_engine_failed", 0) or 0)
+    excluded_by_attempt_cap = int(pending_diag.get("excluded_by_attempt_cap", 0) or 0)
+    excluded_by_cooldown = int(pending_diag.get("excluded_by_cooldown", 0) or 0)
+    logger.info(
+        (
+            "Queue cycle pending_total=%s eligible_now=%s skipped_by_success_notified=%s "
+            "skipped_by_engine_failed=%s skipped_by_attempt_cap=%s skipped_by_cooldown=%s"
+        ),
+        pending_total,
+        eligible_now,
+        excluded_by_success_notified,
+        excluded_by_engine_failed,
+        excluded_by_attempt_cap,
+        excluded_by_cooldown,
+    )
     _queue_debug(
         (
             "pending_total=%s eligible_now=%s excluded_by_success_notified=%s "
@@ -2607,8 +2641,12 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 str(item.get("last_attempt_at", "") or ""),
             )
 
-    pending_rows = get_pending_games_for_processing(limit=pending_limit)
+    pending_rows = list(pending_diag.get("eligible_rows") or [])
+    if not pending_rows:
+        pending_rows = get_pending_games_for_processing(limit=pending_limit)
+    force_progress_candidate_url = str((pending_rows[0] or {}).get("game_url", "") or "") if pending_rows else ""
 
+    candidate_meta_by_url: dict[str, Mapping[str, Any]] = {}
     if retry_mode:
         logger.info("Retry mode enabled: selecting pending games from centralized eligibility helper.")
         rows = list(pending_rows)
@@ -2627,6 +2665,12 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             rows.append(row)
             if row_url:
                 seen_retry_urls.add(row_url)
+        for idx, row in enumerate(rows):
+            row_url = str((row or {}).get("game_url", "") or "")
+            if row_url:
+                row_meta = dict(row)
+                row_meta["__queue_order"] = idx
+                candidate_meta_by_url[row_url] = row_meta
         parsed = [g for g in (_game_info_from_retry_payload(row, args.username) for row in rows) if g is not None]
         parsed.sort(key=lambda g: g.end_time)
         _poll_debug("retry-failures candidates loaded: %s", int(len(parsed)))
@@ -2641,6 +2685,12 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         parsed = list(pending_parsed)
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
         seen_urls = {g.game_url for g in pending_parsed}
+        for idx, row in enumerate(pending_rows):
+            row_url = str((row or {}).get("game_url", "") or "")
+            if row_url:
+                row_meta = dict(row)
+                row_meta["__queue_order"] = idx
+                candidate_meta_by_url[row_url] = row_meta
 
         for rg in raw_games:
             raw_url = str((rg or {}).get("url", "") or "")
@@ -2664,10 +2714,37 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             parsed.append(gi)
             seen_urls.add(gi.game_url)
 
-    parsed.sort(key=lambda g: g.end_time)
+    def _poll_order_key(game: GameInfo) -> tuple[int, int]:
+        meta = candidate_meta_by_url.get(game.game_url)
+        if isinstance(meta, Mapping) and "__queue_order" in meta:
+            return (0, int(meta.get("__queue_order", 0) or 0))
+        return (1, int(game.end_time))
 
+    parsed.sort(key=_poll_order_key)
+    parsed = parsed[:pending_limit]
+
+    cooldown_seconds = max(
+        0,
+        int(_env_int("POLL_COOLDOWN_SECONDS", _env_int("ATTEMPT_COOLDOWN_SECONDS", 600))),
+    )
+    cycle_skipped_counts: dict[str, int] = {
+        "eligibility_filter": 0,
+        "already_processed": 0,
+        "attempt_backoff": 0,
+        "unsupported_time_control": 0,
+        "integrity_exclusion": 0,
+    }
+    force_progress_attempted = False
     created = 0
     for g in parsed:
+        force_progress_for_game = bool(
+            force_progress_candidate_url
+            and not force_progress_attempted
+            and str(g.game_url) == force_progress_candidate_url
+        )
+        if force_progress_for_game:
+            force_progress_attempted = True
+
         game_payload = {
             "game_url": g.game_url,
             "pgn": g.pgn,
@@ -2683,8 +2760,46 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             "player_color": g.your_color,
         }
         if (not retry_mode) and is_processed(conn, g.game_url):
-            _poll_debug("game skipped url=%s reason=already processed", g.game_url)
-            continue
+            if force_progress_for_game:
+                _poll_debug("force-progress override url=%s check=already_processed", g.game_url)
+            else:
+                _poll_debug("game skipped url=%s reason=already processed", g.game_url)
+                cycle_skipped_counts["already_processed"] += 1
+                continue
+
+        now_utc = datetime.now(timezone.utc)
+        eligibility_row: dict[str, Any] = dict(candidate_meta_by_url.get(g.game_url, {}))
+        eligibility_row.update(game_payload)
+        reasons = eligibility_rejection_reasons(
+            eligibility_row,
+            now=now_utc,
+            max_attempts=max_attempts,
+            cooldown_seconds=cooldown_seconds,
+        )
+        if not is_game_eligible_for_processing(
+            eligibility_row,
+            now=now_utc,
+            max_attempts=max_attempts,
+            cooldown_seconds=cooldown_seconds,
+        ):
+            if force_progress_for_game:
+                _poll_debug("force-progress override url=%s check=eligibility_filter", g.game_url)
+            else:
+                _poll_debug("game skipped url=%s reason=eligibility_filter", g.game_url)
+                _queue_debug(
+                    (
+                        "game_skip url=%s success_notified=%s engine_failed=%s "
+                        "cooldown_active=%s attempt_cap=%s missing_pgn=%s"
+                    ),
+                    g.game_url,
+                    bool(reasons.get("success_notified", False)),
+                    bool(reasons.get("engine_failed", False)),
+                    bool(reasons.get("cooldown_active", False)),
+                    bool(reasons.get("attempt_cap", False)),
+                    bool(reasons.get("missing_pgn", False)),
+                )
+                cycle_skipped_counts["eligibility_filter"] += 1
+                continue
 
         backoff_state = should_skip_game_due_to_attempt_backoff(
             player_username=args.username,
@@ -2694,18 +2809,26 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             ignore_backoff=ignore_backoff,
         )
         if bool(backoff_state.get("skip", False)):
-            _poll_debug(
-                "game skipped url=%s reason=attempt_backoff attempt_count=%s max=%s window_hours=%s",
-                g.game_url,
-                int(backoff_state.get("attempt_count", 0) or 0),
-                max_attempts,
-                window_hours,
-            )
-            continue
+            if force_progress_for_game:
+                _poll_debug("force-progress override url=%s check=attempt_backoff", g.game_url)
+            else:
+                _poll_debug(
+                    "game skipped url=%s reason=attempt_backoff attempt_count=%s max=%s window_hours=%s",
+                    g.game_url,
+                    int(backoff_state.get("attempt_count", 0) or 0),
+                    max_attempts,
+                    window_hours,
+                )
+                cycle_skipped_counts["attempt_backoff"] += 1
+                continue
 
         if not str(g.time_control or "").strip():
-            _poll_debug("game skipped url=%s reason=unsupported time control", g.game_url)
-            continue
+            if force_progress_for_game:
+                _poll_debug("force-progress override url=%s check=unsupported_time_control", g.game_url)
+            else:
+                _poll_debug("game skipped url=%s reason=unsupported time control", g.game_url)
+                cycle_skipped_counts["unsupported_time_control"] += 1
+                continue
 
         _poll_debug("Game selected for processing: %s", g.game_url)
         if args.dry_run:
@@ -2726,6 +2849,7 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                     created += 1
                 else:
                     _poll_debug("game skipped url=%s reason=integrity exclusion", g.game_url)
+                    cycle_skipped_counts["integrity_exclusion"] += 1
                 last_err = None
                 break
             except Exception as e:
@@ -2738,7 +2862,7 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                     f"[warn] attempt {attempt}/{args.retries} failed for {g.game_url}: {e}",
                     file=sys.stderr,
                 )
-                time.sleep(min(3 * attempt, 12))
+                _sleep(min(3 * attempt, 12))
 
         if last_err is not None:
             print(f"[error] Giving up on {g.game_url}: {last_err}", file=sys.stderr)
@@ -2752,6 +2876,17 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         fallback,
         total,
         rate,
+    )
+    logger.info(
+        (
+            "Poll cycle skips eligibility_filter=%s already_processed=%s attempt_backoff=%s "
+            "unsupported_time_control=%s integrity_exclusion=%s"
+        ),
+        int(cycle_skipped_counts["eligibility_filter"]),
+        int(cycle_skipped_counts["already_processed"]),
+        int(cycle_skipped_counts["attempt_backoff"]),
+        int(cycle_skipped_counts["unsupported_time_control"]),
+        int(cycle_skipped_counts["integrity_exclusion"]),
     )
 
     return created
@@ -2806,6 +2941,10 @@ def _queue_debug(msg: str, *args: Any) -> None:
     if not _queue_debug_enabled():
         return
     logger.info("[QUEUE-DEBUG] " + msg, *args)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
 
 
 def _repair_missing_pgn_rows_from_raw_games(
@@ -3303,20 +3442,30 @@ def main() -> int:
             poll_once(conn, args)
             return 0
 
+        process_on_startup = _env_bool("PROCESS_ON_STARTUP", True)
+        next_sleep_s = int(args.poll_seconds)
+        if process_on_startup:
+            _sync_runtime_provider(args)
+            startup_created = poll_once(conn, args)
+            logger.info("Startup backlog pass complete: created=%d", startup_created)
+            next_sleep_s = 20 if startup_created > 0 else int(args.poll_seconds)
+        else:
+            logger.info("Startup backlog pass disabled (PROCESS_ON_STARTUP=0).")
+            next_sleep_s = int(args.poll_seconds)
+
         while True:
             try:
+                _sleep(next_sleep_s)
                 _sync_runtime_provider(args)
                 created = poll_once(conn, args)
                 logger.info("Poll cycle complete: created=%d", created)
                 # if we just created output, poll quickly once more (sometimes games arrive slightly delayed)
-                sleep_s = 20 if created > 0 else args.poll_seconds
+                next_sleep_s = 20 if created > 0 else int(args.poll_seconds)
             except KeyboardInterrupt:
                 return 0
             except Exception as e:
                 print(f"[error] poll cycle failed: {e}", file=sys.stderr)
-                sleep_s = min(args.poll_seconds, 120)
-
-            time.sleep(sleep_s)
+                next_sleep_s = min(int(args.poll_seconds), 120)
     finally:
         telegram_stop_event.set()
         if telegram_thread is not None:

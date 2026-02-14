@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, Mapping
 
+from src.db.eligibility import is_game_eligible_for_processing
 from src.db._pg_utils import _connect_db, _execute, _fetchall, _fetchone, _table_columns
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,10 @@ def should_notify_review_success(
     player_username: str,
     game_payload: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Check if review-success Telegram notification should be sent."""
+    """Check if review-success Telegram notification should be sent.
+
+    Notification gate is keyed on ``success_notified``.
+    """
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not _is_postgres_url(database_url):
         return {"available": False, "reason": "no_database_url", "should_notify": True}
@@ -180,7 +184,7 @@ def should_notify_review_success(
     try:
         player_columns = _table_columns(conn, "players")
         game_columns = _table_columns(conn, "games")
-        if not player_columns or not game_columns or "review_notified" not in game_columns:
+        if not player_columns or not game_columns or "success_notified" not in game_columns:
             return {"available": False, "reason": "schema_missing", "should_notify": True}
 
         player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
@@ -189,8 +193,8 @@ def should_notify_review_success(
             return {"available": False, "reason": "player_unresolved", "should_notify": True}
 
         game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
-        row = _fetchone(conn, "SELECT review_notified FROM games WHERE id = %s LIMIT 1", (game_id,))
-        already_notified = bool(row and row.get("review_notified"))
+        row = _fetchone(conn, "SELECT success_notified FROM games WHERE id = %s LIMIT 1", (game_id,))
+        already_notified = bool(row and row.get("success_notified"))
         conn.commit()
         if already_notified:
             return {"available": True, "reason": "already_notified", "should_notify": False}
@@ -752,7 +756,7 @@ def get_pending_games_for_processing(limit: int) -> list[dict[str, Any]]:
     - last_attempt_at is null OR older than cooldown window
       (env POLL_COOLDOWN_SECONDS, default 600)
     - pgn present and non-empty
-    Ordered by played_at ASC, limited by ``limit``.
+    Ordered by played_at ASC, created_at ASC, limited by ``limit``.
     """
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not _is_postgres_url(database_url):
@@ -840,9 +844,11 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
               played_at, success_notified, engine_failed, attempt_count, last_attempt_at,
               """
             + ("completed_at" if "completed_at" in game_columns else "NULL AS completed_at")
+            + ", "
+            + ("created_at" if "created_at" in game_columns else "NULL AS created_at")
             + """
             FROM games
-            ORDER BY played_at ASC, id ASC
+            ORDER BY played_at ASC, created_at ASC, id ASC
             """,
         )
         # Prefer poll-specific knobs; keep legacy names as compatibility fallback.
@@ -876,10 +882,6 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             else:
                 pending_rows.append(row_dict)
 
-            pgn = str(row_dict.get("pgn", "") or "").strip()
-            if not pgn:
-                continue
-
             if bool(row_dict.get("success_notified", False)):
                 continue
             if bool(row_dict.get("engine_failed", False)):
@@ -899,12 +901,20 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
                 if len(sample_excluded_by_cooldown) < 5:
                     sample_excluded_by_cooldown.append(str(row_dict.get("game_url", "") or ""))
                 continue
-            eligible_rows_all.append(row_dict)
+            if is_game_eligible_for_processing(
+                row_dict,
+                now=now_utc,
+                max_attempts=max_attempts,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                eligible_rows_all.append(row_dict)
 
         eligible_rows_all.sort(
             key=lambda item: (
                 _coerce_datetime_utc(item.get("played_at")) is None,
                 _coerce_datetime_utc(item.get("played_at")) or datetime.max.replace(tzinfo=timezone.utc),
+                _coerce_datetime_utc(item.get("created_at")) is None,
+                _coerce_datetime_utc(item.get("created_at")) or datetime.max.replace(tzinfo=timezone.utc),
             )
         )
         newest_pending = sorted(

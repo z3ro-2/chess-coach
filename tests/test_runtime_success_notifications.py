@@ -115,3 +115,40 @@ def test_mark_review_success_flags_sets_both_success_and_review_notified(monkeyp
     assert state["review_notified"] is True
     assert state["update_calls"] == 1
     assert state["commits"] == 1
+
+
+def test_should_notify_review_success_uses_success_notified_flag(monkeypatch) -> None:
+    state = {"success_notified": False}
+
+    class _DummyConn:
+        def commit(self) -> None:
+            return None
+
+        def rollback(self) -> None:
+            return None
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, table: {"id", "platform_user"} if table == "players" else {"id", "player_id", "game_url", "success_notified"},
+    )
+    monkeypatch.setattr(runtime_updates, "_resolve_or_create_player_id", lambda _conn, _username, _cols: 7)
+    monkeypatch.setattr(runtime_updates, "_upsert_game", lambda _conn, **_kwargs: (99, False))
+    monkeypatch.setattr(runtime_updates, "_fetchone", lambda *_args, **_kwargs: {"success_notified": state["success_notified"]})
+
+    first = runtime_updates.should_notify_review_success(
+        player_username="logan",
+        game_payload={"game_url": "https://www.chess.com/game/live/123"},
+    )
+    state["success_notified"] = True
+    second = runtime_updates.should_notify_review_success(
+        player_username="logan",
+        game_payload={"game_url": "https://www.chess.com/game/live/123"},
+    )
+
+    assert first["available"] is True
+    assert first["should_notify"] is True
+    assert second["available"] is True
+    assert second["should_notify"] is False

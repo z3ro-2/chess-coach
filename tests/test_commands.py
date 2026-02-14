@@ -263,10 +263,12 @@ def test_queue_inspector_outputs_counts_and_top_rows(monkeypatch, capsys) -> Non
         lambda **_kwargs: {
             "total_games_in_db": 20,
             "total_pending_success_notified_false": 7,
+            "pending_total": 7,
             "eligible_now": 3,
             "excluded_by_cooldown": 2,
             "excluded_by_attempt_cap": 1,
             "excluded_by_engine_failed": 1,
+            "excluded_by_success_notified": 2,
             "top_newest_pending": [
                 {
                     "game_url": "https://www.chess.com/game/live/1",
@@ -283,12 +285,12 @@ def test_queue_inspector_outputs_counts_and_top_rows(monkeypatch, capsys) -> Non
     assert rc == 0
     out = capsys.readouterr().out
     assert "Queue Inspector:" in out
-    assert "- Total games in DB: 20" in out
-    assert "- Total pending (success_notified = FALSE): 7" in out
-    assert "- Total eligible: 3" in out
-    assert "- Blocked by cooldown: 2" in out
-    assert "- Blocked by attempt cap: 1" in out
-    assert "- Blocked by engine_failed: 1" in out
+    assert "- total_games: 20" in out
+    assert "- pending_total: 7" in out
+    assert "- eligible_now: 3" in out
+    assert "- blocked_by_cooldown: 2" in out
+    assert "- blocked_by_attempt_cap: 1" in out
+    assert "- blocked_by_flags: 3" in out
     assert "game_url=https://www.chess.com/game/live/1" in out
 
 
@@ -299,10 +301,12 @@ def test_queue_inspector_outputs_none_when_no_rows(monkeypatch, capsys) -> None:
         lambda **_kwargs: {
             "total_games_in_db": 0,
             "total_pending_success_notified_false": 0,
+            "pending_total": 0,
             "eligible_now": 0,
             "excluded_by_cooldown": 0,
             "excluded_by_attempt_cap": 0,
             "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
             "top_newest_pending": [],
         },
     )

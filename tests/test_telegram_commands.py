@@ -79,6 +79,68 @@ def test_telegram_command_parsing_and_dispatch(monkeypatch, tmp_path) -> None:
     assert all("parse_mode" not in dict(call.get("data", {})) for call in send_message_calls)
 
 
+def test_telegram_status_includes_queue_health_fields(monkeypatch, tmp_path) -> None:
+    posted_messages: list[dict] = []
+
+    def _fake_get(url: str, params=None, timeout=0):
+        assert url.endswith("/getUpdates")
+        return _FakeResponse(
+            {
+                "ok": True,
+                "result": [
+                    {"update_id": 201, "message": {"chat": {"id": "42"}, "text": "/status"}},
+                ],
+            }
+        )
+
+    def _fake_post(url: str, data=None, files=None, timeout=0):
+        posted_messages.append({"url": url, "data": data, "files": files, "timeout": timeout})
+        return _FakeResponse({"ok": True, "result": {}})
+
+    monkeypatch.setattr(telegram_commands.requests, "get", _fake_get)
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
+    monkeypatch.setattr(
+        "src.commands.get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 9,
+            "eligible_now": 3,
+            "excluded_by_cooldown": 2,
+            "excluded_by_attempt_cap": 1,
+            "excluded_by_engine_failed": 1,
+            "excluded_by_success_notified": 2,
+        },
+    )
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = SimpleNamespace(
+            out=tmp_path / "output",
+            username="logan",
+            provider="ollama",
+            timeout=5,
+            player_summary_every_n=20,
+            ollama_url="http://127.0.0.1:11434",
+            ollama_model="llama3.1:8b",
+            gpt_model="gpt-4o-mini",
+            max_tokens=100,
+            telegram_bot_token="token",
+            telegram_chat_id="42",
+        )
+        handled = telegram_commands.poll_telegram_commands(conn, args)
+    finally:
+        conn.close()
+
+    assert handled == 1
+    send_message_calls = [item for item in posted_messages if item["url"].endswith("/sendMessage")]
+    assert send_message_calls
+    text = str(send_message_calls[-1].get("data", {}).get("text", ""))
+    assert "Pending: 9" in text
+    assert "Eligible: 3" in text
+    assert "Cooldown-blocked: 2" in text
+    assert "Attempt-cap-blocked: 1" in text
+
+
 def test_setprovider_gpt_updates_runtime_provider(monkeypatch, tmp_path) -> None:
     posted_messages: list[dict] = []
     set_provider("ollama")
