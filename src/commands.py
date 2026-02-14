@@ -15,6 +15,7 @@ import requests
 
 from src.config.provider_config import get_provider
 from src.db._pg_utils import _connect_db
+from src.db.runtime_updates import get_pending_games_for_processing_diagnostics
 
 CommandResult = dict[str, Any]
 CommandFn = Callable[[sqlite3.Connection, Any], CommandResult]
@@ -76,6 +77,7 @@ def _status_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
     llm_info = _status_llm_info(args, out_dir=Path(args.out))
     fallback_rate = _llm_fallback_rate_percent()
     llm_provider = str(get_provider() or getattr(args, "provider", "ollama") or "ollama").strip().lower() or "ollama"
+    queue_diag = _status_queue_diagnostics()
 
     lines = [
         "Engine: OK",
@@ -87,6 +89,13 @@ def _status_command(conn: sqlite3.Connection, args: Any) -> CommandResult:
         f"Postgres: {'connected' if postgres_ok else 'not connected'}",
         f"SQLite: {'connected' if sqlite_ok else 'not connected'}",
         f"Pending games count: {_pending_games_count(conn)}",
+        "Queue Health:",
+        f"- pending_total: {int(queue_diag.get('pending_total', 0) or 0)}",
+        f"- eligible_now: {int(queue_diag.get('eligible_now', 0) or 0)}",
+        f"- excluded_by_cooldown: {int(queue_diag.get('excluded_by_cooldown', 0) or 0)}",
+        f"- excluded_by_attempt_cap: {int(queue_diag.get('excluded_by_attempt_cap', 0) or 0)}",
+        f"- excluded_by_engine_failed: {int(queue_diag.get('excluded_by_engine_failed', 0) or 0)}",
+        f"- excluded_by_success_notified: {int(queue_diag.get('excluded_by_success_notified', 0) or 0)}",
         f"Games since last summary: {since_last_summary}",
     ]
     return {"text": "\n".join(lines), "file": None}
@@ -358,3 +367,18 @@ def _llm_fallback_rate_percent() -> float:
         return (float(fallback) / float(total)) * 100.0
     except Exception:
         return 0.0
+
+
+def _status_queue_diagnostics() -> dict[str, int]:
+    try:
+        diag = get_pending_games_for_processing_diagnostics(limit=10)
+    except Exception:
+        diag = {}
+    return {
+        "pending_total": int(diag.get("pending_total", 0) or 0),
+        "eligible_now": int(diag.get("eligible_now", 0) or 0),
+        "excluded_by_cooldown": int(diag.get("excluded_by_cooldown", 0) or 0),
+        "excluded_by_attempt_cap": int(diag.get("excluded_by_attempt_cap", 0) or 0),
+        "excluded_by_engine_failed": int(diag.get("excluded_by_engine_failed", 0) or 0),
+        "excluded_by_success_notified": int(diag.get("excluded_by_success_notified", 0) or 0),
+    }

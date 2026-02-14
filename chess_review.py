@@ -72,17 +72,22 @@ from src.db.bootstrap import ensure_bootstrap
 from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import (
+    cleanup_completed_games,
     consume_success_notification_once,
     fetch_player_runtime_snapshot,
     clear_engine_failed,
+    get_pending_games_for_processing,
+    get_pending_games_for_processing_diagnostics,
+    load_games_missing_pgn,
     load_retry_failure_game_payloads,
+    mark_review_success_flags,
     record_game_attempt,
     mark_engine_failed,
     mark_engine_failure_notified,
-    mark_review_notified,
     should_skip_game_due_to_attempt_backoff,
     should_notify_engine_failure,
     sync_game_record_and_traits,
+    update_game_pgn_for_url,
 )
 from src.db.schema import ensure_postgres_core_schema
 from src.llm_diagnostics import hash_text_sha256, prompt_hash, split_model_name_version
@@ -326,6 +331,35 @@ def run_telegram_smoketest(args: argparse.Namespace) -> int:
         disable_notification=bool(getattr(args, "telegram_disable_notification", False)),
     )
     print("TG-SMOKETEST sent: URL preview + document attachment")
+    return 0
+
+
+def run_queue_inspector(args: argparse.Namespace) -> int:
+    diag = get_pending_games_for_processing_diagnostics(limit=10)
+    print("Queue Inspector:")
+    print(f"- Total games in DB: {int(diag.get('total_games_in_db', 0) or 0)}")
+    print(f"- Total pending (success_notified = FALSE): {int(diag.get('total_pending_success_notified_false', 0) or 0)}")
+    print(f"- Total eligible: {int(diag.get('eligible_now', 0) or 0)}")
+    print(f"- Blocked by cooldown: {int(diag.get('excluded_by_cooldown', 0) or 0)}")
+    print(f"- Blocked by attempt cap: {int(diag.get('excluded_by_attempt_cap', 0) or 0)}")
+    print(f"- Blocked by engine_failed: {int(diag.get('excluded_by_engine_failed', 0) or 0)}")
+    print("- Top 10 pending rows:")
+    rows = list(diag.get("top_newest_pending") or [])
+    if not rows:
+        print("  <none>")
+    else:
+        for row in rows[:10]:
+            if not isinstance(row, Mapping):
+                continue
+            print(
+                "  - game_url={url} success_notified={sn} engine_failed={ef} attempt_count={ac} last_attempt_at={la}".format(
+                    url=str(row.get("game_url", "") or ""),
+                    sn=bool(row.get("success_notified", False)),
+                    ef=bool(row.get("engine_failed", False)),
+                    ac=int(row.get("attempt_count", 0) or 0),
+                    la=str(row.get("last_attempt_at", "") or ""),
+                )
+            )
     return 0
 
 try:
@@ -2206,6 +2240,26 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
     # Always archive raw PGN first.
     write_pgn_once(pgn_path, game.pgn)
 
+    game_payload_for_runtime = {
+        "game_url": game.game_url,
+        "pgn": game.pgn,
+        "end_time": game.end_time,
+        "time_control": game.time_control,
+        "rated": game.rated,
+        "rules": game.rules,
+        "result": game.result,
+        "white_username": game.white_username,
+        "black_username": game.black_username,
+        "white_rating": game.white_rating,
+        "black_rating": game.black_rating,
+        "player_color": game.your_color,
+    }
+    record_game_attempt(
+        player_username=args.username,
+        game_payload=game_payload_for_runtime,
+        last_error=None,
+    )
+
     provider = get_provider()
     used_model = args.ollama_model if provider == "ollama" else args.gpt_model
     try:
@@ -2221,27 +2275,13 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         )
     except Exception as exc:
         logger.error("Stockfish failure: %s", exc)
-        game_payload_for_notify = {
-            "game_url": game.game_url,
-            "pgn": game.pgn,
-            "end_time": game.end_time,
-            "time_control": game.time_control,
-            "rated": game.rated,
-            "rules": game.rules,
-            "result": game.result,
-            "white_username": game.white_username,
-            "black_username": game.black_username,
-            "white_rating": game.white_rating,
-            "black_rating": game.black_rating,
-            "player_color": game.your_color,
-        }
         mark_engine_failed(
             player_username=args.username,
-            game_payload=game_payload_for_notify,
+            game_payload=game_payload_for_runtime,
         )
         notify_decision = should_notify_engine_failure(
             player_username=args.username,
-            game_payload=game_payload_for_notify,
+            game_payload=game_payload_for_runtime,
         )
         if not bool(notify_decision.get("should_notify", True)):
             return None
@@ -2258,27 +2298,12 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
         if sent:
             mark_engine_failure_notified(
                 player_username=args.username,
-                game_payload=game_payload_for_notify,
+                game_payload=game_payload_for_runtime,
             )
         return None
 
     write_text(md_path, review_md)
     llm_diag = _extract_llm_diagnostics_from_review_markdown(review_md)
-
-    game_payload_for_runtime = {
-        "game_url": game.game_url,
-        "pgn": game.pgn,
-        "end_time": game.end_time,
-        "time_control": game.time_control,
-        "rated": game.rated,
-        "rules": game.rules,
-        "result": game.result,
-        "white_username": game.white_username,
-        "black_username": game.black_username,
-        "white_rating": game.white_rating,
-        "black_rating": game.black_rating,
-        "player_color": game.your_color,
-    }
 
     # Optional: Telegram notification with the generated Markdown attached
     telegram_notified = False
@@ -2315,14 +2340,15 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
                         disable_notification=getattr(args, "telegram_disable_notification", False),
                         disable_web_page_preview=True,
                     )
-                mark_review_notified(
-                    player_username=args.username,
-                    game_payload=game_payload_for_runtime,
-                )
                 telegram_notified = True
             except Exception as e:
                 # Do not fail the whole pipeline if Telegram is down/misconfigured.
                 print(f"[warn] Telegram notification failed: {e}", file=sys.stderr)
+
+    mark_review_success_flags(
+        player_username=args.username,
+        game_payload=game_payload_for_runtime,
+    )
 
     h = compute_content_hash(game, provider, used_model)
     mark_processed(
@@ -2522,29 +2548,99 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     max_attempts = max(1, int(getattr(args, "attempt_backoff_max_attempts", 5) or 5))
     window_hours = max(1, int(getattr(args, "attempt_backoff_window_hours", 6) or 6))
     ignore_backoff = bool(getattr(args, "ignore_attempt_backoff", False))
+    pending_limit = max(1, int(getattr(args, "backfill", 100) or 100))
+    cleanup_result = cleanup_completed_games(player_username=args.username)
+    _poll_debug(
+        "queue cleanup reason=%s marked_count=%s",
+        str(cleanup_result.get("reason", "unknown")),
+        int(cleanup_result.get("marked_count", 0) or 0),
+    )
+    pending_diag = get_pending_games_for_processing_diagnostics(limit=pending_limit)
+    _queue_debug(
+        (
+            "pending_total=%s eligible_now=%s excluded_by_success_notified=%s "
+            "excluded_by_engine_failed=%s excluded_by_attempt_cap=%s excluded_by_cooldown=%s"
+        ),
+        int(pending_diag.get("pending_total", 0) or 0),
+        int(pending_diag.get("eligible_now", 0) or 0),
+        int(pending_diag.get("excluded_by_success_notified", 0) or 0),
+        int(pending_diag.get("excluded_by_engine_failed", 0) or 0),
+        int(pending_diag.get("excluded_by_attempt_cap", 0) or 0),
+        int(pending_diag.get("excluded_by_cooldown", 0) or 0),
+    )
+    _queue_debug(
+        "sample_excluded_by_success_notified=%s",
+        ",".join(str(x) for x in list(pending_diag.get("sample_excluded_by_success_notified") or [])[:5]) or "<none>",
+    )
+    _queue_debug(
+        "sample_excluded_by_engine_failed=%s",
+        ",".join(str(x) for x in list(pending_diag.get("sample_excluded_by_engine_failed") or [])[:5]) or "<none>",
+    )
+    _queue_debug(
+        "sample_excluded_by_attempt_cap=%s",
+        ",".join(str(x) for x in list(pending_diag.get("sample_excluded_by_attempt_cap") or [])[:5]) or "<none>",
+    )
+    _queue_debug(
+        "sample_excluded_by_cooldown=%s",
+        ",".join(str(x) for x in list(pending_diag.get("sample_excluded_by_cooldown") or [])[:5]) or "<none>",
+    )
+    _poll_debug(
+        (
+            "pending diagnostics pending_total=%s eligible_now=%s excluded_by_cooldown=%s "
+            "excluded_by_attempt_cap=%s excluded_by_engine_failed=%s excluded_by_success_notified=%s"
+        ),
+        int(pending_diag.get("pending_total", 0) or 0),
+        int(pending_diag.get("eligible_now", 0) or 0),
+        int(pending_diag.get("excluded_by_cooldown", 0) or 0),
+        int(pending_diag.get("excluded_by_attempt_cap", 0) or 0),
+        int(pending_diag.get("excluded_by_engine_failed", 0) or 0),
+        int(pending_diag.get("excluded_by_success_notified", 0) or 0),
+    )
+    for item in list(pending_diag.get("top_newest_pending") or [])[:5]:
+        if isinstance(item, Mapping):
+            _poll_debug(
+                "pending newest url=%s success_notified=%s engine_failed=%s attempt_count=%s last_attempt_at=%s",
+                str(item.get("game_url", "") or ""),
+                bool(item.get("success_notified", False)),
+                bool(item.get("engine_failed", False)),
+                int(item.get("attempt_count", 0) or 0),
+                str(item.get("last_attempt_at", "") or ""),
+            )
+
+    pending_rows = get_pending_games_for_processing(limit=pending_limit)
+
     if retry_mode:
-        logger.info(
-            "Retry mode enabled: selecting games where engine_failed=true OR review_notified=false (backoff max_attempts=%s window_hours=%s ignore=%s).",
-            max_attempts,
-            window_hours,
-            ignore_backoff,
-        )
-        rows = load_retry_failure_game_payloads(
+        logger.info("Retry mode enabled: selecting pending games from centralized eligibility helper.")
+        rows = list(pending_rows)
+        retry_rows = load_retry_failure_game_payloads(
             player_username=args.username,
-            limit=max(1, int(getattr(args, "backfill", 100) or 100)),
+            limit=pending_limit,
             max_attempts=max_attempts,
             window_hours=window_hours,
             ignore_backoff=ignore_backoff,
         )
+        seen_retry_urls = {str((row or {}).get("game_url", "") or "") for row in rows}
+        for row in retry_rows:
+            row_url = str((row or {}).get("game_url", "") or "")
+            if row_url and row_url in seen_retry_urls:
+                continue
+            rows.append(row)
+            if row_url:
+                seen_retry_urls.add(row_url)
         parsed = [g for g in (_game_info_from_retry_payload(row, args.username) for row in rows) if g is not None]
         parsed.sort(key=lambda g: g.end_time)
         _poll_debug("retry-failures candidates loaded: %s", int(len(parsed)))
     else:
         raw_games = fetch_recent_games(args.username, args.lookback_days)
+        repair_stats = _repair_missing_pgn_rows_from_raw_games(raw_games=raw_games, limit=pending_limit)
+        if int(repair_stats.get("repaired", 0) or 0) > 0:
+            pending_rows = get_pending_games_for_processing(limit=pending_limit)
+        pending_parsed = [g for g in (_game_info_from_retry_payload(row, args.username) for row in pending_rows) if g is not None]
         _poll_debug("total games fetched from chess.com: %s", int(len(raw_games)))
 
-        parsed = []
+        parsed = list(pending_parsed)
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
+        seen_urls = {g.game_url for g in pending_parsed}
 
         for rg in raw_games:
             raw_url = str((rg or {}).get("url", "") or "")
@@ -2563,7 +2659,10 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 _poll_debug("game skipped url=%s reason=outside lookback window", gi.game_url)
                 continue
 
+            if gi.game_url in seen_urls:
+                continue
             parsed.append(gi)
+            seen_urls.add(gi.game_url)
 
     parsed.sort(key=lambda g: g.end_time)
 
@@ -2616,7 +2715,6 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
         last_err: Optional[Exception] = None
         for attempt in range(1, args.retries + 1):
-            attempt_error: str | None = None
             try:
                 out = process_game(conn, args, g)
                 if out:
@@ -2631,7 +2729,6 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 last_err = None
                 break
             except Exception as e:
-                attempt_error = str(e)
                 last_err = e
                 mark_engine_failed(
                     player_username=args.username,
@@ -2642,12 +2739,6 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 time.sleep(min(3 * attempt, 12))
-            finally:
-                record_game_attempt(
-                    player_username=args.username,
-                    game_payload=game_payload,
-                    last_error=attempt_error,
-                )
 
         if last_err is not None:
             print(f"[error] Giving up on {g.game_url}: {last_err}", file=sys.stderr)
@@ -2705,6 +2796,48 @@ def _poll_debug(msg: str, *args: Any) -> None:
     if not _polling_debug_enabled():
         return
     logger.info("[POLL-DEBUG] " + msg, *args)
+
+
+def _queue_debug_enabled() -> bool:
+    return str(os.environ.get("ENABLE_QUEUE_DEBUG", "")).strip() == "1"
+
+
+def _queue_debug(msg: str, *args: Any) -> None:
+    if not _queue_debug_enabled():
+        return
+    logger.info("[QUEUE-DEBUG] " + msg, *args)
+
+
+def _repair_missing_pgn_rows_from_raw_games(
+    *,
+    raw_games: Sequence[Mapping[str, Any]],
+    limit: int,
+) -> dict[str, int]:
+    missing = load_games_missing_pgn(limit=max(1, int(limit)))
+    if not missing:
+        return {"missing_rows": 0, "repaired": 0}
+
+    pgn_by_url: dict[str, str] = {}
+    for row in raw_games:
+        url = str(row.get("url", "") or "").strip()
+        pgn = str(row.get("pgn", "") or "")
+        if url and pgn.strip():
+            pgn_by_url[url] = pgn
+
+    repaired = 0
+    for row in missing:
+        game_url = str(row.get("game_url", "") or "").strip()
+        pgn = pgn_by_url.get(game_url, "")
+        if not pgn:
+            logger.info("pgn_fetch_missing_retry game_url=%s status=not_found", game_url)
+            continue
+        ok = bool(update_game_pgn_for_url(game_url=game_url, pgn=pgn))
+        if ok:
+            repaired += 1
+            logger.info("pgn_fetch_missing_retry game_url=%s status=success", game_url)
+        else:
+            logger.info("pgn_fetch_missing_retry game_url=%s status=failed_update", game_url)
+    return {"missing_rows": int(len(missing)), "repaired": int(repaired)}
 
 
 def get_loaded_llm_config() -> Dict[str, Any]:
@@ -2928,6 +3061,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--poll-seconds", type=int, default=300, help="Polling interval (seconds)")
     p.add_argument("--once", action="store_true", help="Run one poll cycle then exit")
     p.add_argument(
+        "--queue",
+        action="store_true",
+        help="Inspect pending poller queue using centralized eligibility logic.",
+    )
+    p.add_argument(
         "--retry-failures",
         action="store_true",
         help="Retry games flagged in Postgres where engine_failed=true OR review_notified=false.",
@@ -3049,16 +3187,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     args = p.parse_args(argv)
 
-    if not args.tg_smoketest:
-        if not args.username:
-            p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
-        if args.out is None:
-            p.error("CHESS_OUTPUT_DIR is not set; set it or pass --out explicitly.")
-    else:
+    if args.tg_smoketest:
         if not str(args.tg_smoketest_game_url or "").strip():
             p.error("--tg-smoketest requires --game-url.")
         if args.tg_smoketest_md is None:
             p.error("--tg-smoketest requires --md.")
+    elif not args.queue:
+        if not args.username:
+            p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
+        if args.out is None:
+            p.error("CHESS_OUTPUT_DIR is not set; set it or pass --out explicitly.")
     if args.bootstrap_games is not None and args.bootstrap_games <= 0:
         p.error("--bootstrap-games must be > 0.")
     if args.player_summary_every_n <= 0:
@@ -3090,6 +3228,8 @@ def main() -> int:
     args = parse_args()
     if bool(getattr(args, "tg_smoketest", False)):
         return int(run_telegram_smoketest(args))
+    if bool(getattr(args, "queue", False)):
+        return int(run_queue_inspector(args))
     if not bool(getattr(args, "enable_engine", False)):
         raise RuntimeError("Engine cannot be disabled in strict mode.")
     args.out = Path(args.out)

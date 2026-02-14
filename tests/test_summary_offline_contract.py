@@ -362,7 +362,7 @@ def test_success_path_emits_structured_json_log(monkeypatch, tmp_path, summary_a
     )
     monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(chess_review, "consume_success_notification_once", lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True})
-    monkeypatch.setattr(chess_review, "mark_review_notified", lambda **_kwargs: {"available": True, "reason": "marked_notified", "updated": True})
+    monkeypatch.setattr(chess_review, "mark_review_success_flags", lambda **_kwargs: {"available": True, "reason": "marked_notified", "updated": True})
     monkeypatch.setattr(chess_review, "send_telegram_message", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(chess_review, "send_telegram_document", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
@@ -424,7 +424,7 @@ def test_review_notified_gating_first_success_sends_second_skips(
     monkeypatch.setattr(chess_review, "consume_success_notification_once", lambda **_kwargs: next(notify_states))
     monkeypatch.setattr(
         chess_review,
-        "mark_review_notified",
+        "mark_review_success_flags",
         lambda **kwargs: mark_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_notified", "updated": True},
     )
     monkeypatch.setattr(
@@ -472,7 +472,7 @@ def test_success_notification_sends_document_with_md_path(
     monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
     monkeypatch.setattr(chess_review, "record_player_rating_for_game", lambda **_kwargs: False)
     monkeypatch.setattr(chess_review, "consume_success_notification_once", lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True})
-    monkeypatch.setattr(chess_review, "mark_review_notified", lambda **_kwargs: {"available": True, "reason": "marked_notified", "updated": True})
+    monkeypatch.setattr(chess_review, "mark_review_success_flags", lambda **_kwargs: {"available": True, "reason": "marked_notified", "updated": True})
     monkeypatch.setattr(
         chess_review,
         "send_telegram_message",
@@ -494,6 +494,91 @@ def test_success_notification_sends_document_with_md_path(
     assert text_calls[0]["kwargs"]["disable_web_page_preview"] is False
     assert len(doc_calls) == 1
     assert doc_calls[0]["file_path"] == out
+
+
+def test_process_game_records_attempt_before_processing_and_marks_success_flags(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    attempt_calls: list[dict] = []
+    success_flag_calls: list[dict] = []
+
+    monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# game review")
+    monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chess_review, "mark_processed", lambda **_kwargs: None)
+    monkeypatch.setattr(chess_review, "_record_processed_game_meta", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
+    monkeypatch.setattr(chess_review, "record_player_rating_for_game", lambda **_kwargs: False)
+    monkeypatch.setattr(chess_review, "_write_player_stats_markdown", lambda *_args, **_kwargs: tmp_path / "output" / "player_stats.md")
+    monkeypatch.setattr(chess_review, "_maybe_generate_player_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "consume_success_notification_once", lambda **_kwargs: {"available": True, "reason": "already_consumed", "should_notify": False})
+    monkeypatch.setattr(
+        chess_review,
+        "record_game_attempt",
+        lambda **kwargs: attempt_calls.append(dict(kwargs)) or {"available": True, "reason": "updated", "updated": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_review_success_flags",
+        lambda **kwargs: success_flag_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_success", "updated": True},
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, sample_game)
+    finally:
+        conn.close()
+
+    assert out is not None
+    assert len(attempt_calls) == 1
+    assert attempt_calls[0]["last_error"] is None
+    assert len(success_flag_calls) == 1
+
+
+def test_process_game_engine_failure_marks_engine_failed_without_success_flags(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    attempt_calls: list[dict] = []
+    engine_failed_calls: list[dict] = []
+    success_flag_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        chess_review,
+        "run_analysis_pipeline",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("Stockfish engine failed or produced no output.")),
+    )
+    monkeypatch.setattr(chess_review, "should_notify_engine_failure", lambda **_kwargs: {"available": True, "reason": "already_notified", "should_notify": False})
+    monkeypatch.setattr(
+        chess_review,
+        "record_game_attempt",
+        lambda **kwargs: attempt_calls.append(dict(kwargs)) or {"available": True, "reason": "updated", "updated": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_engine_failed",
+        lambda **kwargs: engine_failed_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_engine_failed", "updated": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_review_success_flags",
+        lambda **kwargs: success_flag_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_success", "updated": True},
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, sample_game)
+    finally:
+        conn.close()
+
+    assert out is None
+    assert len(attempt_calls) == 1
+    assert len(engine_failed_calls) == 1
+    assert success_flag_calls == []
 
 
 def test_failure_notified_flag_set_after_success(

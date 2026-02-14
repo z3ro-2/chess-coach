@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Mapping
 
 from src.db._pg_utils import _connect_db, _execute, _fetchall, _fetchone, _table_columns
@@ -359,6 +359,53 @@ def record_game_attempt(
         cleanup()
 
 
+def mark_review_success_flags(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Mark both success_notified and review_notified true after successful review generation."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping review-success flag mark: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        required = {"success_notified", "review_notified"}
+        if not player_columns or not game_columns or not required.issubset(game_columns):
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        _execute(
+            conn,
+            "UPDATE games SET success_notified = TRUE, review_notified = TRUE WHERE id = %s",
+            (game_id,),
+        )
+        conn.commit()
+        return {"available": True, "reason": "marked_success", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping review-success flag mark due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
+    finally:
+        cleanup()
+
+
 def should_skip_game_due_to_attempt_backoff(
     *,
     player_username: str,
@@ -525,7 +572,14 @@ def load_retry_failure_game_payloads(
     window_hours: int = 6,
     ignore_backoff: bool = False,
 ) -> list[dict[str, Any]]:
-    """Load game payloads where engine_failed=true or review_notified=false."""
+    """Load retry-failure payloads eligible under poll retry rules.
+
+    Eligibility:
+    - success_notified = FALSE
+    - (engine_failed = TRUE OR attempt_count < POLL_MAX_ATTEMPTS)
+    - last_attempt_at is NULL OR older than POLL_COOLDOWN_SECONDS
+    - pgn present and non-empty
+    """
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not _is_postgres_url(database_url):
         return []
@@ -539,48 +593,478 @@ def load_retry_failure_game_payloads(
         game_columns = _table_columns(conn, "games")
         if not player_columns or not game_columns:
             return []
-        if "engine_failed" not in game_columns or "review_notified" not in game_columns:
+        required = {
+            "engine_failed",
+            "success_notified",
+            "attempt_count",
+            "last_attempt_at",
+        }
+        if not required.issubset(game_columns):
             return []
         player_row = _find_player_row(conn, player_username, player_columns)
         if player_row is None:
             return []
         player_id = int(player_row["id"])
-        has_attempt_backoff_fields = {"attempt_count", "last_attempt_at"}.issubset(game_columns)
-        attempt_filter_sql = ""
-        params: list[Any] = [player_id]
-        if has_attempt_backoff_fields and not bool(ignore_backoff):
-            attempt_filter_sql = """
-              AND (
-                    last_attempt_at IS NULL
-                    OR COALESCE(attempt_count, 0) < %s
-                    OR last_attempt_at < (NOW() - (%s * INTERVAL '1 hour'))
-                  )
-            """
-            params.extend([max(1, int(max_attempts)), max(1, int(window_hours))])
-        params.append(max(1, int(limit)))
+
+        poll_max_attempts = _env_int("POLL_MAX_ATTEMPTS", _env_int("MAX_ATTEMPTS", max(1, int(max_attempts))))
+        poll_cooldown_seconds = _env_int(
+            "POLL_COOLDOWN_SECONDS",
+            _env_int("ATTEMPT_COOLDOWN_SECONDS", max(0, int(window_hours) * 3600)),
+        )
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(0, int(poll_cooldown_seconds)))
+
+        completed_at_select = "completed_at" if "completed_at" in game_columns else "NULL AS completed_at"
         rows = _fetchall(
             conn,
             """
             SELECT game_url, pgn, raw_pgn, game_pgn, end_time, time_control, rated, rules, result,
-                   white_username, black_username, white_rating, black_rating, player_color
+                   white_username, black_username, white_rating, black_rating, player_color,
+                   success_notified, engine_failed, attempt_count, last_attempt_at,
+                   """
+            + completed_at_select
+            + """
             FROM games
             WHERE player_id = %s
-              AND (engine_failed = TRUE OR COALESCE(review_notified, FALSE) = FALSE)
-            """
-            + attempt_filter_sql
-            + """
             ORDER BY end_time DESC, id DESC
             LIMIT %s
             """,
-            tuple(params),
+            (player_id, max(1, int(limit))),
         )
-        out: list[dict[str, Any]] = []
+        eligible_rows: list[dict[str, Any]] = []
         for row in rows:
-            out.append(dict(row))
-        return out
+            row_dict = dict(row)
+            if _coerce_datetime_utc(row_dict.get("completed_at")) is not None:
+                continue
+            if bool(row_dict.get("success_notified", False)):
+                continue
+            pgn = str(row_dict.get("pgn", "") or "").strip()
+            if not pgn:
+                continue
+            attempts = int(row_dict.get("attempt_count", 0) or 0)
+            engine_failed = bool(row_dict.get("engine_failed", False))
+            if not (engine_failed or attempts < max(1, int(poll_max_attempts))):
+                continue
+            if not bool(ignore_backoff):
+                last_attempt_at = _coerce_datetime_utc(row_dict.get("last_attempt_at"))
+                if last_attempt_at is not None and last_attempt_at >= cutoff:
+                    continue
+            eligible_rows.append(row_dict)
+        return eligible_rows
     except Exception:
         logger.debug("Skipping retry-failures fetch due to unexpected error.", exc_info=True)
         return []
+    finally:
+        cleanup()
+
+
+def cleanup_completed_games(
+    *,
+    player_username: str,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Mark permanently-completed rows with completed_at.
+
+    Rows are marked completed when either:
+    - success_notified = TRUE
+    - engine_failed = TRUE and attempt_count >= POLL_MAX_ATTEMPTS
+
+    Cooldown gate:
+    - last_attempt_at is NULL OR older than POLL_COOLDOWN_SECONDS
+    """
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "marked_count": 0}
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping completed-row cleanup: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "marked_count": 0}
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        required = {"success_notified", "engine_failed", "attempt_count", "last_attempt_at", "completed_at"}
+        if not player_columns or not game_columns or not required.issubset(game_columns):
+            return {"available": False, "reason": "schema_missing", "marked_count": 0}
+        player_row = _find_player_row(conn, player_username, player_columns)
+        if player_row is None:
+            return {"available": False, "reason": "player_missing", "marked_count": 0}
+        player_id = int(player_row["id"])
+
+        max_attempts = _env_int("POLL_MAX_ATTEMPTS", _env_int("MAX_ATTEMPTS", 5))
+        cooldown_seconds = _env_int(
+            "POLL_COOLDOWN_SECONDS",
+            _env_int("ATTEMPT_COOLDOWN_SECONDS", 600),
+        )
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(0, int(cooldown_seconds)))
+
+        rows = _fetchall(
+            conn,
+            """
+            SELECT id, game_url, success_notified, engine_failed, attempt_count, last_attempt_at, completed_at
+            FROM games
+            WHERE player_id = %s
+              AND completed_at IS NULL
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (player_id, max(1, int(limit))),
+        )
+        marked = 0
+        for row in rows:
+            row_dict = dict(row)
+            if _coerce_datetime_utc(row_dict.get("completed_at")) is not None:
+                continue
+            last_attempt_at = _coerce_datetime_utc(row_dict.get("last_attempt_at"))
+            if last_attempt_at is not None and last_attempt_at >= cutoff:
+                continue
+            success_notified = bool(row_dict.get("success_notified", False))
+            engine_failed = bool(row_dict.get("engine_failed", False))
+            attempts = int(row_dict.get("attempt_count", 0) or 0)
+            should_complete = success_notified or (engine_failed and attempts >= max(1, int(max_attempts)))
+            if not should_complete:
+                continue
+            game_id = int(row_dict.get("id", 0) or 0)
+            if game_id <= 0:
+                continue
+            _execute(conn, "UPDATE games SET completed_at = NOW() WHERE id = %s AND completed_at IS NULL", (game_id,))
+            marked += 1
+        conn.commit()
+        return {"available": True, "reason": "ok", "marked_count": int(marked)}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping completed-row cleanup due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_error", "marked_count": 0}
+    finally:
+        cleanup()
+
+
+def get_pending_games_for_processing(limit: int) -> list[dict[str, Any]]:
+    """Return pending game rows eligible for processing.
+
+    Eligibility:
+    - completed_at IS NULL
+    - success_notified = FALSE
+    - engine_failed = FALSE
+    - attempt_count < max attempts (env POLL_MAX_ATTEMPTS, default 5)
+    - last_attempt_at is null OR older than cooldown window
+      (env POLL_COOLDOWN_SECONDS, default 600)
+    - pgn present and non-empty
+    Ordered by played_at ASC, limited by ``limit``.
+    """
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return []
+
+    diag = get_pending_games_for_processing_diagnostics(limit=limit)
+    return list(diag.get("eligible_rows") or [])
+
+
+def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
+    """Return pending-game eligibility diagnostics + limited eligible rows."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {
+            "available": False,
+            "reason": "no_database_url",
+            "pending_total": 0,
+            "eligible_now": 0,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "sample_excluded_by_success_notified": [],
+            "sample_excluded_by_engine_failed": [],
+            "sample_excluded_by_attempt_cap": [],
+            "sample_excluded_by_cooldown": [],
+            "top_newest_pending": [],
+            "eligible_rows": [],
+        }
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping pending-game diagnostics: DB unavailable.", exc_info=True)
+        return {
+            "available": False,
+            "reason": "db_unreachable",
+            "pending_total": 0,
+            "eligible_now": 0,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "sample_excluded_by_success_notified": [],
+            "sample_excluded_by_engine_failed": [],
+            "sample_excluded_by_attempt_cap": [],
+            "sample_excluded_by_cooldown": [],
+            "top_newest_pending": [],
+            "eligible_rows": [],
+        }
+    try:
+        game_columns = _table_columns(conn, "games")
+        required = {
+            "pgn",
+            "played_at",
+            "success_notified",
+            "engine_failed",
+            "attempt_count",
+            "last_attempt_at",
+        }
+        if not game_columns or not required.issubset(game_columns):
+            return {
+                "available": False,
+                "reason": "schema_missing",
+                "pending_total": 0,
+                "eligible_now": 0,
+                "excluded_by_cooldown": 0,
+                "excluded_by_attempt_cap": 0,
+                "excluded_by_engine_failed": 0,
+                "excluded_by_success_notified": 0,
+                "sample_excluded_by_success_notified": [],
+                "sample_excluded_by_engine_failed": [],
+                "sample_excluded_by_attempt_cap": [],
+                "sample_excluded_by_cooldown": [],
+                "top_newest_pending": [],
+                "eligible_rows": [],
+            }
+
+        rows = _fetchall(
+            conn,
+            """
+            SELECT
+              game_url, pgn, end_time, time_control, rated, rules, result,
+              white_username, black_username, white_rating, black_rating, player_color,
+              played_at, success_notified, engine_failed, attempt_count, last_attempt_at,
+              """
+            + ("completed_at" if "completed_at" in game_columns else "NULL AS completed_at")
+            + """
+            FROM games
+            ORDER BY played_at ASC, id ASC
+            """,
+        )
+        # Prefer poll-specific knobs; keep legacy names as compatibility fallback.
+        max_attempts = _env_int("POLL_MAX_ATTEMPTS", _env_int("MAX_ATTEMPTS", 5))
+        cooldown_seconds = _env_int(
+            "POLL_COOLDOWN_SECONDS",
+            _env_int("ATTEMPT_COOLDOWN_SECONDS", 600),
+        )
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(seconds=max(0, int(cooldown_seconds)))
+
+        pending_rows: list[dict[str, Any]] = []
+        eligible_rows_all: list[dict[str, Any]] = []
+        excluded_by_success_notified = 0
+        excluded_by_engine_failed = 0
+        excluded_by_attempt_cap = 0
+        excluded_by_cooldown = 0
+        sample_excluded_by_success_notified: list[str] = []
+        sample_excluded_by_engine_failed: list[str] = []
+        sample_excluded_by_attempt_cap: list[str] = []
+        sample_excluded_by_cooldown: list[str] = []
+
+        for row in rows:
+            row_dict = dict(row)
+            if _coerce_datetime_utc(row_dict.get("completed_at")) is not None:
+                continue
+            if bool(row_dict.get("success_notified", False)):
+                excluded_by_success_notified += 1
+                if len(sample_excluded_by_success_notified) < 5:
+                    sample_excluded_by_success_notified.append(str(row_dict.get("game_url", "") or ""))
+            else:
+                pending_rows.append(row_dict)
+
+            pgn = str(row_dict.get("pgn", "") or "").strip()
+            if not pgn:
+                continue
+
+            if bool(row_dict.get("success_notified", False)):
+                continue
+            if bool(row_dict.get("engine_failed", False)):
+                excluded_by_engine_failed += 1
+                if len(sample_excluded_by_engine_failed) < 5:
+                    sample_excluded_by_engine_failed.append(str(row_dict.get("game_url", "") or ""))
+                continue
+            attempts = int(row_dict.get("attempt_count", 0) or 0)
+            if attempts >= max(1, int(max_attempts)):
+                excluded_by_attempt_cap += 1
+                if len(sample_excluded_by_attempt_cap) < 5:
+                    sample_excluded_by_attempt_cap.append(str(row_dict.get("game_url", "") or ""))
+                continue
+            last_attempt_at = _coerce_datetime_utc(row_dict.get("last_attempt_at"))
+            if last_attempt_at is not None and last_attempt_at >= cutoff:
+                excluded_by_cooldown += 1
+                if len(sample_excluded_by_cooldown) < 5:
+                    sample_excluded_by_cooldown.append(str(row_dict.get("game_url", "") or ""))
+                continue
+            eligible_rows_all.append(row_dict)
+
+        eligible_rows_all.sort(
+            key=lambda item: (
+                _coerce_datetime_utc(item.get("played_at")) is None,
+                _coerce_datetime_utc(item.get("played_at")) or datetime.max.replace(tzinfo=timezone.utc),
+            )
+        )
+        newest_pending = sorted(
+            pending_rows,
+            key=lambda item: (
+                _coerce_datetime_utc(item.get("played_at")) is None,
+                _coerce_datetime_utc(item.get("played_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
+            reverse=True,
+        )[:10]
+        top_newest_pending = [
+            {
+                "game_url": str(item.get("game_url", "") or ""),
+                "success_notified": bool(item.get("success_notified", False)),
+                "engine_failed": bool(item.get("engine_failed", False)),
+                "attempt_count": int(item.get("attempt_count", 0) or 0),
+                "last_attempt_at": str(item.get("last_attempt_at", "") or ""),
+            }
+            for item in newest_pending
+        ]
+
+        return {
+            "available": True,
+            "reason": "ok",
+            "total_games_in_db": int(len(rows)),
+            "total_pending_success_notified_false": int(len(pending_rows)),
+            "pending_total": int(len(pending_rows)),
+            "eligible_now": int(len(eligible_rows_all)),
+            "excluded_by_cooldown": int(excluded_by_cooldown),
+            "excluded_by_attempt_cap": int(excluded_by_attempt_cap),
+            "excluded_by_engine_failed": int(excluded_by_engine_failed),
+            "excluded_by_success_notified": int(excluded_by_success_notified),
+            "sample_excluded_by_success_notified": sample_excluded_by_success_notified,
+            "sample_excluded_by_engine_failed": sample_excluded_by_engine_failed,
+            "sample_excluded_by_attempt_cap": sample_excluded_by_attempt_cap,
+            "sample_excluded_by_cooldown": sample_excluded_by_cooldown,
+            "top_newest_pending": top_newest_pending,
+            "eligible_rows": eligible_rows_all[: max(1, int(limit))],
+        }
+    except Exception:
+        logger.debug("Skipping pending-game diagnostics due to unexpected error.", exc_info=True)
+        return {
+            "available": False,
+            "reason": "runtime_error",
+            "pending_total": 0,
+            "eligible_now": 0,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "sample_excluded_by_success_notified": [],
+            "sample_excluded_by_engine_failed": [],
+            "sample_excluded_by_attempt_cap": [],
+            "sample_excluded_by_cooldown": [],
+            "top_newest_pending": [],
+            "eligible_rows": [],
+        }
+    finally:
+        cleanup()
+
+
+def load_games_missing_pgn(limit: int = 100) -> list[dict[str, Any]]:
+    """Return game rows that have a URL but are missing PGN text."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return []
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping missing-PGN scan: DB unavailable.", exc_info=True)
+        return []
+    try:
+        game_columns = _table_columns(conn, "games")
+        if not game_columns:
+            return []
+        if "game_url" not in game_columns and "url" not in game_columns:
+            return []
+        if "pgn" not in game_columns and "raw_pgn" not in game_columns and "game_pgn" not in game_columns:
+            return []
+
+        url_col = "game_url" if "game_url" in game_columns else "url"
+        missing_parts: list[str] = []
+        if "pgn" in game_columns:
+            missing_parts.append("(pgn IS NULL OR TRIM(pgn) = '')")
+        if "raw_pgn" in game_columns:
+            missing_parts.append("(raw_pgn IS NULL OR TRIM(raw_pgn) = '')")
+        if "game_pgn" in game_columns:
+            missing_parts.append("(game_pgn IS NULL OR TRIM(game_pgn) = '')")
+        if not missing_parts:
+            return []
+
+        rows = _fetchall(
+            conn,
+            f"""
+            SELECT id, {url_col} AS game_url
+            FROM games
+            WHERE {url_col} IS NOT NULL
+              AND TRIM({url_col}) <> ''
+              AND ({' OR '.join(missing_parts)})
+            ORDER BY played_at ASC NULLS LAST, id ASC
+            LIMIT %s
+            """,
+            (max(1, int(limit)),),
+        )
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.debug("Skipping missing-PGN scan due to unexpected error.", exc_info=True)
+        return []
+    finally:
+        cleanup()
+
+
+def update_game_pgn_for_url(*, game_url: str, pgn: str) -> bool:
+    """Update PGN fields for one game URL; returns True when updated."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return False
+    clean_url = str(game_url or "").strip()
+    clean_pgn = str(pgn or "").strip()
+    if not clean_url or not clean_pgn:
+        return False
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping PGN update: DB unavailable.", exc_info=True)
+        return False
+    try:
+        game_columns = _table_columns(conn, "games")
+        if not game_columns:
+            return False
+        if "game_url" not in game_columns and "url" not in game_columns:
+            return False
+        set_parts: list[str] = []
+        params: list[Any] = []
+        for field in ("pgn", "raw_pgn", "game_pgn"):
+            if field in game_columns:
+                set_parts.append(f"{field} = %s")
+                params.append(clean_pgn)
+        if not set_parts:
+            return False
+        url_col = "game_url" if "game_url" in game_columns else "url"
+        params.append(clean_url)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"UPDATE games SET {', '.join(set_parts)} WHERE {url_col} = %s",
+                tuple(params),
+            )
+            updated = bool(int(getattr(cursor, "rowcount", 0) or 0) > 0)
+        finally:
+            cursor.close()
+        conn.commit()
+        return updated
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping PGN update due to unexpected error.", exc_info=True)
+        return False
     finally:
         cleanup()
 
@@ -827,3 +1311,35 @@ def _summarize_performance(rows: list[Mapping[str, Any]]) -> dict[str, int]:
 def _is_postgres_url(database_url: str) -> bool:
     lower = (database_url or "").strip().lower()
     return lower.startswith(_POSTGRES_PREFIXES)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _coerce_datetime_utc(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None

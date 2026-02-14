@@ -405,11 +405,21 @@ def test_retry_failures_flag_processes_seeded_failed_game_once(monkeypatch, tmp_
         "player_color": "white",
     }
 
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [row])
     monkeypatch.setattr(
         chess_review,
-        "load_retry_failure_game_payloads",
-        lambda **_kwargs: [row],
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 1,
+            "eligible_now": 1,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "top_newest_pending": [{"game_url": row["game_url"], "success_notified": False, "engine_failed": False, "attempt_count": 0, "last_attempt_at": ""}],
+        },
     )
+    monkeypatch.setattr(chess_review, "load_retry_failure_game_payloads", lambda **_kwargs: [])
     monkeypatch.setattr(
         chess_review,
         "fetch_recent_games",
@@ -440,6 +450,46 @@ def test_retry_failures_flag_processes_seeded_failed_game_once(monkeypatch, tmp_
     assert calls["process"] == 1
 
 
+def test_poll_once_runs_queue_cleanup_job(monkeypatch, tmp_path) -> None:
+    ingest_check_module.close_ingest_db_check()
+    cleanup_calls = {"count": 0}
+    monkeypatch.setattr(
+        chess_review,
+        "cleanup_completed_games",
+        lambda **_kwargs: cleanup_calls.__setitem__("count", cleanup_calls["count"] + 1)
+        or {"available": True, "reason": "ok", "marked_count": 0},
+    )
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 0,
+            "eligible_now": 0,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "top_newest_pending": [],
+        },
+    )
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [])
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = False
+        args.lookback_days = 10
+        args.dry_run = False
+        args.retries = 1
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    assert cleanup_calls["count"] == 1
+
+
 def test_retry_failures_skips_game_when_attempt_backoff_threshold_exceeded(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     calls = {"process": 0}
@@ -459,7 +509,21 @@ def test_retry_failures_skips_game_when_attempt_backoff_threshold_exceeded(monke
         "player_color": "white",
     }
 
-    monkeypatch.setattr(chess_review, "load_retry_failure_game_payloads", lambda **_kwargs: [row])
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [row])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 1,
+            "eligible_now": 1,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "top_newest_pending": [{"game_url": row["game_url"], "success_notified": False, "engine_failed": False, "attempt_count": 0, "last_attempt_at": ""}],
+        },
+    )
+    monkeypatch.setattr(chess_review, "load_retry_failure_game_payloads", lambda **_kwargs: [])
     monkeypatch.setattr(
         chess_review,
         "should_skip_game_due_to_attempt_backoff",
@@ -492,3 +556,348 @@ def test_retry_failures_skips_game_when_attempt_backoff_threshold_exceeded(monke
 
     assert created == 0
     assert calls["process"] == 0
+
+
+def test_retry_failures_dedupes_overlapping_sources(monkeypatch, tmp_path) -> None:
+    ingest_check_module.close_ingest_db_check()
+    calls = {"process": 0}
+
+    row_a = {
+        "game_url": "https://www.chess.com/game/live/9010",
+        "pgn": '[Event "Live Chess"]\n[White "logan"]\n[Black "opponent"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+        "end_time": int(time.time()) - 10,
+        "time_control": "600",
+        "rated": True,
+        "rules": "chess",
+        "result": "1-0",
+        "white_username": "logan",
+        "black_username": "opponent",
+        "white_rating": 1200,
+        "black_rating": 1190,
+        "player_color": "white",
+    }
+    row_b = {
+        **row_a,
+        "game_url": "https://www.chess.com/game/live/9011",
+        "end_time": int(time.time()),
+    }
+
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [row_a])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 1,
+            "eligible_now": 1,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "top_newest_pending": [{"game_url": row_a["game_url"], "success_notified": False, "engine_failed": False, "attempt_count": 0, "last_attempt_at": ""}],
+        },
+    )
+    monkeypatch.setattr(chess_review, "load_retry_failure_game_payloads", lambda **_kwargs: [row_a, row_b])
+    monkeypatch.setattr(
+        chess_review,
+        "fetch_recent_games",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("retry-failures should not call fetch_recent_games")),
+    )
+    monkeypatch.setattr(chess_review, "clear_engine_failed", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "mark_engine_failed", lambda **_kwargs: {"available": False})
+
+    def _process_stub(_conn, _args, _game):
+        calls["process"] += 1
+        return tmp_path / "output" / "md" / "ok.md"
+
+    monkeypatch.setattr(chess_review, "process_game", _process_stub)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = True
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = False
+        args.retries = 1
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 2
+    assert calls["process"] == 2
+
+
+def test_poll_once_uses_pending_helper_in_non_retry_mode(monkeypatch, tmp_path) -> None:
+    ingest_check_module.close_ingest_db_check()
+    calls = {"process": 0}
+    now_epoch = int(time.time())
+    row = {
+        "game_url": "https://www.chess.com/game/live/9123",
+        "pgn": '[Event "Live Chess"]\n[White "logan"]\n[Black "opponent"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+        "end_time": now_epoch,
+        "time_control": "600",
+        "rated": True,
+        "rules": "chess",
+        "result": "1-0",
+        "white_username": "logan",
+        "black_username": "opponent",
+        "white_rating": 1200,
+        "black_rating": 1190,
+        "player_color": "white",
+    }
+
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [row])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 1,
+            "eligible_now": 1,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "top_newest_pending": [{"game_url": row["game_url"], "success_notified": False, "engine_failed": False, "attempt_count": 0, "last_attempt_at": ""}],
+        },
+    )
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chess_review, "clear_engine_failed", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "mark_engine_failed", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "record_game_attempt", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "should_skip_game_due_to_attempt_backoff", lambda **_kwargs: {"available": False, "skip": False})
+
+    def _process_stub(_conn, _args, game):
+        calls["process"] += 1
+        return tmp_path / "output" / "md" / f"{game.game_url.split('/')[-1]}.md"
+
+    monkeypatch.setattr(chess_review, "process_game", _process_stub)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = False
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = False
+        args.retries = 1
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 1
+    assert calls["process"] == 1
+
+
+def test_poll_once_logs_pending_diagnostics(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.setenv("DEBUG_POLLING", "1")
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 9,
+            "eligible_now": 2,
+            "excluded_by_cooldown": 3,
+            "excluded_by_attempt_cap": 1,
+            "excluded_by_engine_failed": 2,
+            "excluded_by_success_notified": 1,
+            "top_newest_pending": [
+                {"game_url": "https://www.chess.com/game/live/1", "success_notified": False, "engine_failed": False, "attempt_count": 1, "last_attempt_at": "2026-02-14T00:00:00Z"}
+            ],
+        },
+    )
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [])
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = False
+        args.lookback_days = 10
+        args.dry_run = False
+        args.retries = 1
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    text = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert "pending diagnostics pending_total=9 eligible_now=2 excluded_by_cooldown=3 excluded_by_attempt_cap=1 excluded_by_engine_failed=2 excluded_by_success_notified=1" in text
+    assert "pending newest url=https://www.chess.com/game/live/1" in text
+
+
+def test_queue_debug_logging_enabled_includes_counts_and_samples(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.setenv("ENABLE_QUEUE_DEBUG", "1")
+    monkeypatch.delenv("DEBUG_POLLING", raising=False)
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 12,
+            "eligible_now": 4,
+            "excluded_by_success_notified": 3,
+            "excluded_by_engine_failed": 2,
+            "excluded_by_attempt_cap": 2,
+            "excluded_by_cooldown": 1,
+            "sample_excluded_by_success_notified": ["https://www.chess.com/game/live/s1"],
+            "sample_excluded_by_engine_failed": ["https://www.chess.com/game/live/e1"],
+            "sample_excluded_by_attempt_cap": ["https://www.chess.com/game/live/a1"],
+            "sample_excluded_by_cooldown": ["https://www.chess.com/game/live/c1"],
+            "top_newest_pending": [],
+        },
+    )
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [])
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = False
+        args.lookback_days = 10
+        args.dry_run = False
+        args.retries = 1
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[QUEUE-DEBUG] pending_total=12 eligible_now=4 excluded_by_success_notified=3 excluded_by_engine_failed=2 excluded_by_attempt_cap=2 excluded_by_cooldown=1" in text
+    assert "[QUEUE-DEBUG] sample_excluded_by_success_notified=https://www.chess.com/game/live/s1" in text
+    assert "[QUEUE-DEBUG] sample_excluded_by_engine_failed=https://www.chess.com/game/live/e1" in text
+    assert "[QUEUE-DEBUG] sample_excluded_by_attempt_cap=https://www.chess.com/game/live/a1" in text
+    assert "[QUEUE-DEBUG] sample_excluded_by_cooldown=https://www.chess.com/game/live/c1" in text
+
+
+def test_queue_debug_logging_disabled_suppresses_queue_logs(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.delenv("ENABLE_QUEUE_DEBUG", raising=False)
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 12,
+            "eligible_now": 4,
+            "excluded_by_success_notified": 3,
+            "excluded_by_engine_failed": 2,
+            "excluded_by_attempt_cap": 2,
+            "excluded_by_cooldown": 1,
+            "sample_excluded_by_success_notified": ["https://www.chess.com/game/live/s1"],
+            "sample_excluded_by_engine_failed": ["https://www.chess.com/game/live/e1"],
+            "sample_excluded_by_attempt_cap": ["https://www.chess.com/game/live/a1"],
+            "sample_excluded_by_cooldown": ["https://www.chess.com/game/live/c1"],
+            "top_newest_pending": [],
+        },
+    )
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [])
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = False
+        args.lookback_days = 10
+        args.dry_run = False
+        args.retries = 1
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[QUEUE-DEBUG]" not in text
+
+
+def test_poll_once_repairs_missing_pgn_then_processes_game(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    now_epoch = int(time.time())
+    target_url = "https://www.chess.com/game/live/7777"
+    raw_row = {
+        "url": target_url,
+        "pgn": '[Event "Live Chess"]\n[White "logan"]\n[Black "opponent"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+        "end_time": now_epoch,
+        "time_control": "600",
+        "rated": True,
+        "rules": "chess",
+        "white": {"username": "logan", "rating": 1200},
+        "black": {"username": "opponent", "rating": 1190},
+    }
+    pending_row = {
+        "game_url": target_url,
+        "pgn": raw_row["pgn"],
+        "end_time": now_epoch,
+        "time_control": "600",
+        "rated": True,
+        "rules": "chess",
+        "result": "1-0",
+        "white_username": "logan",
+        "black_username": "opponent",
+        "white_rating": 1200,
+        "black_rating": 1190,
+        "player_color": "white",
+    }
+    calls = {"pending": 0, "process": 0, "updated": 0}
+
+    def _pending_rows(**_kwargs):
+        calls["pending"] += 1
+        if calls["pending"] == 1:
+            return []
+        return [pending_row]
+
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", _pending_rows)
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 1,
+            "eligible_now": 0,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "excluded_by_success_notified": 0,
+            "top_newest_pending": [],
+        },
+    )
+    monkeypatch.setattr(chess_review, "load_games_missing_pgn", lambda **_kwargs: [{"game_url": target_url}])
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [raw_row])
+    monkeypatch.setattr(
+        chess_review,
+        "update_game_pgn_for_url",
+        lambda **_kwargs: calls.__setitem__("updated", calls["updated"] + 1) or True,
+    )
+    monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chess_review, "clear_engine_failed", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "mark_engine_failed", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "record_game_attempt", lambda **_kwargs: {"available": False})
+    monkeypatch.setattr(chess_review, "should_skip_game_due_to_attempt_backoff", lambda **_kwargs: {"available": False, "skip": False})
+
+    def _process_stub(_conn, _args, _game):
+        calls["process"] += 1
+        return tmp_path / "output" / "md" / "repaired.md"
+
+    monkeypatch.setattr(chess_review, "process_game", _process_stub)
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = False
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = False
+        args.retries = 1
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 1
+    assert calls["updated"] == 1
+    assert calls["process"] == 1
+    assert "pgn_fetch_missing_retry game_url=https://www.chess.com/game/live/7777 status=success" in "\n".join(
+        rec.getMessage() for rec in caplog.records
+    )

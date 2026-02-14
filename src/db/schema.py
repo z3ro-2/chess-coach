@@ -76,6 +76,7 @@ def ensure_postgres_core_schema(*, database_url: str | None = None) -> dict[str,
               review_notified BOOLEAN NOT NULL DEFAULT FALSE,
               success_notified BOOLEAN NOT NULL DEFAULT FALSE,
               engine_failed BOOLEAN NOT NULL DEFAULT FALSE,
+              completed_at TIMESTAMPTZ,
               last_attempt_at TIMESTAMPTZ,
               attempt_count INTEGER NOT NULL DEFAULT 0,
               last_error TEXT,
@@ -109,6 +110,13 @@ def ensure_postgres_core_schema(*, database_url: str | None = None) -> dict[str,
             """
             ALTER TABLE games
             ADD COLUMN IF NOT EXISTS engine_failed BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ
             """,
         )
         _execute(

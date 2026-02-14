@@ -115,6 +115,57 @@ def test_status_includes_pending_games(monkeypatch, tmp_path) -> None:
     assert "Pending games count: 1" in text
 
 
+def test_status_includes_queue_health_metrics(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        "src.commands.get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 12,
+            "eligible_now": 4,
+            "excluded_by_cooldown": 3,
+            "excluded_by_attempt_cap": 2,
+            "excluded_by_engine_failed": 1,
+            "excluded_by_success_notified": 2,
+        },
+    )
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        result = run_command("status", conn, _args(tmp_path))
+    finally:
+        conn.close()
+
+    text = str(result["text"])
+    assert "Queue Health:" in text
+    assert "- pending_total: 12" in text
+    assert "- eligible_now: 4" in text
+    assert "- excluded_by_cooldown: 3" in text
+    assert "- excluded_by_attempt_cap: 2" in text
+    assert "- excluded_by_engine_failed: 1" in text
+    assert "- excluded_by_success_notified: 2" in text
+
+
+def test_status_queue_health_defaults_when_diagnostics_unavailable(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        "src.commands.get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        result = run_command("status", conn, _args(tmp_path))
+    finally:
+        conn.close()
+
+    text = str(result["text"])
+    assert "Queue Health:" in text
+    assert "- pending_total: 0" in text
+    assert "- eligible_now: 0" in text
+    assert "- excluded_by_cooldown: 0" in text
+    assert "- excluded_by_attempt_cap: 0" in text
+    assert "- excluded_by_engine_failed: 0" in text
+    assert "- excluded_by_success_notified: 0" in text
+
+
 def test_status_includes_last_review_time(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     conn = chess_review.init_db(tmp_path / "state.sqlite")
@@ -196,6 +247,71 @@ def test_parse_args_allows_tg_smoketest_without_username(monkeypatch, tmp_path) 
     assert args.tg_smoketest is True
     assert str(args.tg_smoketest_game_url) == "https://www.chess.com/game/live/1"
     assert Path(args.tg_smoketest_md) == md_path
+
+
+def test_parse_args_allows_queue_without_username(monkeypatch) -> None:
+    monkeypatch.delenv("CHESS_USERNAME", raising=False)
+    monkeypatch.delenv("CHESS_OUTPUT_DIR", raising=False)
+    args = chess_review.parse_args(["--queue"])
+    assert args.queue is True
+
+
+def test_queue_inspector_outputs_counts_and_top_rows(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "total_games_in_db": 20,
+            "total_pending_success_notified_false": 7,
+            "eligible_now": 3,
+            "excluded_by_cooldown": 2,
+            "excluded_by_attempt_cap": 1,
+            "excluded_by_engine_failed": 1,
+            "top_newest_pending": [
+                {
+                    "game_url": "https://www.chess.com/game/live/1",
+                    "success_notified": False,
+                    "engine_failed": False,
+                    "attempt_count": 2,
+                    "last_attempt_at": "2026-02-14T01:00:00Z",
+                }
+            ],
+        },
+    )
+
+    rc = chess_review.run_queue_inspector(SimpleNamespace(queue=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Queue Inspector:" in out
+    assert "- Total games in DB: 20" in out
+    assert "- Total pending (success_notified = FALSE): 7" in out
+    assert "- Total eligible: 3" in out
+    assert "- Blocked by cooldown: 2" in out
+    assert "- Blocked by attempt cap: 1" in out
+    assert "- Blocked by engine_failed: 1" in out
+    assert "game_url=https://www.chess.com/game/live/1" in out
+
+
+def test_queue_inspector_outputs_none_when_no_rows(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "total_games_in_db": 0,
+            "total_pending_success_notified_false": 0,
+            "eligible_now": 0,
+            "excluded_by_cooldown": 0,
+            "excluded_by_attempt_cap": 0,
+            "excluded_by_engine_failed": 0,
+            "top_newest_pending": [],
+        },
+    )
+
+    rc = chess_review.run_queue_inspector(SimpleNamespace(queue=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "- Top 10 pending rows:" in out
+    assert "  <none>" in out
 
 
 def test_summary_command_updates_state_and_does_not_retrigger_after_restart(monkeypatch, tmp_path) -> None:
