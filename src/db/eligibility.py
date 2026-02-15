@@ -37,6 +37,8 @@ def is_game_eligible_for_processing(
         return False
     if bool(row.get("engine_failed", False)):
         return False
+    if bool(row.get("pgn_missing", False)):
+        return False
     attempts = int(row.get("attempt_count", 0) or 0)
     if attempts >= max(1, int(max_attempts)):
         return False
@@ -72,7 +74,8 @@ def eligibility_rejection_reasons(
     return {
         "success_notified": bool(row.get("success_notified", False)),
         "engine_failed": bool(row.get("engine_failed", False)),
+        "pgn_missing": bool(row.get("pgn_missing", False)),
         "cooldown_active": bool(cooldown_active),
         "attempt_cap": attempts >= max(1, int(max_attempts)),
-        "missing_pgn": not bool(pgn),
+        "missing_pgn": (not bool(pgn)) or bool(row.get("pgn_missing", False)),
     }

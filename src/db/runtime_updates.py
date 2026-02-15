@@ -392,11 +392,16 @@ def mark_review_success_flags(
             return {"available": False, "reason": "player_unresolved", "updated": False}
 
         game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
-        _execute(
-            conn,
-            "UPDATE games SET success_notified = TRUE, review_notified = TRUE WHERE id = %s",
-            (game_id,),
-        )
+        set_parts = ["success_notified = TRUE", "review_notified = TRUE"]
+        if "analysis_complete" in game_columns:
+            set_parts.append("analysis_complete = TRUE")
+        if "last_error" in game_columns:
+            set_parts.append("last_error = NULL")
+        if "tg_send_failed" in game_columns:
+            set_parts.append("tg_send_failed = FALSE")
+        if "tg_last_error" in game_columns:
+            set_parts.append("tg_last_error = NULL")
+        _execute(conn, "UPDATE games SET " + ", ".join(set_parts) + " WHERE id = %s", (game_id,))
         conn.commit()
         return {"available": True, "reason": "marked_success", "updated": True}
     except Exception:
@@ -405,6 +410,105 @@ def mark_review_success_flags(
         except Exception:
             pass
         logger.debug("Skipping review-success flag mark due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
+    finally:
+        cleanup()
+
+
+def mark_analysis_complete(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+    md_path: str,
+) -> dict[str, Any]:
+    """Mark analysis as complete and persist markdown path."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping analysis-complete mark: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        required = {"analysis_complete", "md_path"}
+        if not player_columns or not game_columns or not required.issubset(game_columns):
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        set_parts = ["analysis_complete = TRUE", "md_path = %s"]
+        params: list[Any] = [str(md_path or "")]
+        if "tg_send_failed" in game_columns:
+            set_parts.append("tg_send_failed = FALSE")
+        if "tg_last_error" in game_columns:
+            set_parts.append("tg_last_error = NULL")
+        params.append(game_id)
+        _execute(conn, "UPDATE games SET " + ", ".join(set_parts) + " WHERE id = %s", tuple(params))
+        conn.commit()
+        return {"available": True, "reason": "marked_analysis_complete", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping analysis-complete mark due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_sync_failed", "updated": False}
+    finally:
+        cleanup()
+
+
+def mark_telegram_send_failed(
+    *,
+    player_username: str,
+    game_payload: Mapping[str, Any],
+    error_message: str,
+) -> dict[str, Any]:
+    """Persist Telegram send failure state for later send-only retries."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping tg-send-failed mark: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        required = {"tg_send_failed", "tg_last_error"}
+        if not player_columns or not game_columns or not required.issubset(game_columns):
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        player_id = _resolve_or_create_player_id(conn, player_username, player_columns)
+        if player_id is None:
+            conn.rollback()
+            return {"available": False, "reason": "player_unresolved", "updated": False}
+
+        game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
+        _execute(
+            conn,
+            "UPDATE games SET tg_send_failed = TRUE, tg_last_error = %s WHERE id = %s",
+            (str(error_message or "")[:4000], game_id),
+        )
+        conn.commit()
+        return {"available": True, "reason": "marked_tg_send_failed", "updated": True}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping tg-send-failed mark due to unexpected error.", exc_info=True)
         return {"available": False, "reason": "runtime_sync_failed", "updated": False}
     finally:
         cleanup()
@@ -756,7 +860,8 @@ def get_pending_games_for_processing(limit: int) -> list[dict[str, Any]]:
     - last_attempt_at is null OR older than cooldown window
       (env POLL_COOLDOWN_SECONDS, default 600)
     - pgn present and non-empty
-    Ordered by played_at ASC, created_at ASC, limited by ``limit``.
+    Ordered by recency (played_at DESC, fallback created_at DESC, fallback end_time DESC),
+    limited by ``limit``.
     """
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not _is_postgres_url(database_url):
@@ -843,12 +948,24 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
               white_username, black_username, white_rating, black_rating, player_color,
               played_at, success_notified, engine_failed, attempt_count, last_attempt_at,
               """
+            + ("analysis_complete" if "analysis_complete" in game_columns else "FALSE AS analysis_complete")
+            + ", "
+            + ("md_path" if "md_path" in game_columns else "NULL AS md_path")
+            + ", "
+            + ("tg_send_failed" if "tg_send_failed" in game_columns else "FALSE AS tg_send_failed")
+            + ", "
+            + ("tg_last_error" if "tg_last_error" in game_columns else "NULL AS tg_last_error")
+            + ", "
+            + ("pgn_missing" if "pgn_missing" in game_columns else "FALSE AS pgn_missing")
+            + ", "
+            + """
+              """
             + ("completed_at" if "completed_at" in game_columns else "NULL AS completed_at")
             + ", "
             + ("created_at" if "created_at" in game_columns else "NULL AS created_at")
             + """
             FROM games
-            ORDER BY played_at ASC, created_at ASC, id ASC
+            ORDER BY played_at DESC NULLS LAST, created_at DESC NULLS LAST, end_time DESC, id DESC
             """,
         )
         # Prefer poll-specific knobs; keep legacy names as compatibility fallback.
@@ -901,6 +1018,10 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
                 if len(sample_excluded_by_cooldown) < 5:
                     sample_excluded_by_cooldown.append(str(row_dict.get("game_url", "") or ""))
                 continue
+            if str(row_dict.get("rules", "chess") or "chess").strip().lower() != "chess":
+                continue
+            if not str(row_dict.get("time_control", "") or "").strip():
+                continue
             if is_game_eligible_for_processing(
                 row_dict,
                 now=now_utc,
@@ -911,11 +1032,12 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
 
         eligible_rows_all.sort(
             key=lambda item: (
-                _coerce_datetime_utc(item.get("played_at")) is None,
-                _coerce_datetime_utc(item.get("played_at")) or datetime.max.replace(tzinfo=timezone.utc),
-                _coerce_datetime_utc(item.get("created_at")) is None,
-                _coerce_datetime_utc(item.get("created_at")) or datetime.max.replace(tzinfo=timezone.utc),
-            )
+                _coerce_datetime_utc(item.get("played_at"))
+                or _coerce_datetime_utc(item.get("created_at"))
+                or datetime.min.replace(tzinfo=timezone.utc),
+                int(item.get("end_time", 0) or 0),
+            ),
+            reverse=True,
         )
         newest_pending = sorted(
             pending_rows,
@@ -932,6 +1054,8 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
                 "engine_failed": bool(item.get("engine_failed", False)),
                 "attempt_count": int(item.get("attempt_count", 0) or 0),
                 "last_attempt_at": str(item.get("last_attempt_at", "") or ""),
+                "analysis_complete": bool(item.get("analysis_complete", False)),
+                "tg_send_failed": bool(item.get("tg_send_failed", False)),
             }
             for item in newest_pending
         ]
@@ -1006,19 +1130,56 @@ def load_games_missing_pgn(limit: int = 100) -> list[dict[str, Any]]:
         if not missing_parts:
             return []
 
-        rows = _fetchall(
-            conn,
+        max_attempts = max(1, _env_int("PGN_MISSING_MAX_ATTEMPTS", 5))
+        retry_seconds = max(0, _env_int("PGN_MISSING_RETRY_SECONDS", 3600))
+        query = (
             f"""
-            SELECT id, {url_col} AS game_url
+            SELECT id, {url_col} AS game_url,
+                   """
+            + ("pgn_missing" if "pgn_missing" in game_columns else "FALSE AS pgn_missing")
+            + ", "
+            + ("pgn_missing_attempts" if "pgn_missing_attempts" in game_columns else "0 AS pgn_missing_attempts")
+            + ", "
+            + ("pgn_missing_last_attempt_at" if "pgn_missing_last_attempt_at" in game_columns else "NULL AS pgn_missing_last_attempt_at")
+            + f"""
             FROM games
             WHERE {url_col} IS NOT NULL
               AND TRIM({url_col}) <> ''
               AND ({' OR '.join(missing_parts)})
+              AND (
+                """
+            + ("COALESCE(pgn_missing, FALSE) = FALSE" if "pgn_missing" in game_columns else "TRUE")
+            + """
+              )
+              AND (
+                """
+            + (
+                "(COALESCE(pgn_missing_attempts, 0) < %s)"
+                if "pgn_missing_attempts" in game_columns
+                else "TRUE"
+            )
+            + """
+              )
+              AND (
+                """
+            + (
+                "(pgn_missing_last_attempt_at IS NULL OR pgn_missing_last_attempt_at < (NOW() - (%s * INTERVAL '1 second')))"
+                if "pgn_missing_last_attempt_at" in game_columns
+                else "TRUE"
+            )
+            + """
+              )
             ORDER BY played_at ASC NULLS LAST, id ASC
             LIMIT %s
-            """,
-            (max(1, int(limit)),),
+            """
         )
+        params: list[Any] = []
+        if "pgn_missing_attempts" in game_columns:
+            params.append(max_attempts)
+        if "pgn_missing_last_attempt_at" in game_columns:
+            params.append(retry_seconds)
+        params.append(max(1, int(limit)))
+        rows = _fetchall(conn, query, tuple(params))
         return [dict(r) for r in rows]
     except Exception:
         logger.debug("Skipping missing-PGN scan due to unexpected error.", exc_info=True)
@@ -1053,6 +1214,12 @@ def update_game_pgn_for_url(*, game_url: str, pgn: str) -> bool:
             if field in game_columns:
                 set_parts.append(f"{field} = %s")
                 params.append(clean_pgn)
+        if "pgn_missing" in game_columns:
+            set_parts.append("pgn_missing = FALSE")
+        if "pgn_missing_attempts" in game_columns:
+            set_parts.append("pgn_missing_attempts = 0")
+        if "pgn_missing_last_attempt_at" in game_columns:
+            set_parts.append("pgn_missing_last_attempt_at = NULL")
         if not set_parts:
             return False
         url_col = "game_url" if "game_url" in game_columns else "url"
@@ -1075,6 +1242,155 @@ def update_game_pgn_for_url(*, game_url: str, pgn: str) -> bool:
             pass
         logger.debug("Skipping PGN update due to unexpected error.", exc_info=True)
         return False
+    finally:
+        cleanup()
+
+
+def record_pgn_missing_not_found(*, game_url: str) -> dict[str, Any]:
+    """Record a PGN not-found event and optionally mark row as permanently missing."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+    clean_url = str(game_url or "").strip()
+    if not clean_url:
+        return {"available": False, "reason": "empty_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping pgn-missing record: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        game_columns = _table_columns(conn, "games")
+        required = {"pgn_missing", "pgn_missing_attempts", "pgn_missing_last_attempt_at"}
+        if not game_columns or "game_url" not in game_columns or not required.issubset(game_columns):
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        max_attempts = max(1, _env_int("PGN_MISSING_MAX_ATTEMPTS", 5))
+        row = _fetchone(
+            conn,
+            "SELECT id, COALESCE(pgn_missing_attempts, 0) AS attempts FROM games WHERE game_url = %s LIMIT 1",
+            (clean_url,),
+        )
+        if not row:
+            conn.commit()
+            return {"available": False, "reason": "row_not_found", "updated": False}
+
+        game_id = int(row.get("id", 0) or 0)
+        attempts = int(row.get("attempts", 0) or 0) + 1
+        permanently_missing = attempts >= max_attempts
+        _execute(
+            conn,
+            """
+            UPDATE games
+            SET pgn_missing_attempts = %s,
+                pgn_missing_last_attempt_at = NOW(),
+                pgn_missing = %s
+            WHERE id = %s
+            """,
+            (attempts, permanently_missing, game_id),
+        )
+        conn.commit()
+        return {
+            "available": True,
+            "reason": "updated",
+            "updated": True,
+            "attempts": attempts,
+            "pgn_missing": permanently_missing,
+            "max_attempts": max_attempts,
+        }
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping pgn-missing record due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_error", "updated": False}
+    finally:
+        cleanup()
+
+
+def reset_game_processing_state(*, game_url: str) -> dict[str, Any]:
+    """Reset processing/notification/failure flags for one game URL."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {"available": False, "reason": "no_database_url", "updated": False}
+    clean_url = str(game_url or "").strip()
+    if not clean_url:
+        return {"available": False, "reason": "empty_url", "updated": False}
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping game reset: DB unavailable.", exc_info=True)
+        return {"available": False, "reason": "db_unreachable", "updated": False}
+
+    try:
+        game_columns = _table_columns(conn, "games")
+        if not game_columns:
+            return {"available": False, "reason": "schema_missing", "updated": False}
+        url_col = "game_url" if "game_url" in game_columns else ("url" if "url" in game_columns else None)
+        if not url_col:
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        row = _fetchone(conn, f"SELECT id FROM games WHERE {url_col} = %s LIMIT 1", (clean_url,))
+        if not row:
+            conn.commit()
+            return {"available": True, "reason": "row_not_found", "updated": False}
+
+        game_id = int(row.get("id", 0) or 0)
+        if game_id <= 0:
+            return {"available": False, "reason": "invalid_row", "updated": False}
+
+        field_values: dict[str, Any] = {
+            "engine_failed": False,
+            "failure_notified": False,
+            "attempt_count": 0,
+            "last_attempt_at": None,
+            "success_notified": False,
+            "review_notified": False,
+            "completed_at": None,
+            "last_error": None,
+            "analysis_complete": False,
+            "md_path": None,
+            "tg_send_failed": False,
+            "tg_last_error": None,
+            "pgn_missing": False,
+            "pgn_missing_attempts": 0,
+            "pgn_missing_last_attempt_at": None,
+        }
+        set_parts: list[str] = []
+        params: list[Any] = []
+        changed_fields: list[str] = []
+        for field, value in field_values.items():
+            if field not in game_columns:
+                continue
+            set_parts.append(f"{field} = %s")
+            params.append(value)
+            changed_fields.append(field)
+
+        if not set_parts:
+            conn.commit()
+            return {"available": False, "reason": "schema_missing", "updated": False}
+
+        params.append(game_id)
+        _execute(conn, "UPDATE games SET " + ", ".join(set_parts) + " WHERE id = %s", tuple(params))
+        conn.commit()
+        return {
+            "available": True,
+            "reason": "reset",
+            "updated": True,
+            "changed_fields": changed_fields,
+            "game_url": clean_url,
+        }
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.debug("Skipping game reset due to unexpected error.", exc_info=True)
+        return {"available": False, "reason": "runtime_error", "updated": False}
     finally:
         cleanup()
 

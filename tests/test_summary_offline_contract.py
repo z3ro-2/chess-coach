@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 from pathlib import Path
@@ -448,7 +449,7 @@ def test_review_notified_gating_first_success_sends_second_skips(
     assert first is not None
     assert second is not None
     assert len(telegram_text_calls) == 1
-    assert telegram_text_calls[0]["message"] == sample_game.game_url
+    assert telegram_text_calls[0]["message"].endswith("\n" + sample_game.game_url)
     assert telegram_text_calls[0]["kwargs"]["disable_web_page_preview"] is False
     assert len(telegram_doc_calls) == 1
     assert str(telegram_doc_calls[0]["file_path"]).endswith(".md")
@@ -490,10 +491,35 @@ def test_success_notification_sends_document_with_md_path(
 
     assert out is not None
     assert len(text_calls) == 1
-    assert text_calls[0]["message"] == sample_game.game_url
+    body = text_calls[0]["message"]
+    assert body.endswith("\n" + sample_game.game_url)
+    assert "♟ Chess review ready" in body
+    assert body.count("\n- ") >= 3
     assert text_calls[0]["kwargs"]["disable_web_page_preview"] is False
     assert len(doc_calls) == 1
     assert doc_calls[0]["file_path"] == out
+
+
+def test_engine_failure_notification_enables_preview_and_has_url_last_line(monkeypatch, summary_args) -> None:
+    sent: list[dict] = []
+
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **kwargs: sent.append({"message": str(message), "kwargs": dict(kwargs)}),
+    )
+
+    game_url = "https://www.chess.com/game/live/999001"
+    ok = chess_review._send_engine_failure_telegram_with_retry(
+        message=chess_review.build_telegram_failure_message(game_url=game_url, reason="Stockfish unavailable"),
+        args=summary_args,
+        context="game_999001",
+    )
+
+    assert ok is True
+    assert len(sent) == 1
+    assert sent[0]["kwargs"]["disable_web_page_preview"] is False
+    assert sent[0]["message"].endswith("\n" + game_url)
 
 
 def test_process_game_records_attempt_before_processing_and_marks_success_flags(
@@ -534,7 +560,133 @@ def test_process_game_records_attempt_before_processing_and_marks_success_flags(
     assert out is not None
     assert len(attempt_calls) == 1
     assert attempt_calls[0]["last_error"] is None
+    assert len(success_flag_calls) == 0
+
+
+def test_success_notification_does_not_mark_flags_when_document_send_fails(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    text_calls: list[dict] = []
+    success_flag_calls: list[dict] = []
+    tg_failed_calls: list[dict] = []
+
+    monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# game review")
+    monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chess_review, "mark_processed", lambda **_kwargs: None)
+    monkeypatch.setattr(chess_review, "_record_processed_game_meta", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
+    monkeypatch.setattr(chess_review, "record_player_rating_for_game", lambda **_kwargs: False)
+    monkeypatch.setattr(chess_review, "_write_player_stats_markdown", lambda *_args, **_kwargs: tmp_path / "output" / "player_stats.md")
+    monkeypatch.setattr(chess_review, "_maybe_generate_player_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "should_notify_review_success", lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True})
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **kwargs: text_calls.append({"message": str(message), "kwargs": dict(kwargs)}),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_document",
+        lambda **_kwargs: (_ for _ in ()).throw(chess_review.TelegramError("Telegram API error 500: down")),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_review_success_flags",
+        lambda **kwargs: success_flag_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_notified", "updated": True},
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_telegram_send_failed",
+        lambda **kwargs: tg_failed_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_tg_send_failed", "updated": True},
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, sample_game)
+    finally:
+        conn.close()
+
+    assert out is not None
+    assert len(text_calls) == 1
+    assert len(success_flag_calls) == 0
+    assert len(tg_failed_calls) == 1
+
+
+def test_process_game_send_only_retry_skips_analysis_and_reuses_existing_md(
+    monkeypatch,
+    tmp_path,
+    summary_args,
+    sample_game,
+) -> None:
+    existing_md = tmp_path / "output" / "md" / "existing.md"
+    chess_review.write_text(existing_md, "# existing review")
+
+    send_text_calls: list[dict] = []
+    send_doc_calls: list[dict] = []
+    success_flag_calls: list[dict] = []
+    analysis_mark_calls: list[dict] = []
+
+    send_only_game = dataclasses.replace(
+        sample_game,
+        analysis_complete=True,
+        analysis_md_path=str(existing_md),
+    )
+
+    monkeypatch.setattr(
+        chess_review,
+        "run_analysis_pipeline",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("analysis should not rerun for send-only retry")),
+    )
+    monkeypatch.setattr(chess_review, "is_processed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chess_review, "mark_processed", lambda **_kwargs: None)
+    monkeypatch.setattr(chess_review, "_record_processed_game_meta", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "sync_game_record_and_traits", lambda **_kwargs: {"available": False, "reason": "no_database_url"})
+    monkeypatch.setattr(chess_review, "record_player_rating_for_game", lambda **_kwargs: False)
+    monkeypatch.setattr(chess_review, "_write_player_stats_markdown", lambda *_args, **_kwargs: tmp_path / "output" / "player_stats.md")
+    monkeypatch.setattr(chess_review, "_maybe_generate_player_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chess_review, "mark_analysis_complete", lambda **kwargs: analysis_mark_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_analysis_complete", "updated": True})
+    monkeypatch.setattr(chess_review, "should_notify_review_success", lambda **_kwargs: {"available": True, "reason": "notify_pending", "should_notify": True})
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_message",
+        lambda message, **kwargs: send_text_calls.append({"message": str(message), "kwargs": dict(kwargs)}),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "send_telegram_document",
+        lambda **kwargs: send_doc_calls.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "mark_review_success_flags",
+        lambda **kwargs: success_flag_calls.append(dict(kwargs)) or {"available": True, "reason": "marked_success", "updated": True},
+    )
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        out = chess_review.process_game(conn, summary_args, send_only_game)
+    finally:
+        conn.close()
+
+    assert out == existing_md
+    assert len(send_text_calls) == 1
+    assert len(send_doc_calls) == 1
+    assert send_doc_calls[0]["file_path"] == existing_md
     assert len(success_flag_calls) == 1
+    assert len(analysis_mark_calls) == 0
+
+
+def test_compose_telegram_success_payload_has_header_bullets_and_url(sample_game) -> None:
+    payload = chess_review.compose_telegram_success_payload(sample_game)
+    assert isinstance(payload, dict)
+    body = str(payload.get("body", ""))
+    lines = body.splitlines()
+    assert lines[0] == "♟ Chess review ready"
+    assert body.count("\n- ") >= 3
+    assert lines[-1] == sample_game.game_url
 
 
 def test_process_game_attempt_is_recorded_before_analysis_call(

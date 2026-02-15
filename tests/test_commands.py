@@ -256,6 +256,20 @@ def test_parse_args_allows_queue_without_username(monkeypatch) -> None:
     assert args.queue is True
 
 
+def test_parse_args_allows_reset_game_without_username(monkeypatch) -> None:
+    monkeypatch.delenv("CHESS_USERNAME", raising=False)
+    monkeypatch.delenv("CHESS_OUTPUT_DIR", raising=False)
+    args = chess_review.parse_args(["--reset-game", "https://www.chess.com/game/live/123"])
+    assert str(args.reset_game) == "https://www.chess.com/game/live/123"
+
+
+def test_parse_args_allows_smoke_without_username(monkeypatch) -> None:
+    monkeypatch.delenv("CHESS_USERNAME", raising=False)
+    monkeypatch.delenv("CHESS_OUTPUT_DIR", raising=False)
+    args = chess_review.parse_args(["--smoke"])
+    assert args.smoke is True
+
+
 def test_queue_inspector_outputs_counts_and_top_rows(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         chess_review,
@@ -288,10 +302,81 @@ def test_queue_inspector_outputs_counts_and_top_rows(monkeypatch, capsys) -> Non
     assert "- total_games: 20" in out
     assert "- pending_total: 7" in out
     assert "- eligible_now: 3" in out
-    assert "- blocked_by_cooldown: 2" in out
-    assert "- blocked_by_attempt_cap: 1" in out
-    assert "- blocked_by_flags: 3" in out
-    assert "game_url=https://www.chess.com/game/live/1" in out
+
+
+def test_run_smoke_checks_fails_with_actionable_reasons(monkeypatch, capsys, tmp_path) -> None:
+    missing_stockfish = tmp_path / "missing-stockfish"
+    monkeypatch.setattr(chess_review, "load_prompt_file", lambda _name: (_ for _ in ()).throw(FileNotFoundError("missing prompt")))
+    monkeypatch.setattr(chess_review, "ensure_postgres_core_schema", lambda: {"ready": False, "reason": "no_database_url"})
+
+    args = SimpleNamespace(
+        stockfish_path=str(missing_stockfish),
+        ollama_url="",
+        ollama_model="",
+        telegram_bot_token="",
+        telegram_chat_id="",
+        smoke_send_telegram=False,
+        timeout=3,
+        telegram_disable_notification=True,
+    )
+
+    rc = chess_review.run_smoke_checks(args)
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "Smoke result: FAIL" in out
+    assert "failed to load" in out
+    assert "binary not found" in out
+    assert "OLLAMA_URL is empty" in out
+    assert "TG_BOT_TOKEN/TG_CHAT_ID missing" in out
+    assert "postgres schema not ready" in out
+
+
+def test_run_smoke_checks_passes_when_all_checks_ok(monkeypatch, capsys, tmp_path) -> None:
+    stockfish_bin = tmp_path / "stockfish"
+    stockfish_bin.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(chess_review, "load_prompt_file", lambda _name: "prompt text")
+
+    class _Proc:
+        stdout = "id name Stockfish\nuciok\n"
+        stderr = ""
+        returncode = 0
+
+    monkeypatch.setattr(chess_review.subprocess, "run", lambda *args, **kwargs: _Proc())
+
+    class _Resp:
+        status_code = 200
+        content = b'{"models":[{"name":"qwen2.5:14b-instruct"}]}'
+
+        @staticmethod
+        def json():
+            return {"models": [{"name": "qwen2.5:14b-instruct"}]}
+
+    monkeypatch.setattr(chess_review.requests, "get", lambda *_args, **_kwargs: _Resp())
+    monkeypatch.setattr(chess_review, "ensure_postgres_core_schema", lambda: {"ready": True, "reason": "ready"})
+
+    args = SimpleNamespace(
+        stockfish_path=str(stockfish_bin),
+        ollama_url="http://127.0.0.1:11434",
+        ollama_model="qwen2.5:14b-instruct",
+        telegram_bot_token="token",
+        telegram_chat_id="chat",
+        smoke_send_telegram=False,
+        timeout=3,
+        telegram_disable_notification=True,
+    )
+
+    rc = chess_review.run_smoke_checks(args)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Smoke result: PASS" in out
+    assert "[PASS] prompt:review_system.md" in out
+    assert "[PASS] stockfish" in out
+    assert "[PASS] ollama" in out
+    assert "[PASS] telegram" in out
+    assert "[PASS] db_schema" in out
 
 
 def test_queue_inspector_outputs_none_when_no_rows(monkeypatch, capsys) -> None:

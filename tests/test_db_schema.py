@@ -27,6 +27,13 @@ def test_ensure_postgres_core_schema_includes_failure_notified_column(monkeypatc
                 "failure_notified",
                 "review_notified",
                 "success_notified",
+                "analysis_complete",
+                "md_path",
+                "tg_send_failed",
+                "tg_last_error",
+                "pgn_missing",
+                "pgn_missing_attempts",
+                "pgn_missing_last_attempt_at",
                 "engine_failed",
                 "completed_at",
                 "last_attempt_at",
@@ -49,6 +56,13 @@ def test_ensure_postgres_core_schema_includes_failure_notified_column(monkeypatc
         and "failure_notified BOOLEAN NOT NULL DEFAULT FALSE" in q
         and "review_notified BOOLEAN NOT NULL DEFAULT FALSE" in q
         and "success_notified BOOLEAN NOT NULL DEFAULT FALSE" in q
+        and "analysis_complete BOOLEAN NOT NULL DEFAULT FALSE" in q
+        and "md_path TEXT" in q
+        and "tg_send_failed BOOLEAN NOT NULL DEFAULT FALSE" in q
+        and "tg_last_error TEXT" in q
+        and "pgn_missing BOOLEAN NOT NULL DEFAULT FALSE" in q
+        and "pgn_missing_attempts INTEGER NOT NULL DEFAULT 0" in q
+        and "pgn_missing_last_attempt_at TIMESTAMPTZ" in q
         and "engine_failed BOOLEAN NOT NULL DEFAULT FALSE" in q
         and "completed_at TIMESTAMPTZ" in q
         and "last_attempt_at TIMESTAMPTZ" in q
@@ -59,6 +73,13 @@ def test_ensure_postgres_core_schema_includes_failure_notified_column(monkeypatc
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS failure_notified BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS review_notified BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS success_notified BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS analysis_complete BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS md_path TEXT" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS tg_send_failed BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS tg_last_error TEXT" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS pgn_missing BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS pgn_missing_attempts INTEGER NOT NULL DEFAULT 0" in q for q in executed)
+    assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS pgn_missing_last_attempt_at TIMESTAMPTZ" in q for q in executed)
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS engine_failed BOOLEAN NOT NULL DEFAULT FALSE" in q for q in executed)
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ" in q for q in executed)
     assert any("ALTER TABLE games ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ" in q for q in executed)

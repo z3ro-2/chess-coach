@@ -31,6 +31,8 @@ def _base_row(*, game_url: str, played_at: datetime) -> dict[str, object]:
         "game_url": game_url,
         "pgn": "[Event \"Live Chess\"]\\n1. e4 e5 1-0",
         "played_at": played_at,
+        "time_control": "600",
+        "rules": "chess",
         "success_notified": False,
         "engine_failed": False,
         "attempt_count": 0,
@@ -55,8 +57,8 @@ def test_get_pending_games_for_processing_returns_eligible_rows(monkeypatch) -> 
     out = runtime_updates.get_pending_games_for_processing(limit=10)
 
     assert len(out) == 2
-    assert out[0]["game_url"] == "https://www.chess.com/game/live/1"
-    assert out[1]["game_url"] == "https://www.chess.com/game/live/2"
+    assert out[0]["game_url"] == "https://www.chess.com/game/live/2"
+    assert out[1]["game_url"] == "https://www.chess.com/game/live/1"
 
 
 def test_get_pending_games_for_processing_excludes_rows_blocked_by_cooldown(monkeypatch) -> None:
@@ -221,15 +223,15 @@ def test_get_pending_games_for_processing_respects_limit(monkeypatch) -> None:
     assert len(out) == 3
 
 
-def test_get_pending_games_for_processing_orders_by_played_at_then_created_at(monkeypatch) -> None:
+def test_get_pending_games_for_processing_orders_by_newest_played_at_then_created_at(monkeypatch) -> None:
     now = datetime.now(timezone.utc)
     same_played = now - timedelta(hours=1)
     first_created = _base_row(game_url="https://www.chess.com/game/live/created-first", played_at=same_played)
     first_created["created_at"] = now - timedelta(hours=2)
     second_created = _base_row(game_url="https://www.chess.com/game/live/created-second", played_at=same_played)
     second_created["created_at"] = now - timedelta(hours=1, minutes=30)
-    older_played = _base_row(game_url="https://www.chess.com/game/live/played-oldest", played_at=now - timedelta(hours=2))
-    older_played["created_at"] = now - timedelta(hours=2, minutes=10)
+    newer_played = _base_row(game_url="https://www.chess.com/game/live/played-newest", played_at=now - timedelta(minutes=10))
+    newer_played["created_at"] = now - timedelta(minutes=15)
 
     monkeypatch.setenv("DATABASE_URL", "postgres://example")
     monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
@@ -243,13 +245,112 @@ def test_get_pending_games_for_processing_orders_by_played_at_then_created_at(mo
     monkeypatch.setattr(
         runtime_updates,
         "_fetchall",
-        lambda _conn, _query, _params=(): [second_created, older_played, first_created],
+        lambda _conn, _query, _params=(): [second_created, newer_played, first_created],
     )
 
     out = runtime_updates.get_pending_games_for_processing(limit=10)
 
     assert [row["game_url"] for row in out] == [
-        "https://www.chess.com/game/live/played-oldest",
-        "https://www.chess.com/game/live/created-first",
+        "https://www.chess.com/game/live/played-newest",
         "https://www.chess.com/game/live/created-second",
+        "https://www.chess.com/game/live/created-first",
     ]
+
+
+def test_get_pending_games_for_processing_prefers_newest_over_analysis_complete(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    analysis_complete = _base_row(game_url="https://www.chess.com/game/live/send-only", played_at=now - timedelta(minutes=30))
+    analysis_complete["analysis_complete"] = True
+    analysis_complete["md_path"] = "/data/md/send-only.md"
+    regular = _base_row(game_url="https://www.chess.com/game/live/regular", played_at=now - timedelta(minutes=1))
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("POLL_COOLDOWN_SECONDS", "600")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, _table: _required_game_columns() | {"analysis_complete", "md_path"},
+    )
+    monkeypatch.setattr(runtime_updates, "_fetchall", lambda _conn, _query, _params=(): [regular, analysis_complete])
+
+    out = runtime_updates.get_pending_games_for_processing(limit=10)
+
+    assert [row["game_url"] for row in out] == [
+        "https://www.chess.com/game/live/regular",
+        "https://www.chess.com/game/live/send-only",
+    ]
+
+
+def test_get_pending_games_for_processing_falls_back_to_created_at_when_played_at_missing(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    missing_played_newer_created = _base_row(
+        game_url="https://www.chess.com/game/live/missing-played-newer-created",
+        played_at=now - timedelta(minutes=5),
+    )
+    missing_played_newer_created["played_at"] = None
+    missing_played_newer_created["created_at"] = now - timedelta(minutes=1)
+
+    missing_played_older_created = _base_row(
+        game_url="https://www.chess.com/game/live/missing-played-older-created",
+        played_at=now - timedelta(minutes=4),
+    )
+    missing_played_older_created["played_at"] = None
+    missing_played_older_created["created_at"] = now - timedelta(minutes=3)
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("POLL_COOLDOWN_SECONDS", "600")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, _table: _required_game_columns() | {"created_at"},
+    )
+    monkeypatch.setattr(
+        runtime_updates,
+        "_fetchall",
+        lambda _conn, _query, _params=(): [missing_played_older_created, missing_played_newer_created],
+    )
+
+    out = runtime_updates.get_pending_games_for_processing(limit=10)
+
+    assert [row["game_url"] for row in out] == [
+        "https://www.chess.com/game/live/missing-played-newer-created",
+        "https://www.chess.com/game/live/missing-played-older-created",
+    ]
+
+
+def test_get_pending_games_for_processing_excludes_unsupported_rules_and_missing_time_control(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    supported = _base_row(game_url="https://www.chess.com/game/live/supported", played_at=now - timedelta(minutes=3))
+    supported["rules"] = "chess"
+    supported["time_control"] = "600"
+
+    unsupported_rules = _base_row(game_url="https://www.chess.com/game/live/unsupported-rules", played_at=now - timedelta(minutes=1))
+    unsupported_rules["rules"] = "chess960"
+    unsupported_rules["time_control"] = "600"
+
+    missing_time_control = _base_row(game_url="https://www.chess.com/game/live/missing-tc", played_at=now - timedelta(minutes=2))
+    missing_time_control["rules"] = "chess"
+    missing_time_control["time_control"] = ""
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("POLL_COOLDOWN_SECONDS", "600")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, _table: _required_game_columns() | {"rules", "time_control"},
+    )
+    monkeypatch.setattr(
+        runtime_updates,
+        "_fetchall",
+        lambda _conn, _query, _params=(): [supported, unsupported_rules, missing_time_control],
+    )
+
+    out = runtime_updates.get_pending_games_for_processing(limit=10)
+
+    assert [row["game_url"] for row in out] == ["https://www.chess.com/game/live/supported"]

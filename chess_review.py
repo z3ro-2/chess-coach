@@ -42,7 +42,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -57,6 +59,7 @@ import requests
 from analysis_pipeline import (
     LLMFormatViolationError,
     get_llm_attempt_counters,
+    load_prompt_file,
     reset_llm_attempt_counters,
     run_analysis_pipeline,
 )
@@ -79,10 +82,14 @@ from src.db.runtime_updates import (
     get_pending_games_for_processing,
     get_pending_games_for_processing_diagnostics,
     load_games_missing_pgn,
+    record_pgn_missing_not_found,
     load_retry_failure_game_payloads,
     mark_review_success_flags,
     should_notify_review_success,
     record_game_attempt,
+    reset_game_processing_state,
+    mark_analysis_complete,
+    mark_telegram_send_failed,
     mark_engine_failed,
     mark_engine_failure_notified,
     should_skip_game_due_to_attempt_backoff,
@@ -169,6 +176,22 @@ def send_telegram_message(
         raise TelegramError(str(exc)) from exc
 
 
+def _send_telegram_text_notification(
+    *,
+    message: str,
+    args: argparse.Namespace,
+    enable_preview: bool,
+) -> None:
+    send_telegram_message(
+        message,
+        bot_token=str(getattr(args, "telegram_bot_token", "") or ""),
+        chat_id=str(getattr(args, "telegram_chat_id", "") or ""),
+        timeout=int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+        disable_notification=bool(getattr(args, "telegram_disable_notification", False)),
+        disable_web_page_preview=not bool(enable_preview),
+    )
+
+
 def _telegram_error_status_code(exc: Exception) -> int | None:
     match = re.search(r"Telegram API error\s+(\d+)", str(exc))
     if not match:
@@ -192,14 +215,8 @@ def _write_telegram_failed_message_dump(*, context: str, formatted_message: str)
 
 
 def _send_engine_failure_telegram_with_retry(*, message: str, args: argparse.Namespace, context: str) -> bool:
-    send_kwargs = {
-        "bot_token": str(getattr(args, "telegram_bot_token", "") or ""),
-        "chat_id": str(getattr(args, "telegram_chat_id", "") or ""),
-        "timeout": int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
-        "disable_notification": bool(getattr(args, "telegram_disable_notification", False)),
-    }
     try:
-        send_telegram_message(message, **send_kwargs)
+        _send_telegram_text_notification(message=message, args=args, enable_preview=True)
         return True
     except Exception as exc:
         status = _telegram_error_status_code(exc)
@@ -212,7 +229,11 @@ def _send_engine_failure_telegram_with_retry(*, message: str, args: argparse.Nam
             except Exception:
                 logger.error("Failed to write Telegram failed-message dump for context=%s", context, exc_info=True)
             try:
-                send_telegram_message(_strip_engine_failure_diagnostics(message), **send_kwargs)
+                _send_telegram_text_notification(
+                    message=_strip_engine_failure_diagnostics(message),
+                    args=args,
+                    enable_preview=True,
+                )
                 return True
             except Exception as second_exc:
                 logger.error("Telegram engine-failure notification retry (400) failed: %s", second_exc)
@@ -220,7 +241,7 @@ def _send_engine_failure_telegram_with_retry(*, message: str, args: argparse.Nam
         if status is not None and status >= 500:
             time.sleep(0.5)
             try:
-                send_telegram_message(message, **send_kwargs)
+                _send_telegram_text_notification(message=message, args=args, enable_preview=True)
                 return True
             except Exception as second_exc:
                 logger.error("Telegram engine-failure notification retry (5xx) failed: %s", second_exc)
@@ -248,35 +269,62 @@ def _extract_llm_diagnostics_from_review_markdown(review_md: str) -> dict[str, A
     return {}
 
 
-def build_telegram_success_message(game: "GameInfo") -> str:
-    """Plain-text success message with raw URL as last line for preview."""
+def compose_telegram_success_payload(game: "GameInfo") -> dict[str, str]:
+    """Compose deterministic Telegram success text + caption.
+
+    Body format:
+    - header line
+    - timestamp line
+    - three short bullet lines
+    - blank line
+    - game URL on its own final line
+    """
     dt = game.end_dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     who = escape_telegram_text(str(game.your_color or "").strip().lower() or "unknown")
     opponent = escape_telegram_text(str(game.opponent or ""))
     result = escape_telegram_text(str(game.result or ""))
     time_control = escape_telegram_text(str(game.time_control or ""))
+    body = "\n".join(
+        [
+            "♟ Chess review ready",
+            dt,
+            f"- You: {who} vs {opponent}",
+            f"- Result: {result} | TC: {time_control}",
+            "- Summary: review attached markdown for full move-by-move guidance.",
+            "",
+            str(game.game_url or "").strip(),
+        ]
+    )
+    caption = "\n".join(
+        [
+            "Chess review generated",
+            dt,
+            f"You: {who} vs {opponent}",
+        ]
+    )
+    return {"body": body, "caption": caption}
+
+
+def build_telegram_success_message(game: "GameInfo") -> str:
+    """Backward-compatible helper for tests/callers expecting body text only."""
+    payload = compose_telegram_success_payload(game)
+    return str(payload.get("body", ""))
+
+
+def build_telegram_failure_message(*, game_url: str, reason: str) -> str:
+    reason_line = str(reason or "").strip()
     return (
-        f"♟ Chess review ready\n"
-        f"{dt}\n\n"
-        f"You: {who} vs {opponent}\n"
-        f"Result: {result} | TC: {time_control}\n"
-        f"\n"
-        f"{game.game_url}"
+        "Engine failure\n"
+        "Stockfish could not produce analysis.\n"
+        f"Reason: {reason_line}\n"
+        "\n"
+        f"{str(game_url or '').strip()}"
     )
 
 
 def build_telegram_success_summary_text(game: "GameInfo") -> str:
-    dt = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    who = escape_telegram_text(str(game.your_color or "").strip().lower() or "unknown")
-    opponent = escape_telegram_text(str(game.opponent or ""))
-    result = escape_telegram_text(str(game.result or ""))
-    time_control = escape_telegram_text(str(game.time_control or ""))
-    return (
-        f"Chess review generated\n"
-        f"{dt}\n\n"
-        f"You: {who} vs {opponent}\n"
-        f"Result: {result} | TC: {time_control}"
-    )
+    payload = compose_telegram_success_payload(game)
+    return str(payload.get("caption", "Chess review generated"))
 
 
 def run_telegram_smoketest(args: argparse.Namespace) -> int:
@@ -366,6 +414,129 @@ def run_queue_inspector(args: argparse.Namespace) -> int:
             )
     return 0
 
+
+def run_smoke_checks(args: argparse.Namespace) -> int:
+    """Fast end-to-end readiness checks for engine/LLM/Telegram/DB wiring."""
+    results: list[tuple[str, bool, str]] = []
+
+    def _add(name: str, ok: bool, detail: str) -> None:
+        results.append((name, bool(ok), str(detail)))
+
+    # Prompts
+    for prompt_name in ("review_system.md", "review_user_strict.md"):
+        try:
+            content = load_prompt_file(prompt_name)
+            if not str(content or "").strip():
+                _add(f"prompt:{prompt_name}", False, f"{prompt_name} is empty.")
+            else:
+                _add(f"prompt:{prompt_name}", True, f"loaded ({len(content)} chars)")
+        except Exception as exc:
+            _add(
+                f"prompt:{prompt_name}",
+                False,
+                f"failed to load: {exc}. Ensure prompts exist under PROMPTS_DIR/project prompts.",
+            )
+
+    # Stockfish binary + handshake
+    stockfish_path = str(getattr(args, "stockfish_path", "") or "").strip()
+    resolved_stockfish = stockfish_path
+    if stockfish_path and not Path(stockfish_path).exists():
+        maybe = shutil.which(stockfish_path)
+        if maybe:
+            resolved_stockfish = maybe
+    if not resolved_stockfish or not Path(resolved_stockfish).exists():
+        _add("stockfish", False, f"binary not found at {stockfish_path!r}. Set STOCKFISH_PATH or --stockfish-path.")
+    else:
+        try:
+            proc = subprocess.run(
+                [resolved_stockfish],
+                input="uci\nquit\n",
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if "uciok" in out:
+                _add("stockfish", True, f"uci handshake ok ({resolved_stockfish})")
+            else:
+                _add("stockfish", False, f"uci handshake failed ({resolved_stockfish}); output missing 'uciok'.")
+        except Exception as exc:
+            _add("stockfish", False, f"failed to execute {resolved_stockfish}: {exc}")
+
+    # Ollama reachability + model presence
+    ollama_url = str(getattr(args, "ollama_url", "") or "").strip()
+    ollama_model = str(getattr(args, "ollama_model", "") or "").strip()
+    if not ollama_url:
+        _add("ollama", False, "OLLAMA_URL is empty. Set OLLAMA_URL or --ollama-url.")
+    elif not ollama_model:
+        _add("ollama", False, "OLLAMA_MODEL is empty. Set OLLAMA_MODEL or --ollama-model.")
+    else:
+        tags_url = ollama_url.rstrip("/") + "/api/tags"
+        try:
+            resp = requests.get(tags_url, timeout=max(1, int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)))
+            if resp.status_code >= 400:
+                _add("ollama", False, f"/api/tags returned HTTP {resp.status_code} at {ollama_url}")
+            else:
+                body = resp.json() if resp.content else {}
+                models = body.get("models") if isinstance(body, Mapping) else []
+                names = {str((item or {}).get("name", "")).strip() for item in list(models or []) if isinstance(item, Mapping)}
+                if ollama_model in names:
+                    _add("ollama", True, f"reachable; model present ({ollama_model})")
+                else:
+                    _add(
+                        "ollama",
+                        False,
+                        f"reachable but model missing ({ollama_model}). Pull it first: ollama pull {ollama_model}",
+                    )
+        except Exception as exc:
+            _add("ollama", False, f"unreachable at {ollama_url}: {exc}")
+
+    # Telegram config (+ optional send)
+    bot_token = str(getattr(args, "telegram_bot_token", "") or "").strip()
+    chat_id = str(getattr(args, "telegram_chat_id", "") or "").strip()
+    smoke_send_telegram = bool(getattr(args, "smoke_send_telegram", False))
+    if not bot_token or not chat_id:
+        _add("telegram", False, "TG_BOT_TOKEN/TG_CHAT_ID missing. Configure both for notifications.")
+    else:
+        if smoke_send_telegram:
+            try:
+                send_telegram_message(
+                    "chess-coach smoke check: telegram connectivity OK",
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    timeout=int(getattr(args, "timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+                    disable_notification=bool(getattr(args, "telegram_disable_notification", False)),
+                    disable_web_page_preview=True,
+                )
+                _add("telegram", True, "configured and smoke message sent")
+            except Exception as exc:
+                _add("telegram", False, f"configured but smoke send failed: {exc}")
+        else:
+            _add("telegram", True, "configured (send test skipped; pass --smoke-send-telegram to send)")
+
+    # DB schema
+    schema_status = ensure_postgres_core_schema()
+    if bool(schema_status.get("ready")):
+        _add("db_schema", True, "postgres core schema ready")
+    else:
+        reason = str(schema_status.get("reason", "unknown"))
+        _add("db_schema", False, f"postgres schema not ready ({reason}). Check DATABASE_URL and migrations/bootstrap.")
+
+    print("Smoke Checks:")
+    failed = 0
+    for name, ok, detail in results:
+        marker = "PASS" if ok else "FAIL"
+        print(f"- [{marker}] {name}: {detail}")
+        if not ok:
+            failed += 1
+
+    if failed > 0:
+        print(f"Smoke result: FAIL ({failed} checks failed)")
+        return 1
+    print("Smoke result: PASS")
+    return 0
+
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
@@ -390,6 +561,10 @@ class GameInfo:
     result: str  # "1-0", "0-1", "1/2-1/2", "*"
     your_color: str  # "white" or "black"
     opponent: str
+    analysis_complete: bool = False
+    analysis_md_path: str = ""
+    tg_send_failed: bool = False
+    tg_last_error: str = ""
 
     @property
     def end_dt_utc(self) -> datetime:
@@ -461,11 +636,17 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 
 def is_processed(conn: sqlite3.Connection, game_url: str) -> bool:
-    if is_game_ingested_in_db(game_url):
-        return True
+    processed, _source = _processed_status(conn, game_url)
+    return processed
 
+
+def _processed_status(conn: sqlite3.Connection, game_url: str) -> tuple[bool, str]:
+    if is_game_ingested_in_db(game_url):
+        return True, "ingest_db"
     cur = conn.execute("SELECT 1 FROM processed_games WHERE game_url = ?", (game_url,))
-    return cur.fetchone() is not None
+    if cur.fetchone() is not None:
+        return True, "state_db"
+    return False, "none"
 
 
 def mark_processed(
@@ -2235,7 +2416,9 @@ def update_index(out_dir: Path, limit: int = 5000) -> None:
 # Main processing loop
 # -----------------------------
 def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameInfo) -> Optional[Path]:
-    if is_processed(conn, game.game_url):
+    processed, processed_source = _processed_status(conn, game.game_url)
+    if processed:
+        logger.info("process_game skip url=%s reason=already_processed source=%s", game.game_url, processed_source)
         return None
 
     ensure_dirs(args.out)
@@ -2272,47 +2455,65 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
 
     provider = get_provider()
     used_model = args.ollama_model if provider == "ollama" else args.gpt_model
-    try:
-        review_md = run_analysis_pipeline(
-            game=game,
-            args=args,
-            llm_runner=lambda system_msg, user_msg: _call_selected_llm_backend(
+    review_md = ""
+    used_send_only_retry = False
+    if bool(game.analysis_complete) and str(game.analysis_md_path or "").strip():
+        candidate_md_path = Path(str(game.analysis_md_path).strip())
+        if candidate_md_path.exists():
+            try:
+                review_md = candidate_md_path.read_text(encoding="utf-8")
+                md_path = candidate_md_path
+                used_send_only_retry = True
+                logger.info("Send-only retry path selected for %s using md_path=%s", game.game_url, md_path)
+            except Exception:
+                logger.warning("Failed to read existing markdown for send-only retry (%s). Regenerating.", game.game_url, exc_info=True)
+
+    if not used_send_only_retry:
+        try:
+            review_md = run_analysis_pipeline(
+                game=game,
                 args=args,
-                system_msg=system_msg,
-                user_msg=user_msg,
-            ),
-            logger=logger,
-        )
-    except Exception as exc:
-        logger.error("Stockfish failure: %s", exc)
-        mark_engine_failed(
-            player_username=args.username,
-            game_payload=game_payload_for_runtime,
-        )
-        notify_decision = should_notify_engine_failure(
-            player_username=args.username,
-            game_payload=game_payload_for_runtime,
-        )
-        if not bool(notify_decision.get("should_notify", True)):
-            return None
-        sent = _send_engine_failure_telegram_with_retry(
-            message=(
-                f"# Engine failure\n"
-                f"- Game: {game.game_url}\n"
-                f"- Detail: Stockfish could not produce analysis.\n"
-                f"- Reason: {str(exc)[:300]}"
-            ),
-            args=args,
-            context=short_id_from_url(game.game_url),
-        )
-        if sent:
-            mark_engine_failure_notified(
+                llm_runner=lambda system_msg, user_msg: _call_selected_llm_backend(
+                    args=args,
+                    system_msg=system_msg,
+                    user_msg=user_msg,
+                ),
+                logger=logger,
+            )
+        except Exception as exc:
+            logger.error("Stockfish failure: %s", exc)
+            mark_engine_failed(
                 player_username=args.username,
                 game_payload=game_payload_for_runtime,
             )
-        return None
+            notify_decision = should_notify_engine_failure(
+                player_username=args.username,
+                game_payload=game_payload_for_runtime,
+            )
+            if not bool(notify_decision.get("should_notify", True)):
+                return None
+            sent = _send_engine_failure_telegram_with_retry(
+                message=build_telegram_failure_message(
+                    game_url=game.game_url,
+                    reason=str(exc)[:300],
+                ),
+                args=args,
+                context=short_id_from_url(game.game_url),
+            )
+            if sent:
+                mark_engine_failure_notified(
+                    player_username=args.username,
+                    game_payload=game_payload_for_runtime,
+                )
+            return None
 
-    write_text(md_path, review_md)
+        write_text(md_path, review_md)
+        mark_analysis_complete(
+            player_username=args.username,
+            game_payload=game_payload_for_runtime,
+            md_path=str(md_path),
+        )
+
     llm_diag = _extract_llm_diagnostics_from_review_markdown(review_md)
 
     # Optional: Telegram notification with the generated Markdown attached
@@ -2328,36 +2529,31 @@ def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameI
             should_mark_success_flags = False
         if should_notify_success:
             try:
-                send_telegram_message(
-                    game.game_url,
+                success_payload = compose_telegram_success_payload(game)
+                _send_telegram_text_notification(
+                    message=str(success_payload.get("body", "")),
+                    args=args,
+                    enable_preview=True,
+                )
+                if not md_path.exists():
+                    raise FileNotFoundError(f"Review markdown missing; expected at: {md_path}")
+                send_telegram_document(
                     bot_token=args.telegram_bot_token,
                     chat_id=args.telegram_chat_id,
+                    file_path=md_path,
+                    caption=str(success_payload.get("caption", "")),
                     timeout=args.timeout,
                     disable_notification=getattr(args, "telegram_disable_notification", False),
-                    disable_web_page_preview=False,
                 )
-                if md_path.exists():
-                    send_telegram_document(
-                        bot_token=args.telegram_bot_token,
-                        chat_id=args.telegram_chat_id,
-                        file_path=md_path,
-                        caption=build_telegram_success_summary_text(game),
-                        timeout=args.timeout,
-                        disable_notification=getattr(args, "telegram_disable_notification", False),
-                    )
-                else:
-                    send_telegram_message(
-                        f"Review markdown missing; expected at: {md_path}",
-                        bot_token=args.telegram_bot_token,
-                        chat_id=args.telegram_chat_id,
-                        timeout=args.timeout,
-                        disable_notification=getattr(args, "telegram_disable_notification", False),
-                        disable_web_page_preview=True,
-                    )
                 telegram_notified = True
             except Exception as e:
                 # Do not fail the whole pipeline if Telegram is down/misconfigured.
                 print(f"[warn] Telegram notification failed: {e}", file=sys.stderr)
+                mark_telegram_send_failed(
+                    player_username=args.username,
+                    game_payload=game_payload_for_runtime,
+                    error_message=str(e),
+                )
                 should_mark_success_flags = False
 
     if should_mark_success_flags:
@@ -2477,6 +2673,10 @@ def _game_info_from_retry_payload(row: Mapping[str, Any], username: str) -> Opti
         result=str(row.get("result", "*") or "*"),
         your_color=your_color,
         opponent=opponent,
+        analysis_complete=bool(row.get("analysis_complete", False)),
+        analysis_md_path=str(row.get("md_path", "") or ""),
+        tg_send_failed=bool(row.get("tg_send_failed", False)),
+        tg_last_error=str(row.get("tg_last_error", "") or ""),
     )
 
 
@@ -2558,7 +2758,7 @@ def _print_backfill_summary(result: Mapping[str, Any]) -> None:
     print(f"  blunder_frequency: {int(scores['blunder_frequency'])}")
 
 
-def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_only: bool = False) -> int:
     reset_llm_attempt_counters()
     retry_mode = bool(getattr(args, "retry_failures", False))
     max_attempts = max(1, int(getattr(args, "attempt_backoff_max_attempts", 5) or 5))
@@ -2644,7 +2844,11 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     pending_rows = list(pending_diag.get("eligible_rows") or [])
     if not pending_rows:
         pending_rows = get_pending_games_for_processing(limit=pending_limit)
-    force_progress_candidate_url = str((pending_rows[0] or {}).get("game_url", "") or "") if pending_rows else ""
+    pending_source_urls = {
+        str((row or {}).get("game_url", "") or "")
+        for row in list(pending_rows)
+        if str((row or {}).get("game_url", "") or "")
+    }
 
     candidate_meta_by_url: dict[str, Mapping[str, Any]] = {}
     if retry_mode:
@@ -2671,15 +2875,33 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 row_meta = dict(row)
                 row_meta["__queue_order"] = idx
                 candidate_meta_by_url[row_url] = row_meta
-        parsed = [g for g in (_game_info_from_retry_payload(row, args.username) for row in rows) if g is not None]
+        parsed: list[GameInfo] = []
+        for row in rows:
+            parsed_game = _game_info_from_retry_payload(row, args.username)
+            if parsed_game is None:
+                row_url = str((row or {}).get("game_url", "") or "<missing>")
+                _poll_exec_audit("skip url=%s reason=pending_row_parse_failed", row_url)
+                _poll_debug("pending row skipped url=%s reason=parse_failed", row_url)
+                continue
+            parsed.append(parsed_game)
         parsed.sort(key=lambda g: g.end_time)
         _poll_debug("retry-failures candidates loaded: %s", int(len(parsed)))
     else:
-        raw_games = fetch_recent_games(args.username, args.lookback_days)
-        repair_stats = _repair_missing_pgn_rows_from_raw_games(raw_games=raw_games, limit=pending_limit)
-        if int(repair_stats.get("repaired", 0) or 0) > 0:
-            pending_rows = get_pending_games_for_processing(limit=pending_limit)
-        pending_parsed = [g for g in (_game_info_from_retry_payload(row, args.username) for row in pending_rows) if g is not None]
+        raw_games: list[Mapping[str, Any]] = []
+        if not pending_only:
+            raw_games = fetch_recent_games(args.username, args.lookback_days)
+            repair_stats = _repair_missing_pgn_rows_from_raw_games(raw_games=raw_games, limit=pending_limit)
+            if int(repair_stats.get("repaired", 0) or 0) > 0:
+                pending_rows = get_pending_games_for_processing(limit=pending_limit)
+        pending_parsed: list[GameInfo] = []
+        for row in pending_rows:
+            parsed_game = _game_info_from_retry_payload(row, args.username)
+            if parsed_game is None:
+                row_url = str((row or {}).get("game_url", "") or "<missing>")
+                _poll_exec_audit("skip url=%s reason=pending_row_parse_failed", row_url)
+                _poll_debug("pending row skipped url=%s reason=parse_failed", row_url)
+                continue
+            pending_parsed.append(parsed_game)
         _poll_debug("total games fetched from chess.com: %s", int(len(raw_games)))
 
         parsed = list(pending_parsed)
@@ -2692,36 +2914,44 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                 row_meta["__queue_order"] = idx
                 candidate_meta_by_url[row_url] = row_meta
 
-        for rg in raw_games:
-            raw_url = str((rg or {}).get("url", "") or "")
-            raw_end_time = (rg or {}).get("end_time")
-            _poll_debug("fetched game url=%s end_time=%s", raw_url, raw_end_time)
-            gi, parse_skip_reason = _parse_game_with_reason(rg, args.username)
-            if gi is None:
-                _poll_debug("game skipped url=%s reason=%s", raw_url, str(parse_skip_reason or "parse failure"))
-                continue
+        if not pending_only:
+            for rg in raw_games:
+                raw_url = str((rg or {}).get("url", "") or "")
+                raw_end_time = (rg or {}).get("end_time")
+                _poll_debug("fetched game url=%s end_time=%s", raw_url, raw_end_time)
+                gi, parse_skip_reason = _parse_game_with_reason(rg, args.username)
+                if gi is None:
+                    _poll_debug("game skipped url=%s reason=%s", raw_url, str(parse_skip_reason or "parse failure"))
+                    continue
 
-            if args.rules_filter and gi.rules != args.rules_filter:
-                _poll_debug("game skipped url=%s reason=rules_filter mismatch", gi.game_url)
-                continue
+                rules_filter = getattr(args, "rules_filter", None)
+                if rules_filter and gi.rules != rules_filter:
+                    _poll_debug("game skipped url=%s reason=rules_filter mismatch", gi.game_url)
+                    continue
 
-            if gi.end_dt_utc < cutoff:
-                _poll_debug("game skipped url=%s reason=outside lookback window", gi.game_url)
-                continue
+                if gi.end_dt_utc < cutoff:
+                    _poll_debug("game skipped url=%s reason=outside lookback window", gi.game_url)
+                    continue
 
-            if gi.game_url in seen_urls:
-                continue
-            parsed.append(gi)
-            seen_urls.add(gi.game_url)
+                if gi.game_url in seen_urls:
+                    continue
+                parsed.append(gi)
+                seen_urls.add(gi.game_url)
 
     def _poll_order_key(game: GameInfo) -> tuple[int, int]:
+        # Process newest games first so notifications feel real-time.
         meta = candidate_meta_by_url.get(game.game_url)
-        if isinstance(meta, Mapping) and "__queue_order" in meta:
-            return (0, int(meta.get("__queue_order", 0) or 0))
-        return (1, int(game.end_time))
+        queue_order = int(meta.get("__queue_order", 0) or 0) if isinstance(meta, Mapping) else 0
+        return (-int(game.end_time), queue_order)
 
     parsed.sort(key=_poll_order_key)
     parsed = parsed[:pending_limit]
+    if eligible_now > 0 and not parsed:
+        logger.warning(
+            "Eligible rows detected (eligible_now=%s) but no executable candidates were produced this cycle.",
+            eligible_now,
+        )
+        _poll_exec_audit("warning eligible_now=%s candidates_count=0", eligible_now)
 
     cooldown_seconds = max(
         0,
@@ -2734,17 +2964,15 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         "unsupported_time_control": 0,
         "integrity_exclusion": 0,
     }
-    force_progress_attempted = False
     created = 0
+    candidate_urls = [str(g.game_url) for g in parsed]
+    _poll_exec_audit(
+        "candidates_count=%s candidates=%s",
+        int(len(candidate_urls)),
+        ",".join(candidate_urls) if candidate_urls else "<none>",
+    )
     for g in parsed:
-        force_progress_for_game = bool(
-            force_progress_candidate_url
-            and not force_progress_attempted
-            and str(g.game_url) == force_progress_candidate_url
-        )
-        if force_progress_for_game:
-            force_progress_attempted = True
-
+        from_pending_eligible = str(g.game_url) in pending_source_urls
         game_payload = {
             "game_url": g.game_url,
             "pgn": g.pgn,
@@ -2759,13 +2987,14 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             "black_rating": g.black_rating,
             "player_color": g.your_color,
         }
-        if (not retry_mode) and is_processed(conn, g.game_url):
-            if force_progress_for_game:
-                _poll_debug("force-progress override url=%s check=already_processed", g.game_url)
-            else:
-                _poll_debug("game skipped url=%s reason=already processed", g.game_url)
-                cycle_skipped_counts["already_processed"] += 1
-                continue
+        _poll_exec_audit("candidate url=%s source=%s", g.game_url, "pending" if from_pending_eligible else "discovered")
+
+        processed, processed_source = _processed_status(conn, g.game_url)
+        if (not retry_mode) and (not from_pending_eligible) and processed:
+            _poll_debug("game skipped url=%s reason=already processed source=%s", g.game_url, processed_source)
+            _poll_exec_audit("skip url=%s reason=already_processed source=%s", g.game_url, processed_source)
+            cycle_skipped_counts["already_processed"] += 1
+            continue
 
         now_utc = datetime.now(timezone.utc)
         eligibility_row: dict[str, Any] = dict(candidate_meta_by_url.get(g.game_url, {}))
@@ -2776,42 +3005,51 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
             max_attempts=max_attempts,
             cooldown_seconds=cooldown_seconds,
         )
-        if not is_game_eligible_for_processing(
+        if (not from_pending_eligible) and (not is_game_eligible_for_processing(
             eligibility_row,
             now=now_utc,
             max_attempts=max_attempts,
             cooldown_seconds=cooldown_seconds,
-        ):
-            if force_progress_for_game:
-                _poll_debug("force-progress override url=%s check=eligibility_filter", g.game_url)
-            else:
-                _poll_debug("game skipped url=%s reason=eligibility_filter", g.game_url)
-                _queue_debug(
-                    (
-                        "game_skip url=%s success_notified=%s engine_failed=%s "
-                        "cooldown_active=%s attempt_cap=%s missing_pgn=%s"
-                    ),
-                    g.game_url,
-                    bool(reasons.get("success_notified", False)),
-                    bool(reasons.get("engine_failed", False)),
-                    bool(reasons.get("cooldown_active", False)),
-                    bool(reasons.get("attempt_cap", False)),
-                    bool(reasons.get("missing_pgn", False)),
-                )
-                cycle_skipped_counts["eligibility_filter"] += 1
-                continue
+        )):
+            _poll_debug("game skipped url=%s reason=eligibility_filter", g.game_url)
+            _queue_debug(
+                (
+                    "game_skip url=%s success_notified=%s engine_failed=%s "
+                    "cooldown_active=%s attempt_cap=%s missing_pgn=%s pgn_missing=%s"
+                ),
+                g.game_url,
+                bool(reasons.get("success_notified", False)),
+                bool(reasons.get("engine_failed", False)),
+                bool(reasons.get("cooldown_active", False)),
+                bool(reasons.get("attempt_cap", False)),
+                bool(reasons.get("missing_pgn", False)),
+                bool(reasons.get("pgn_missing", False)),
+            )
+            _poll_exec_audit(
+                (
+                    "skip url=%s reason=eligibility_filter success_notified=%s engine_failed=%s "
+                    "cooldown_active=%s attempt_cap=%s missing_pgn=%s pgn_missing=%s"
+                ),
+                g.game_url,
+                bool(reasons.get("success_notified", False)),
+                bool(reasons.get("engine_failed", False)),
+                bool(reasons.get("cooldown_active", False)),
+                bool(reasons.get("attempt_cap", False)),
+                bool(reasons.get("missing_pgn", False)),
+                bool(reasons.get("pgn_missing", False)),
+            )
+            cycle_skipped_counts["eligibility_filter"] += 1
+            continue
 
-        backoff_state = should_skip_game_due_to_attempt_backoff(
-            player_username=args.username,
-            game_payload=game_payload,
-            max_attempts=max_attempts,
-            window_hours=window_hours,
-            ignore_backoff=ignore_backoff,
-        )
-        if bool(backoff_state.get("skip", False)):
-            if force_progress_for_game:
-                _poll_debug("force-progress override url=%s check=attempt_backoff", g.game_url)
-            else:
+        if not from_pending_eligible:
+            backoff_state = should_skip_game_due_to_attempt_backoff(
+                player_username=args.username,
+                game_payload=game_payload,
+                max_attempts=max_attempts,
+                window_hours=window_hours,
+                ignore_backoff=ignore_backoff,
+            )
+            if bool(backoff_state.get("skip", False)):
                 _poll_debug(
                     "game skipped url=%s reason=attempt_backoff attempt_count=%s max=%s window_hours=%s",
                     g.game_url,
@@ -2819,20 +3057,36 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                     max_attempts,
                     window_hours,
                 )
+                _poll_exec_audit(
+                    "skip url=%s reason=attempt_backoff attempt_count=%s",
+                    g.game_url,
+                    int(backoff_state.get("attempt_count", 0) or 0),
+                )
                 cycle_skipped_counts["attempt_backoff"] += 1
                 continue
 
         if not str(g.time_control or "").strip():
-            if force_progress_for_game:
-                _poll_debug("force-progress override url=%s check=unsupported_time_control", g.game_url)
-            else:
-                _poll_debug("game skipped url=%s reason=unsupported time control", g.game_url)
-                cycle_skipped_counts["unsupported_time_control"] += 1
-                continue
+            _poll_debug("game skipped url=%s reason=unsupported time control", g.game_url)
+            _poll_exec_audit("skip url=%s reason=unsupported_time_control", g.game_url)
+            cycle_skipped_counts["unsupported_time_control"] += 1
+            continue
+        if str(g.rules or "chess").strip().lower() != "chess":
+            _poll_debug("game skipped url=%s reason=unsupported rule type rules=%s", g.game_url, g.rules)
+            _poll_exec_audit("skip url=%s reason=unsupported_rules rules=%s", g.game_url, g.rules)
+            cycle_skipped_counts["unsupported_time_control"] += 1
+            continue
+        rules_filter = getattr(args, "rules_filter", None)
+        if rules_filter and str(g.rules or "").strip() != str(rules_filter):
+            _poll_debug("game skipped url=%s reason=rules_filter mismatch", g.game_url)
+            _poll_exec_audit("skip url=%s reason=rules_filter_mismatch", g.game_url)
+            cycle_skipped_counts["unsupported_time_control"] += 1
+            continue
 
         _poll_debug("Game selected for processing: %s", g.game_url)
+        _poll_exec_audit("attempt url=%s", g.game_url)
         if args.dry_run:
             print(f"[dry-run] Would process: {g.end_dt_utc.isoformat()} {g.game_url}")
+            _poll_exec_audit("attempt_result url=%s result=dry_run", g.game_url)
             created += 1
             continue
 
@@ -2845,10 +3099,12 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                         player_username=args.username,
                         game_payload=game_payload,
                     )
+                    _poll_exec_audit("attempt_result url=%s result=success", g.game_url)
                     print(f"[ok] Wrote: {out}")
                     created += 1
                 else:
                     _poll_debug("game skipped url=%s reason=integrity exclusion", g.game_url)
+                    _poll_exec_audit("attempt_result url=%s result=skipped reason=integrity_exclusion", g.game_url)
                     cycle_skipped_counts["integrity_exclusion"] += 1
                 last_err = None
                 break
@@ -2862,9 +3118,16 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
                     f"[warn] attempt {attempt}/{args.retries} failed for {g.game_url}: {e}",
                     file=sys.stderr,
                 )
+                _poll_exec_audit(
+                    "attempt_result url=%s result=failed attempt=%s error=%s",
+                    g.game_url,
+                    int(attempt),
+                    str(e)[:200],
+                )
                 _sleep(min(3 * attempt, 12))
 
         if last_err is not None:
+            _poll_exec_audit("attempt_result url=%s result=failed_final", g.game_url)
             print(f"[error] Giving up on {g.game_url}: {last_err}", file=sys.stderr)
 
     counters = get_llm_attempt_counters()
@@ -2943,8 +3206,33 @@ def _queue_debug(msg: str, *args: Any) -> None:
     logger.info("[QUEUE-DEBUG] " + msg, *args)
 
 
+def _poll_exec_audit_enabled() -> bool:
+    if str(os.environ.get("ENABLE_POLL_EXEC_AUDIT", "")).strip() == "1":
+        return True
+    return _polling_debug_enabled()
+
+
+def _poll_exec_audit(msg: str, *args: Any) -> None:
+    if not _poll_exec_audit_enabled():
+        return
+    logger.info("[POLL-EXEC] " + msg, *args)
+
+
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
+
+
+def run_once_single_shot(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    """Run exactly one eligible-game attempt and return processed count."""
+    prev_batch_size = os.environ.get("POLL_BATCH_SIZE")
+    os.environ["POLL_BATCH_SIZE"] = "1"
+    try:
+        return int(poll_once(conn, args, pending_only=True))
+    finally:
+        if prev_batch_size is None:
+            os.environ.pop("POLL_BATCH_SIZE", None)
+        else:
+            os.environ["POLL_BATCH_SIZE"] = prev_batch_size
 
 
 def _repair_missing_pgn_rows_from_raw_games(
@@ -2968,7 +3256,13 @@ def _repair_missing_pgn_rows_from_raw_games(
         game_url = str(row.get("game_url", "") or "").strip()
         pgn = pgn_by_url.get(game_url, "")
         if not pgn:
-            logger.info("pgn_fetch_missing_retry game_url=%s status=not_found", game_url)
+            missing_state = record_pgn_missing_not_found(game_url=game_url)
+            logger.info(
+                "pgn_fetch_missing_retry game_url=%s status=not_found attempts=%s pgn_missing=%s",
+                game_url,
+                int(missing_state.get("attempts", 0) or 0),
+                bool(missing_state.get("pgn_missing", False)),
+            )
             continue
         ok = bool(update_game_pgn_for_url(game_url=game_url, pgn=pgn))
         if ok:
@@ -3199,6 +3493,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     p.add_argument("--poll-seconds", type=int, default=300, help="Polling interval (seconds)")
     p.add_argument("--once", action="store_true", help="Run one poll cycle then exit")
+    p.add_argument("--smoke", action="store_true", help="Run fast integration smoke checks and exit non-zero on failure.")
+    p.add_argument(
+        "--smoke-send-telegram",
+        action="store_true",
+        help="With --smoke, send a Telegram smoke message (requires TG_BOT_TOKEN/TG_CHAT_ID).",
+    )
     p.add_argument(
         "--queue",
         action="store_true",
@@ -3208,6 +3508,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--retry-failures",
         action="store_true",
         help="Retry games flagged in Postgres where engine_failed=true OR review_notified=false.",
+    )
+    p.add_argument(
+        "--reset-game",
+        default="",
+        help="Reset one game's processing state by game URL in Postgres and exit.",
     )
     p.add_argument(
         "--backfill",
@@ -3331,7 +3636,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             p.error("--tg-smoketest requires --game-url.")
         if args.tg_smoketest_md is None:
             p.error("--tg-smoketest requires --md.")
-    elif not args.queue:
+    elif (not args.queue) and (not args.smoke) and (not str(getattr(args, "reset_game", "") or "").strip()):
         if not args.username:
             p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
         if args.out is None:
@@ -3369,6 +3674,26 @@ def main() -> int:
         return int(run_telegram_smoketest(args))
     if bool(getattr(args, "queue", False)):
         return int(run_queue_inspector(args))
+    if bool(getattr(args, "smoke", False)):
+        return int(run_smoke_checks(args))
+    reset_game_url = str(getattr(args, "reset_game", "") or "").strip()
+    if reset_game_url:
+        result = reset_game_processing_state(game_url=reset_game_url)
+        if bool(result.get("available")) and bool(result.get("updated")):
+            logger.info(
+                "Game reset applied game_url=%s changed_fields=%s",
+                reset_game_url,
+                ",".join(str(x) for x in list(result.get("changed_fields") or [])),
+            )
+            close_ingest_db_check()
+            return 0
+        if bool(result.get("available")) and str(result.get("reason", "")) == "row_not_found":
+            logger.warning("Game reset skipped: row not found for game_url=%s", reset_game_url)
+            close_ingest_db_check()
+            return 1
+        logger.error("Game reset failed game_url=%s reason=%s", reset_game_url, str(result.get("reason", "unknown")))
+        close_ingest_db_check()
+        return 1
     if not bool(getattr(args, "enable_engine", False)):
         raise RuntimeError("Engine cannot be disabled in strict mode.")
     args.out = Path(args.out)
@@ -3425,6 +3750,23 @@ def main() -> int:
         else:
             logger.info("Bootstrap skipped: Postgres core schema is not ready.")
 
+    if args.once:
+        try:
+            logger.info("Single-shot --once run started")
+            _sync_runtime_provider(args)
+            processed = run_once_single_shot(conn, args)
+            if processed > 0:
+                logger.info("Single-shot --once run complete: processed=%d", processed)
+            else:
+                logger.info("Single-shot --once run complete: no eligible work")
+            return 0
+        except Exception as exc:
+            logger.error("Single-shot --once run failed: %s", exc)
+            return 1
+        finally:
+            conn.close()
+            close_ingest_db_check()
+
     telegram_stop_event = threading.Event()
     telegram_thread: Optional[threading.Thread] = threading.Thread(
         target=_telegram_command_loop,
@@ -3437,11 +3779,6 @@ def main() -> int:
     logger.info("Polling loop started (interval=%ss)", args.poll_seconds)
 
     try:
-        if args.once:
-            _sync_runtime_provider(args)
-            poll_once(conn, args)
-            return 0
-
         process_on_startup = _env_bool("PROCESS_ON_STARTUP", True)
         next_sleep_s = int(args.poll_seconds)
         if process_on_startup:

@@ -9,6 +9,7 @@ def _row(**overrides):
     base = {
         "success_notified": False,
         "engine_failed": False,
+        "pgn_missing": False,
         "attempt_count": 0,
         "last_attempt_at": None,
         "pgn": '[Event "Live Chess"]\n1. e4 e5 1-0\n',
@@ -35,6 +36,12 @@ def test_is_game_eligible_for_processing_false_when_engine_failed() -> None:
     assert is_game_eligible_for_processing(row, now, max_attempts=5, cooldown_seconds=600) is False
 
 
+def test_is_game_eligible_for_processing_false_when_pgn_marked_permanently_missing() -> None:
+    now = datetime(2026, 2, 14, 12, 0, 0, tzinfo=timezone.utc)
+    row = _row(pgn_missing=True)
+    assert is_game_eligible_for_processing(row, now, max_attempts=5, cooldown_seconds=600) is False
+
+
 def test_is_game_eligible_for_processing_false_when_attempt_count_hits_cap() -> None:
     now = datetime(2026, 2, 14, 12, 0, 0, tzinfo=timezone.utc)
     row = _row(attempt_count=5)
@@ -52,4 +59,3 @@ def test_is_game_eligible_for_processing_false_when_pgn_missing_or_empty() -> No
     assert is_game_eligible_for_processing(_row(pgn=""), now, max_attempts=5, cooldown_seconds=600) is False
     assert is_game_eligible_for_processing(_row(pgn="   "), now, max_attempts=5, cooldown_seconds=600) is False
     assert is_game_eligible_for_processing(_row(pgn=None), now, max_attempts=5, cooldown_seconds=600) is False
-

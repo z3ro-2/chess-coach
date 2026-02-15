@@ -89,7 +89,7 @@ def test_plain_text_payload_with_entity_chars_does_not_set_parse_mode(monkeypatc
     monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
 
     client = create_telegram_client(bot_token="token", timeout=5)
-    tricky = r"name_with_[brackets](parens)<tag>&value"
+    tricky = r"name_with_[brackets](parens)#topic<tag>&value"
     client.send_text(chat_id="42", text=tricky, disable_preview=False)
 
     md_path = Path(tmp_path / "review.md")
@@ -103,3 +103,23 @@ def test_plain_text_payload_with_entity_chars_does_not_set_parse_mode(monkeypatc
     assert second["caption"] == tricky
     assert "parse_mode" not in first
     assert "parse_mode" not in second
+
+
+def test_plain_text_payload_with_markdown_breakers_does_not_throw(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def _fake_post(url: str, data=None, timeout=0, files=None):
+        calls.append({"url": url, "data": dict(data or {}), "files": files})
+        return _FakeResponse()
+
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
+
+    client = create_telegram_client(bot_token="token", timeout=5)
+    tricky = "user_name (rapid)[arena] #tag _underscore_"
+    client.send_text(chat_id="42", text=tricky, disable_preview=False)
+
+    assert len(calls) == 1
+    payload = calls[0]["data"]
+    assert payload["text"] == tricky
+    assert payload["disable_web_page_preview"] is False
+    assert "parse_mode" not in payload
