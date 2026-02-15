@@ -121,3 +121,39 @@ def test_names_with_ampersand_less_greater_are_sent_plain_text(monkeypatch) -> N
     assert "bob & carol > dave" in text
     assert "1-0 & sharp" in text
     assert "10<0" in text
+
+
+def test_telegram_document_caption_with_markdown_chars_has_no_parse_mode(monkeypatch, tmp_path) -> None:
+    calls: list[dict] = []
+
+    class _FakeResponse:
+        status_code = 200
+        text = "ok"
+
+        @staticmethod
+        def json() -> dict:
+            return {"ok": True}
+
+    def _fake_post(url: str, data=None, timeout=0, files=None):
+        calls.append({"url": url, "data": dict(data or {}), "files": files, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setattr("src.telegram_client.requests.post", _fake_post)
+
+    md_file = tmp_path / "review.md"
+    md_file.write_text("# review", encoding="utf-8")
+    caption = "user_name [rapid](arena) _critical_ #1"
+
+    chess_review.send_telegram_document(
+        bot_token="token",
+        chat_id="42",
+        file_path=md_file,
+        caption=caption,
+        timeout=7,
+        disable_notification=False,
+    )
+
+    assert len(calls) == 1
+    payload = calls[0]["data"]
+    assert payload["caption"] == caption
+    assert "parse_mode" not in payload or payload.get("parse_mode") is None

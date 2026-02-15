@@ -79,9 +79,13 @@ def ensure_postgres_core_schema(*, database_url: str | None = None) -> dict[str,
               md_path TEXT,
               tg_send_failed BOOLEAN NOT NULL DEFAULT FALSE,
               tg_last_error TEXT,
+              tg_send_attempts INTEGER NOT NULL DEFAULT 0,
+              tg_last_send_at TIMESTAMPTZ,
               pgn_missing BOOLEAN NOT NULL DEFAULT FALSE,
               pgn_missing_attempts INTEGER NOT NULL DEFAULT 0,
               pgn_missing_last_attempt_at TIMESTAMPTZ,
+              pgn_missing_count INTEGER NOT NULL DEFAULT 0,
+              pgn_missing_terminal BOOLEAN NOT NULL DEFAULT FALSE,
               engine_failed BOOLEAN NOT NULL DEFAULT FALSE,
               completed_at TIMESTAMPTZ,
               last_attempt_at TIMESTAMPTZ,
@@ -144,6 +148,20 @@ def ensure_postgres_core_schema(*, database_url: str | None = None) -> dict[str,
             conn,
             """
             ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS tg_send_attempts INTEGER NOT NULL DEFAULT 0
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS tg_last_send_at TIMESTAMPTZ
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
             ADD COLUMN IF NOT EXISTS pgn_missing BOOLEAN NOT NULL DEFAULT FALSE
             """,
         )
@@ -159,6 +177,20 @@ def ensure_postgres_core_schema(*, database_url: str | None = None) -> dict[str,
             """
             ALTER TABLE games
             ADD COLUMN IF NOT EXISTS pgn_missing_last_attempt_at TIMESTAMPTZ
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS pgn_missing_count INTEGER NOT NULL DEFAULT 0
+            """,
+        )
+        _execute(
+            conn,
+            """
+            ALTER TABLE games
+            ADD COLUMN IF NOT EXISTS pgn_missing_terminal BOOLEAN NOT NULL DEFAULT FALSE
             """,
         )
         _execute(

@@ -11,7 +11,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, Mapping
 
-from src.db.eligibility import is_game_eligible_for_processing
+from src.db.eligibility import eligibility_rejection_reasons, is_game_eligible_for_processing
 from src.db._pg_utils import _connect_db, _execute, _fetchall, _fetchone, _table_columns
 
 logger = logging.getLogger(__name__)
@@ -401,7 +401,38 @@ def mark_review_success_flags(
             set_parts.append("tg_send_failed = FALSE")
         if "tg_last_error" in game_columns:
             set_parts.append("tg_last_error = NULL")
+        if "tg_send_attempts" in game_columns:
+            set_parts.append("tg_send_attempts = 0")
+        if "tg_last_send_at" in game_columns:
+            set_parts.append("tg_last_send_at = NULL")
         _execute(conn, "UPDATE games SET " + ", ".join(set_parts) + " WHERE id = %s", (game_id,))
+        if "completed_at" in game_columns:
+            tg_max_attempts = max(1, _env_int("TG_MAX_SEND_ATTEMPTS", 5))
+            if "tg_send_attempts" in game_columns:
+                _execute(
+                    conn,
+                    """
+                    UPDATE games
+                    SET completed_at = NOW()
+                    WHERE id = %s
+                      AND COALESCE(success_notified, FALSE) = TRUE
+                      AND COALESCE(analysis_complete, FALSE) = TRUE
+                      AND COALESCE(tg_send_attempts, 0) <= %s
+                    """,
+                    (game_id, int(tg_max_attempts)),
+                )
+            else:
+                _execute(
+                    conn,
+                    """
+                    UPDATE games
+                    SET completed_at = NOW()
+                    WHERE id = %s
+                      AND COALESCE(success_notified, FALSE) = TRUE
+                      AND COALESCE(analysis_complete, FALSE) = TRUE
+                    """,
+                    (game_id,),
+                )
         conn.commit()
         return {"available": True, "reason": "marked_success", "updated": True}
     except Exception:
@@ -496,11 +527,14 @@ def mark_telegram_send_failed(
             return {"available": False, "reason": "player_unresolved", "updated": False}
 
         game_id, _inserted = _upsert_game(conn, player_id=player_id, game_columns=game_columns, game_payload=game_payload)
-        _execute(
-            conn,
-            "UPDATE games SET tg_send_failed = TRUE, tg_last_error = %s WHERE id = %s",
-            (str(error_message or "")[:4000], game_id),
-        )
+        set_parts = ["tg_send_failed = TRUE", "tg_last_error = %s"]
+        params: list[Any] = [str(error_message or "")[:4000]]
+        if "tg_send_attempts" in game_columns:
+            set_parts.append("tg_send_attempts = COALESCE(tg_send_attempts, 0) + 1")
+        if "tg_last_send_at" in game_columns:
+            set_parts.append("tg_last_send_at = NOW()")
+        params.append(game_id)
+        _execute(conn, "UPDATE games SET " + ", ".join(set_parts) + " WHERE id = %s", tuple(params))
         conn.commit()
         return {"available": True, "reason": "marked_tg_send_failed", "updated": True}
     except Exception:
@@ -772,9 +806,10 @@ def cleanup_completed_games(
 ) -> dict[str, Any]:
     """Mark permanently-completed rows with completed_at.
 
-    Rows are marked completed when either:
+    Rows are marked completed when:
+    - analysis_complete = TRUE
     - success_notified = TRUE
-    - engine_failed = TRUE and attempt_count >= POLL_MAX_ATTEMPTS
+    - tg_send_attempts <= TG_MAX_SEND_ATTEMPTS (when column exists)
 
     Cooldown gate:
     - last_attempt_at is NULL OR older than POLL_COOLDOWN_SECONDS
@@ -790,7 +825,7 @@ def cleanup_completed_games(
     try:
         player_columns = _table_columns(conn, "players")
         game_columns = _table_columns(conn, "games")
-        required = {"success_notified", "engine_failed", "attempt_count", "last_attempt_at", "completed_at"}
+        required = {"success_notified", "analysis_complete", "last_attempt_at", "completed_at"}
         if not player_columns or not game_columns or not required.issubset(game_columns):
             return {"available": False, "reason": "schema_missing", "marked_count": 0}
         player_row = _find_player_row(conn, player_username, player_columns)
@@ -798,7 +833,6 @@ def cleanup_completed_games(
             return {"available": False, "reason": "player_missing", "marked_count": 0}
         player_id = int(player_row["id"])
 
-        max_attempts = _env_int("POLL_MAX_ATTEMPTS", _env_int("MAX_ATTEMPTS", 5))
         cooldown_seconds = _env_int(
             "POLL_COOLDOWN_SECONDS",
             _env_int("ATTEMPT_COOLDOWN_SECONDS", 600),
@@ -808,7 +842,11 @@ def cleanup_completed_games(
         rows = _fetchall(
             conn,
             """
-            SELECT id, game_url, success_notified, engine_failed, attempt_count, last_attempt_at, completed_at
+            SELECT
+              id, game_url, success_notified, analysis_complete, last_attempt_at, completed_at,
+              """
+            + ("tg_send_attempts" if "tg_send_attempts" in game_columns else "0 AS tg_send_attempts")
+            + """
             FROM games
             WHERE player_id = %s
               AND completed_at IS NULL
@@ -826,9 +864,10 @@ def cleanup_completed_games(
             if last_attempt_at is not None and last_attempt_at >= cutoff:
                 continue
             success_notified = bool(row_dict.get("success_notified", False))
-            engine_failed = bool(row_dict.get("engine_failed", False))
-            attempts = int(row_dict.get("attempt_count", 0) or 0)
-            should_complete = success_notified or (engine_failed and attempts >= max(1, int(max_attempts)))
+            analysis_complete = bool(row_dict.get("analysis_complete", False))
+            tg_attempts = int(row_dict.get("tg_send_attempts", 0) or 0)
+            tg_max_attempts = max(1, _env_int("TG_MAX_SEND_ATTEMPTS", 5))
+            should_complete = success_notified and analysis_complete and (tg_attempts <= tg_max_attempts)
             if not should_complete:
                 continue
             game_id = int(row_dict.get("id", 0) or 0)
@@ -859,8 +898,10 @@ def get_pending_games_for_processing(limit: int) -> list[dict[str, Any]]:
     - attempt_count < max attempts (env POLL_MAX_ATTEMPTS, default 5)
     - last_attempt_at is null OR older than cooldown window
       (env POLL_COOLDOWN_SECONDS, default 600)
+    - send-only retries (analysis_complete=TRUE) respect
+      TG_MAX_SEND_ATTEMPTS/TG_RETRY_COOLDOWN_SECONDS
     - pgn present and non-empty
-    Ordered by recency (played_at DESC, fallback created_at DESC, fallback end_time DESC),
+    Ordered by recency (played_at DESC NULLS LAST, created_at DESC, id DESC),
     limited by ``limit``.
     """
     database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -884,10 +925,14 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             "excluded_by_attempt_cap": 0,
             "excluded_by_engine_failed": 0,
             "excluded_by_success_notified": 0,
+            "excluded_by_pgn_missing_terminal": 0,
+            "excluded_by_tg_send_backoff": 0,
             "sample_excluded_by_success_notified": [],
             "sample_excluded_by_engine_failed": [],
             "sample_excluded_by_attempt_cap": [],
             "sample_excluded_by_cooldown": [],
+            "sample_excluded_by_pgn_missing_terminal": [],
+            "sample_excluded_by_tg_send_backoff": [],
             "top_newest_pending": [],
             "eligible_rows": [],
         }
@@ -905,10 +950,14 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             "excluded_by_attempt_cap": 0,
             "excluded_by_engine_failed": 0,
             "excluded_by_success_notified": 0,
+            "excluded_by_pgn_missing_terminal": 0,
+            "excluded_by_tg_send_backoff": 0,
             "sample_excluded_by_success_notified": [],
             "sample_excluded_by_engine_failed": [],
             "sample_excluded_by_attempt_cap": [],
             "sample_excluded_by_cooldown": [],
+            "sample_excluded_by_pgn_missing_terminal": [],
+            "sample_excluded_by_tg_send_backoff": [],
             "top_newest_pending": [],
             "eligible_rows": [],
         }
@@ -932,10 +981,14 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
                 "excluded_by_attempt_cap": 0,
                 "excluded_by_engine_failed": 0,
                 "excluded_by_success_notified": 0,
+                "excluded_by_pgn_missing_terminal": 0,
+                "excluded_by_tg_send_backoff": 0,
                 "sample_excluded_by_success_notified": [],
                 "sample_excluded_by_engine_failed": [],
                 "sample_excluded_by_attempt_cap": [],
                 "sample_excluded_by_cooldown": [],
+                "sample_excluded_by_pgn_missing_terminal": [],
+                "sample_excluded_by_tg_send_backoff": [],
                 "top_newest_pending": [],
                 "eligible_rows": [],
             }
@@ -944,7 +997,7 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             conn,
             """
             SELECT
-              game_url, pgn, end_time, time_control, rated, rules, result,
+              id, game_url, pgn, end_time, time_control, rated, rules, result,
               white_username, black_username, white_rating, black_rating, player_color,
               played_at, success_notified, engine_failed, attempt_count, last_attempt_at,
               """
@@ -956,7 +1009,13 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             + ", "
             + ("tg_last_error" if "tg_last_error" in game_columns else "NULL AS tg_last_error")
             + ", "
+            + ("tg_send_attempts" if "tg_send_attempts" in game_columns else "0 AS tg_send_attempts")
+            + ", "
+            + ("tg_last_send_at" if "tg_last_send_at" in game_columns else "NULL AS tg_last_send_at")
+            + ", "
             + ("pgn_missing" if "pgn_missing" in game_columns else "FALSE AS pgn_missing")
+            + ", "
+            + ("pgn_missing_terminal" if "pgn_missing_terminal" in game_columns else "FALSE AS pgn_missing_terminal")
             + ", "
             + """
               """
@@ -965,7 +1024,7 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             + ("created_at" if "created_at" in game_columns else "NULL AS created_at")
             + """
             FROM games
-            ORDER BY played_at DESC NULLS LAST, created_at DESC NULLS LAST, end_time DESC, id DESC
+            ORDER BY played_at DESC NULLS LAST, created_at DESC, id DESC
             """,
         )
         # Prefer poll-specific knobs; keep legacy names as compatibility fallback.
@@ -983,10 +1042,14 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
         excluded_by_engine_failed = 0
         excluded_by_attempt_cap = 0
         excluded_by_cooldown = 0
+        excluded_by_pgn_missing_terminal = 0
+        excluded_by_tg_send_backoff = 0
         sample_excluded_by_success_notified: list[str] = []
         sample_excluded_by_engine_failed: list[str] = []
         sample_excluded_by_attempt_cap: list[str] = []
         sample_excluded_by_cooldown: list[str] = []
+        sample_excluded_by_pgn_missing_terminal: list[str] = []
+        sample_excluded_by_tg_send_backoff: list[str] = []
 
         for row in rows:
             row_dict = dict(row)
@@ -1000,6 +1063,32 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
                 pending_rows.append(row_dict)
 
             if bool(row_dict.get("success_notified", False)):
+                continue
+            send_only_retry = bool(row_dict.get("analysis_complete", False))
+            if send_only_retry:
+                reasons = eligibility_rejection_reasons(
+                    row_dict,
+                    now=now_utc,
+                    max_attempts=max_attempts,
+                    cooldown_seconds=cooldown_seconds,
+                )
+                if bool(reasons.get("tg_attempt_cap", False)) or bool(reasons.get("tg_cooldown_active", False)):
+                    excluded_by_tg_send_backoff += 1
+                    if len(sample_excluded_by_tg_send_backoff) < 5:
+                        sample_excluded_by_tg_send_backoff.append(str(row_dict.get("game_url", "") or ""))
+                    continue
+                if is_game_eligible_for_processing(
+                    row_dict,
+                    now=now_utc,
+                    max_attempts=max_attempts,
+                    cooldown_seconds=cooldown_seconds,
+                ):
+                    eligible_rows_all.append(row_dict)
+                continue
+            if bool(row_dict.get("pgn_missing_terminal", False)):
+                excluded_by_pgn_missing_terminal += 1
+                if len(sample_excluded_by_pgn_missing_terminal) < 5:
+                    sample_excluded_by_pgn_missing_terminal.append(str(row_dict.get("game_url", "") or ""))
                 continue
             if bool(row_dict.get("engine_failed", False)):
                 excluded_by_engine_failed += 1
@@ -1035,7 +1124,9 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
                 _coerce_datetime_utc(item.get("played_at"))
                 or _coerce_datetime_utc(item.get("created_at"))
                 or datetime.min.replace(tzinfo=timezone.utc),
-                int(item.get("end_time", 0) or 0),
+                _coerce_datetime_utc(item.get("created_at"))
+                or datetime.min.replace(tzinfo=timezone.utc),
+                int(item.get("id", 0) or 0),
             ),
             reverse=True,
         )
@@ -1056,6 +1147,8 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
                 "last_attempt_at": str(item.get("last_attempt_at", "") or ""),
                 "analysis_complete": bool(item.get("analysis_complete", False)),
                 "tg_send_failed": bool(item.get("tg_send_failed", False)),
+                "tg_send_attempts": int(item.get("tg_send_attempts", 0) or 0),
+                "tg_last_send_at": str(item.get("tg_last_send_at", "") or ""),
             }
             for item in newest_pending
         ]
@@ -1071,10 +1164,14 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             "excluded_by_attempt_cap": int(excluded_by_attempt_cap),
             "excluded_by_engine_failed": int(excluded_by_engine_failed),
             "excluded_by_success_notified": int(excluded_by_success_notified),
+            "excluded_by_pgn_missing_terminal": int(excluded_by_pgn_missing_terminal),
+            "excluded_by_tg_send_backoff": int(excluded_by_tg_send_backoff),
             "sample_excluded_by_success_notified": sample_excluded_by_success_notified,
             "sample_excluded_by_engine_failed": sample_excluded_by_engine_failed,
             "sample_excluded_by_attempt_cap": sample_excluded_by_attempt_cap,
             "sample_excluded_by_cooldown": sample_excluded_by_cooldown,
+            "sample_excluded_by_pgn_missing_terminal": sample_excluded_by_pgn_missing_terminal,
+            "sample_excluded_by_tg_send_backoff": sample_excluded_by_tg_send_backoff,
             "top_newest_pending": top_newest_pending,
             "eligible_rows": eligible_rows_all[: max(1, int(limit))],
         }
@@ -1089,10 +1186,14 @@ def get_pending_games_for_processing_diagnostics(limit: int) -> dict[str, Any]:
             "excluded_by_attempt_cap": 0,
             "excluded_by_engine_failed": 0,
             "excluded_by_success_notified": 0,
+            "excluded_by_pgn_missing_terminal": 0,
+            "excluded_by_tg_send_backoff": 0,
             "sample_excluded_by_success_notified": [],
             "sample_excluded_by_engine_failed": [],
             "sample_excluded_by_attempt_cap": [],
             "sample_excluded_by_cooldown": [],
+            "sample_excluded_by_pgn_missing_terminal": [],
+            "sample_excluded_by_tg_send_backoff": [],
             "top_newest_pending": [],
             "eligible_rows": [],
         }
@@ -1130,7 +1231,6 @@ def load_games_missing_pgn(limit: int = 100) -> list[dict[str, Any]]:
         if not missing_parts:
             return []
 
-        max_attempts = max(1, _env_int("PGN_MISSING_MAX_ATTEMPTS", 5))
         retry_seconds = max(0, _env_int("PGN_MISSING_RETRY_SECONDS", 3600))
         query = (
             f"""
@@ -1138,7 +1238,11 @@ def load_games_missing_pgn(limit: int = 100) -> list[dict[str, Any]]:
                    """
             + ("pgn_missing" if "pgn_missing" in game_columns else "FALSE AS pgn_missing")
             + ", "
+            + ("pgn_missing_terminal" if "pgn_missing_terminal" in game_columns else "FALSE AS pgn_missing_terminal")
+            + ", "
             + ("pgn_missing_attempts" if "pgn_missing_attempts" in game_columns else "0 AS pgn_missing_attempts")
+            + ", "
+            + ("pgn_missing_count" if "pgn_missing_count" in game_columns else "0 AS pgn_missing_count")
             + ", "
             + ("pgn_missing_last_attempt_at" if "pgn_missing_last_attempt_at" in game_columns else "NULL AS pgn_missing_last_attempt_at")
             + f"""
@@ -1154,8 +1258,8 @@ def load_games_missing_pgn(limit: int = 100) -> list[dict[str, Any]]:
               AND (
                 """
             + (
-                "(COALESCE(pgn_missing_attempts, 0) < %s)"
-                if "pgn_missing_attempts" in game_columns
+                "(COALESCE(pgn_missing_terminal, FALSE) = FALSE)"
+                if "pgn_missing_terminal" in game_columns
                 else "TRUE"
             )
             + """
@@ -1174,8 +1278,6 @@ def load_games_missing_pgn(limit: int = 100) -> list[dict[str, Any]]:
             """
         )
         params: list[Any] = []
-        if "pgn_missing_attempts" in game_columns:
-            params.append(max_attempts)
         if "pgn_missing_last_attempt_at" in game_columns:
             params.append(retry_seconds)
         params.append(max(1, int(limit)))
@@ -1218,8 +1320,12 @@ def update_game_pgn_for_url(*, game_url: str, pgn: str) -> bool:
             set_parts.append("pgn_missing = FALSE")
         if "pgn_missing_attempts" in game_columns:
             set_parts.append("pgn_missing_attempts = 0")
+        if "pgn_missing_count" in game_columns:
+            set_parts.append("pgn_missing_count = 0")
         if "pgn_missing_last_attempt_at" in game_columns:
             set_parts.append("pgn_missing_last_attempt_at = NULL")
+        if "pgn_missing_terminal" in game_columns:
+            set_parts.append("pgn_missing_terminal = FALSE")
         if not set_parts:
             return False
         url_col = "game_url" if "game_url" in game_columns else "url"
@@ -1263,14 +1369,14 @@ def record_pgn_missing_not_found(*, game_url: str) -> dict[str, Any]:
 
     try:
         game_columns = _table_columns(conn, "games")
-        required = {"pgn_missing", "pgn_missing_attempts", "pgn_missing_last_attempt_at"}
+        required = {"pgn_missing", "pgn_missing_last_attempt_at", "pgn_missing_count", "pgn_missing_terminal"}
         if not game_columns or "game_url" not in game_columns or not required.issubset(game_columns):
             return {"available": False, "reason": "schema_missing", "updated": False}
 
-        max_attempts = max(1, _env_int("PGN_MISSING_MAX_ATTEMPTS", 5))
+        max_attempts = max(1, _env_int("PGN_MISSING_TERMINAL_THRESHOLD", 3))
         row = _fetchone(
             conn,
-            "SELECT id, COALESCE(pgn_missing_attempts, 0) AS attempts FROM games WHERE game_url = %s LIMIT 1",
+            "SELECT id, COALESCE(pgn_missing_count, 0) AS attempts FROM games WHERE game_url = %s LIMIT 1",
             (clean_url,),
         )
         if not row:
@@ -1285,11 +1391,13 @@ def record_pgn_missing_not_found(*, game_url: str) -> dict[str, Any]:
             """
             UPDATE games
             SET pgn_missing_attempts = %s,
+                pgn_missing_count = %s,
                 pgn_missing_last_attempt_at = NOW(),
-                pgn_missing = %s
+                pgn_missing = %s,
+                pgn_missing_terminal = %s
             WHERE id = %s
             """,
-            (attempts, permanently_missing, game_id),
+            (attempts, attempts, permanently_missing, permanently_missing, game_id),
         )
         conn.commit()
         return {
@@ -1298,6 +1406,7 @@ def record_pgn_missing_not_found(*, game_url: str) -> dict[str, Any]:
             "updated": True,
             "attempts": attempts,
             "pgn_missing": permanently_missing,
+            "pgn_missing_terminal": permanently_missing,
             "max_attempts": max_attempts,
         }
     except Exception:
@@ -1356,9 +1465,13 @@ def reset_game_processing_state(*, game_url: str) -> dict[str, Any]:
             "md_path": None,
             "tg_send_failed": False,
             "tg_last_error": None,
+            "tg_send_attempts": 0,
+            "tg_last_send_at": None,
             "pgn_missing": False,
             "pgn_missing_attempts": 0,
+            "pgn_missing_count": 0,
             "pgn_missing_last_attempt_at": None,
+            "pgn_missing_terminal": False,
         }
         set_parts: list[str] = []
         params: list[Any] = []

@@ -27,7 +27,9 @@ def _required_game_columns() -> set[str]:
 
 
 def _base_row(*, game_url: str, played_at: datetime) -> dict[str, object]:
+    row_id = int(str(game_url).rstrip("/").split("/")[-1]) if str(game_url).rstrip("/").split("/")[-1].isdigit() else 0
     return {
+        "id": row_id,
         "game_url": game_url,
         "pgn": "[Event \"Live Chess\"]\\n1. e4 e5 1-0",
         "played_at": played_at,
@@ -283,6 +285,44 @@ def test_get_pending_games_for_processing_prefers_newest_over_analysis_complete(
     ]
 
 
+def test_get_pending_games_for_processing_send_only_respects_tg_backoff(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    send_only_blocked = _base_row(game_url="https://www.chess.com/game/live/send-only-blocked", played_at=now - timedelta(minutes=5))
+    send_only_blocked["analysis_complete"] = True
+    send_only_blocked["md_path"] = "/data/md/send-only.md"
+    send_only_blocked["tg_send_attempts"] = 1
+    send_only_blocked["tg_last_send_at"] = now - timedelta(seconds=120)
+
+    send_only_ready = _base_row(game_url="https://www.chess.com/game/live/send-only-ready", played_at=now - timedelta(minutes=6))
+    send_only_ready["analysis_complete"] = True
+    send_only_ready["md_path"] = "/data/md/send-only-ready.md"
+    send_only_ready["tg_send_attempts"] = 1
+    send_only_ready["tg_last_send_at"] = now - timedelta(seconds=601)
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("POLL_COOLDOWN_SECONDS", "600")
+    monkeypatch.setenv("TG_RETRY_COOLDOWN_SECONDS", "600")
+    monkeypatch.setenv("TG_MAX_SEND_ATTEMPTS", "5")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, _table: _required_game_columns() | {"analysis_complete", "md_path", "tg_send_attempts", "tg_last_send_at"},
+    )
+    monkeypatch.setattr(
+        runtime_updates,
+        "_fetchall",
+        lambda _conn, _query, _params=(): [send_only_blocked, send_only_ready],
+    )
+
+    diag = runtime_updates.get_pending_games_for_processing_diagnostics(limit=10)
+
+    assert diag["eligible_now"] == 1
+    assert diag["excluded_by_tg_send_backoff"] == 1
+    assert [row["game_url"] for row in diag["eligible_rows"]] == ["https://www.chess.com/game/live/send-only-ready"]
+
+
 def test_get_pending_games_for_processing_falls_back_to_created_at_when_played_at_missing(monkeypatch) -> None:
     now = datetime.now(timezone.utc)
     missing_played_newer_created = _base_row(
@@ -319,6 +359,40 @@ def test_get_pending_games_for_processing_falls_back_to_created_at_when_played_a
     assert [row["game_url"] for row in out] == [
         "https://www.chess.com/game/live/missing-played-newer-created",
         "https://www.chess.com/game/live/missing-played-older-created",
+    ]
+
+
+def test_get_pending_games_for_processing_tiebreak_uses_created_at_then_id(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    same_played = now - timedelta(minutes=10)
+    same_created = now - timedelta(minutes=5)
+    row_a = _base_row(game_url="https://www.chess.com/game/live/8101", played_at=same_played)
+    row_a["created_at"] = same_created
+    row_a["id"] = 8101
+    row_b = _base_row(game_url="https://www.chess.com/game/live/8102", played_at=same_played)
+    row_b["created_at"] = same_created
+    row_b["id"] = 8102
+    row_c = _base_row(game_url="https://www.chess.com/game/live/8103", played_at=same_played)
+    row_c["created_at"] = now - timedelta(minutes=1)
+    row_c["id"] = 8103
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setenv("POLL_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("POLL_COOLDOWN_SECONDS", "600")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, _table: _required_game_columns() | {"created_at"},
+    )
+    monkeypatch.setattr(runtime_updates, "_fetchall", lambda _conn, _query, _params=(): [row_a, row_b, row_c])
+
+    out = runtime_updates.get_pending_games_for_processing(limit=10)
+
+    assert [row["game_url"] for row in out] == [
+        "https://www.chess.com/game/live/8103",  # newer created_at wins
+        "https://www.chess.com/game/live/8102",  # same created_at, higher id wins
+        "https://www.chess.com/game/live/8101",
     ]
 
 

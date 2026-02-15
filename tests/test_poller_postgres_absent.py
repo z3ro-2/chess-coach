@@ -1753,6 +1753,54 @@ def test_queue_debug_logging_disabled_suppresses_queue_logs(monkeypatch, tmp_pat
     assert "[QUEUE-DEBUG]" not in text
 
 
+def test_queue_debug_logs_structured_exclusion_reasons(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.setenv("ENABLE_QUEUE_DEBUG", "1")
+    monkeypatch.setattr(chess_review, "cleanup_completed_games", lambda **_kwargs: {"available": True, "reason": "ok", "marked_count": 0})
+    monkeypatch.setattr(chess_review, "get_pending_games_for_processing", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        chess_review,
+        "get_pending_games_for_processing_diagnostics",
+        lambda **_kwargs: {
+            "pending_total": 5,
+            "eligible_now": 0,
+            "excluded_by_cooldown": 1,
+            "excluded_by_attempt_cap": 1,
+            "excluded_by_engine_failed": 1,
+            "excluded_by_success_notified": 1,
+            "excluded_by_pgn_missing_terminal": 1,
+            "sample_excluded_by_success_notified": ["https://www.chess.com/game/live/succ"],
+            "sample_excluded_by_engine_failed": ["https://www.chess.com/game/live/eng"],
+            "sample_excluded_by_pgn_missing_terminal": ["https://www.chess.com/game/live/pgnterm"],
+            "sample_excluded_by_attempt_cap": ["https://www.chess.com/game/live/attcap"],
+            "sample_excluded_by_cooldown": ["https://www.chess.com/game/live/cool"],
+            "top_newest_pending": [],
+            "eligible_rows": [],
+        },
+    )
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [])
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.retry_failures = False
+        args.lookback_days = 10
+        args.dry_run = False
+        args.retries = 1
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[QUEUE-DEBUG] exclude url=https://www.chess.com/game/live/succ reason=success_notified" in text
+    assert "[QUEUE-DEBUG] exclude url=https://www.chess.com/game/live/eng reason=engine_failed" in text
+    assert "[QUEUE-DEBUG] exclude url=https://www.chess.com/game/live/pgnterm reason=pgn_missing_terminal" in text
+    assert "[QUEUE-DEBUG] exclude url=https://www.chess.com/game/live/attcap reason=attempt_cap" in text
+    assert "[QUEUE-DEBUG] exclude url=https://www.chess.com/game/live/cool reason=cooldown" in text
+
+
 def test_queue_debug_logs_structured_per_game_eligibility_reasons_when_enabled(monkeypatch, tmp_path, caplog) -> None:
     ingest_check_module.close_ingest_db_check()
     now_epoch = int(time.time())
@@ -1991,7 +2039,7 @@ def test_poll_once_missing_pgn_not_found_records_attempt_and_marks_permanent_mis
         chess_review,
         "record_pgn_missing_not_found",
         lambda **_kwargs: calls.__setitem__("record_missing", calls["record_missing"] + 1)
-        or {"available": True, "updated": True, "attempts": 5, "pgn_missing": True},
+        or {"available": True, "updated": True, "attempts": 3, "pgn_missing_terminal": True},
     )
     monkeypatch.setattr(chess_review, "process_game", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not process")))
 
@@ -2011,4 +2059,4 @@ def test_poll_once_missing_pgn_not_found_records_attempt_and_marks_permanent_mis
     assert created == 0
     assert calls["record_missing"] == 1
     text = "\n".join(rec.getMessage() for rec in caplog.records)
-    assert "pgn_fetch_missing_retry game_url=https://www.chess.com/game/live/1470001 status=not_found attempts=5 pgn_missing=True" in text
+    assert "pgn_fetch_missing_retry game_url=https://www.chess.com/game/live/1470001 status=not_found attempts=3 pgn_missing_terminal=True" in text

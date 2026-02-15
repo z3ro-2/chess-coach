@@ -21,8 +21,10 @@ def _required_columns() -> set[str]:
         "pgn",
         "played_at",
         "success_notified",
+        "analysis_complete",
         "engine_failed",
         "attempt_count",
+        "tg_send_attempts",
         "last_attempt_at",
         "completed_at",
     }
@@ -34,8 +36,10 @@ def _row(
     game_url: str,
     played_at: datetime,
     success_notified: bool = False,
+    analysis_complete: bool = False,
     engine_failed: bool = False,
     attempt_count: int = 0,
+    tg_send_attempts: int = 0,
     last_attempt_at: datetime | None = None,
     completed_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -58,8 +62,10 @@ def _row(
         "player_color": "white",
         "played_at": played_at,
         "success_notified": success_notified,
+        "analysis_complete": analysis_complete,
         "engine_failed": engine_failed,
         "attempt_count": attempt_count,
+        "tg_send_attempts": tg_send_attempts,
         "last_attempt_at": last_attempt_at,
         "completed_at": completed_at,
     }
@@ -73,18 +79,11 @@ def test_cleanup_marks_completed_and_pending_excludes_them(monkeypatch) -> None:
             game_url="https://www.chess.com/game/live/success-done",
             played_at=now - timedelta(hours=2),
             success_notified=True,
+            analysis_complete=True,
             last_attempt_at=now - timedelta(hours=2),
         ),
         _row(
             game_id=2,
-            game_url="https://www.chess.com/game/live/failed-maxed",
-            played_at=now - timedelta(hours=3),
-            engine_failed=True,
-            attempt_count=5,
-            last_attempt_at=now - timedelta(hours=2),
-        ),
-        _row(
-            game_id=3,
             game_url="https://www.chess.com/game/live/pending",
             played_at=now - timedelta(hours=1),
             attempt_count=1,
@@ -93,7 +92,7 @@ def test_cleanup_marks_completed_and_pending_excludes_them(monkeypatch) -> None:
     ]
 
     def _fetchall(_conn, query: str, _params=()):
-        if "SELECT id, game_url, success_notified, engine_failed, attempt_count, last_attempt_at, completed_at" in query:
+        if "SELECT" in query and "analysis_complete" in query and "tg_send_attempts" in query and "completed_at" in query:
             return [dict(r) for r in rows if r.get("completed_at") is None]
         if "SELECT" in query and "FROM games" in query and "played_at" in query:
             return [dict(r) for r in rows]
@@ -123,7 +122,7 @@ def test_cleanup_marks_completed_and_pending_excludes_them(monkeypatch) -> None:
     pending = runtime_updates.get_pending_games_for_processing(limit=10)
 
     assert cleanup["available"] is True
-    assert int(cleanup["marked_count"]) == 2
+    assert int(cleanup["marked_count"]) == 1
     assert [str(r["game_url"]) for r in pending] == ["https://www.chess.com/game/live/pending"]
 
 
@@ -135,12 +134,13 @@ def test_cleanup_respects_poll_cooldown_seconds(monkeypatch) -> None:
             game_url="https://www.chess.com/game/live/recent-success",
             played_at=now - timedelta(hours=1),
             success_notified=True,
+            analysis_complete=True,
             last_attempt_at=now - timedelta(seconds=30),
         )
     ]
 
     def _fetchall(_conn, query: str, _params=()):
-        if "SELECT id, game_url, success_notified, engine_failed, attempt_count, last_attempt_at, completed_at" in query:
+        if "SELECT" in query and "analysis_complete" in query and "tg_send_attempts" in query and "completed_at" in query:
             return [dict(r) for r in rows if r.get("completed_at") is None]
         return []
 

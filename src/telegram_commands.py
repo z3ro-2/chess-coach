@@ -182,7 +182,7 @@ def _telegram_get_updates(bot_token: str, *, params: dict[str, Any], timeout: in
 
 def _telegram_send_message(*, bot_token: str, chat_id: str, text: str, timeout: int) -> None:
     client = create_telegram_client(bot_token=bot_token, timeout=timeout)
-    client.send_text(chat_id=chat_id, text=text, disable_preview=True)
+    client.send_text(chat_id=chat_id, text=text, disable_preview=True, parse_mode=None)
 
 
 def _telegram_send_document(
@@ -194,4 +194,4 @@ def _telegram_send_document(
     timeout: int,
 ) -> None:
     client = create_telegram_client(bot_token=bot_token, timeout=timeout)
-    client.send_document(chat_id=chat_id, filepath=file_path, caption=caption)
+    client.send_document(chat_id=chat_id, filepath=file_path, caption=caption, parse_mode=None)

@@ -98,6 +98,7 @@ from src.db.runtime_updates import (
     update_game_pgn_for_url,
 )
 from src.db.schema import ensure_postgres_core_schema
+from src.db._pg_utils import _connect_db
 from src.llm_diagnostics import hash_text_sha256, prompt_hash, split_model_name_version
 from src.telegram_client import TelegramClientError, create_telegram_client
 from src.telegram_commands import poll_telegram_commands
@@ -116,6 +117,7 @@ TRAIT_SCORE_KEYS: tuple[str, ...] = (
     "defensive_resilience",
     "blunder_frequency",
 )
+LAST_POLL_CYCLE_STATS: dict[str, Any] = {}
 
 # -----------------------------
 # Telegram notifications
@@ -147,6 +149,7 @@ def send_telegram_document(
             filepath=file_path,
             caption=str(caption or ""),
             disable_notification=disable_notification,
+            parse_mode=None,
         )
     except TelegramClientError as exc:
         raise TelegramError(str(exc)) from exc
@@ -171,6 +174,7 @@ def send_telegram_message(
             text=str(message or ""),
             disable_preview=bool(disable_web_page_preview),
             disable_notification=disable_notification,
+            parse_mode=None,
         )
     except TelegramClientError as exc:
         raise TelegramError(str(exc)) from exc
@@ -415,6 +419,92 @@ def run_queue_inspector(args: argparse.Namespace) -> int:
     return 0
 
 
+def _postgres_connection_ok() -> bool:
+    database_url = str(os.environ.get("DATABASE_URL", "") or "").strip()
+    if not database_url:
+        return False
+    lowered = database_url.lower()
+    if not (
+        lowered.startswith("postgres://")
+        or lowered.startswith("postgresql://")
+        or lowered.startswith("postgresql+")
+    ):
+        return False
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        return False
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        finally:
+            cur.close()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            cleanup()
+        except Exception:
+            pass
+
+
+def run_status_report(args: argparse.Namespace) -> int:
+    _sync_runtime_provider(args)
+    provider = str(get_provider() or getattr(args, "provider", "ollama") or "ollama").strip().lower() or "ollama"
+    model = str(getattr(args, "gpt_model", "") if provider == "gpt" else getattr(args, "ollama_model", "")).strip()
+    pending_limit = max(1, int(_env_int("POLL_BATCH_SIZE", 5)))
+    queue_diag = get_pending_games_for_processing_diagnostics(limit=pending_limit)
+
+    pending_total = int(queue_diag.get("pending_total", 0) or 0)
+    eligible_now = int(queue_diag.get("eligible_now", 0) or 0)
+    excluded_by_cooldown = int(queue_diag.get("excluded_by_cooldown", 0) or 0)
+    excluded_by_attempt_cap = int(queue_diag.get("excluded_by_attempt_cap", 0) or 0)
+    excluded_by_engine_failed = int(queue_diag.get("excluded_by_engine_failed", 0) or 0)
+    excluded_by_pgn_missing_terminal = int(queue_diag.get("excluded_by_pgn_missing_terminal", 0) or 0)
+    total_games = int(queue_diag.get("total_games_in_db", 0) or 0)
+
+    last_stats = dict(LAST_POLL_CYCLE_STATS or {})
+    if last_stats:
+        last_poll_line = (
+            "ts={ts} created={created} pending_total={pending_total} eligible_now={eligible_now} "
+            "skips(eligibility={eligibility_filter}, already_processed={already_processed}, "
+            "attempt_backoff={attempt_backoff}, unsupported={unsupported_time_control}, "
+            "integrity={integrity_exclusion}) fallback_rate={fallback_rate:.4f}"
+        ).format(
+            ts=str(last_stats.get("ts_utc", "unknown")),
+            created=int(last_stats.get("created", 0) or 0),
+            pending_total=int(last_stats.get("pending_total", 0) or 0),
+            eligible_now=int(last_stats.get("eligible_now", 0) or 0),
+            eligibility_filter=int(last_stats.get("eligibility_filter", 0) or 0),
+            already_processed=int(last_stats.get("already_processed", 0) or 0),
+            attempt_backoff=int(last_stats.get("attempt_backoff", 0) or 0),
+            unsupported_time_control=int(last_stats.get("unsupported_time_control", 0) or 0),
+            integrity_exclusion=int(last_stats.get("integrity_exclusion", 0) or 0),
+            fallback_rate=float(last_stats.get("fallback_rate", 0.0) or 0.0),
+        )
+    else:
+        last_poll_line = "none"
+
+    lines = [
+        "Status Report",
+        f"- LLM: provider={provider} model={model}",
+        f"- Postgres: {'connected' if _postgres_connection_ok() else 'not connected'}",
+        f"- Total games: {total_games}",
+        f"- Pending total: {pending_total}",
+        f"- Eligible now: {eligible_now}",
+        f"- Blocked cooldown: {excluded_by_cooldown}",
+        f"- Blocked attempt cap: {excluded_by_attempt_cap}",
+        f"- Blocked engine_failed: {excluded_by_engine_failed}",
+        f"- Blocked pgn_missing_terminal: {excluded_by_pgn_missing_terminal}",
+        f"- Last poll cycle: {last_poll_line}",
+    ]
+    print("\n".join(lines))
+    return 0
+
+
 def run_smoke_checks(args: argparse.Namespace) -> int:
     """Fast end-to-end readiness checks for engine/LLM/Telegram/DB wiring."""
     results: list[tuple[str, bool, str]] = []
@@ -436,6 +526,17 @@ def run_smoke_checks(args: argparse.Namespace) -> int:
                 False,
                 f"failed to load: {exc}. Ensure prompts exist under PROMPTS_DIR/project prompts.",
             )
+
+    # SQLite state path (exists + writable)
+    state_db = Path(str(getattr(args, "state_db", "/data/state.sqlite") or "/data/state.sqlite"))
+    try:
+        state_db.parent.mkdir(parents=True, exist_ok=True)
+        state_db.touch(exist_ok=True)
+        with state_db.open("a", encoding="utf-8"):
+            pass
+        _add("sqlite_state", True, f"writable ({state_db})")
+    except Exception as exc:
+        _add("sqlite_state", False, f"state DB path not writable: {state_db} ({exc})")
 
     # Stockfish binary + handshake
     stockfish_path = str(getattr(args, "stockfish_path", "") or "").strip()
@@ -2778,6 +2879,7 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
     excluded_by_engine_failed = int(pending_diag.get("excluded_by_engine_failed", 0) or 0)
     excluded_by_attempt_cap = int(pending_diag.get("excluded_by_attempt_cap", 0) or 0)
     excluded_by_cooldown = int(pending_diag.get("excluded_by_cooldown", 0) or 0)
+    excluded_by_pgn_missing_terminal = int(pending_diag.get("excluded_by_pgn_missing_terminal", 0) or 0)
     logger.info(
         (
             "Queue cycle pending_total=%s eligible_now=%s skipped_by_success_notified=%s "
@@ -2789,6 +2891,10 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
         excluded_by_engine_failed,
         excluded_by_attempt_cap,
         excluded_by_cooldown,
+    )
+    logger.info(
+        "Queue cycle skipped_by_pgn_missing_terminal=%s",
+        excluded_by_pgn_missing_terminal,
     )
     _queue_debug(
         (
@@ -2818,6 +2924,24 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
         "sample_excluded_by_cooldown=%s",
         ",".join(str(x) for x in list(pending_diag.get("sample_excluded_by_cooldown") or [])[:5]) or "<none>",
     )
+    _queue_debug(
+        "sample_excluded_by_pgn_missing_terminal=%s",
+        ",".join(str(x) for x in list(pending_diag.get("sample_excluded_by_pgn_missing_terminal") or [])[:5]) or "<none>",
+    )
+    for reason_key, reason_label in (
+        ("sample_excluded_by_success_notified", "success_notified"),
+        ("sample_excluded_by_engine_failed", "engine_failed"),
+        ("sample_excluded_by_pgn_missing_terminal", "pgn_missing_terminal"),
+        ("sample_excluded_by_attempt_cap", "attempt_cap"),
+        ("sample_excluded_by_cooldown", "cooldown"),
+    ):
+        for sample_url in list(pending_diag.get(reason_key) or [])[:5]:
+            if str(sample_url or "").strip():
+                _queue_debug(
+                    "exclude url=%s reason=%s",
+                    str(sample_url),
+                    reason_label,
+                )
     _poll_debug(
         (
             "pending diagnostics pending_total=%s eligible_now=%s excluded_by_cooldown=%s "
@@ -3015,7 +3139,7 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
             _queue_debug(
                 (
                     "game_skip url=%s success_notified=%s engine_failed=%s "
-                    "cooldown_active=%s attempt_cap=%s missing_pgn=%s pgn_missing=%s"
+                    "cooldown_active=%s attempt_cap=%s missing_pgn=%s pgn_missing=%s pgn_missing_terminal=%s"
                 ),
                 g.game_url,
                 bool(reasons.get("success_notified", False)),
@@ -3024,11 +3148,12 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
                 bool(reasons.get("attempt_cap", False)),
                 bool(reasons.get("missing_pgn", False)),
                 bool(reasons.get("pgn_missing", False)),
+                bool(reasons.get("pgn_missing_terminal", False)),
             )
             _poll_exec_audit(
                 (
                     "skip url=%s reason=eligibility_filter success_notified=%s engine_failed=%s "
-                    "cooldown_active=%s attempt_cap=%s missing_pgn=%s pgn_missing=%s"
+                    "cooldown_active=%s attempt_cap=%s missing_pgn=%s pgn_missing=%s pgn_missing_terminal=%s"
                 ),
                 g.game_url,
                 bool(reasons.get("success_notified", False)),
@@ -3037,6 +3162,7 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
                 bool(reasons.get("attempt_cap", False)),
                 bool(reasons.get("missing_pgn", False)),
                 bool(reasons.get("pgn_missing", False)),
+                bool(reasons.get("pgn_missing_terminal", False)),
             )
             cycle_skipped_counts["eligibility_filter"] += 1
             continue
@@ -3151,6 +3277,22 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
         int(cycle_skipped_counts["unsupported_time_control"]),
         int(cycle_skipped_counts["integrity_exclusion"]),
     )
+    LAST_POLL_CYCLE_STATS.update(
+        {
+            "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "created": int(created),
+            "pending_total": int(pending_total),
+            "eligible_now": int(eligible_now),
+            "eligibility_filter": int(cycle_skipped_counts["eligibility_filter"]),
+            "already_processed": int(cycle_skipped_counts["already_processed"]),
+            "attempt_backoff": int(cycle_skipped_counts["attempt_backoff"]),
+            "unsupported_time_control": int(cycle_skipped_counts["unsupported_time_control"]),
+            "integrity_exclusion": int(cycle_skipped_counts["integrity_exclusion"]),
+            "llm_fallback_count": int(fallback),
+            "llm_total_attempts": int(total),
+            "fallback_rate": float(rate),
+        }
+    )
 
     return created
 
@@ -3258,10 +3400,10 @@ def _repair_missing_pgn_rows_from_raw_games(
         if not pgn:
             missing_state = record_pgn_missing_not_found(game_url=game_url)
             logger.info(
-                "pgn_fetch_missing_retry game_url=%s status=not_found attempts=%s pgn_missing=%s",
+                "pgn_fetch_missing_retry game_url=%s status=not_found attempts=%s pgn_missing_terminal=%s",
                 game_url,
                 int(missing_state.get("attempts", 0) or 0),
-                bool(missing_state.get("pgn_missing", False)),
+                bool(missing_state.get("pgn_missing_terminal", False)),
             )
             continue
         ok = bool(update_game_pgn_for_url(game_url=game_url, pgn=pgn))
@@ -3493,6 +3635,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     p.add_argument("--poll-seconds", type=int, default=300, help="Polling interval (seconds)")
     p.add_argument("--once", action="store_true", help="Run one poll cycle then exit")
+    p.add_argument("--status", action="store_true", help="Print concise bot health + queue state and exit.")
     p.add_argument("--smoke", action="store_true", help="Run fast integration smoke checks and exit non-zero on failure.")
     p.add_argument(
         "--smoke-send-telegram",
@@ -3636,7 +3779,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             p.error("--tg-smoketest requires --game-url.")
         if args.tg_smoketest_md is None:
             p.error("--tg-smoketest requires --md.")
-    elif (not args.queue) and (not args.smoke) and (not str(getattr(args, "reset_game", "") or "").strip()):
+    elif (not args.queue) and (not args.status) and (not args.smoke) and (not str(getattr(args, "reset_game", "") or "").strip()):
         if not args.username:
             p.error("the following arguments are required: --username (or set CHESS_USERNAME)")
         if args.out is None:
@@ -3670,6 +3813,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
+    if bool(getattr(args, "status", False)):
+        return int(run_status_report(args))
     if bool(getattr(args, "tg_smoketest", False)):
         return int(run_telegram_smoketest(args))
     if bool(getattr(args, "queue", False)):

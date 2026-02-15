@@ -35,6 +35,7 @@ class TelegramClient:
         *,
         disable_preview: bool | None = None,
         disable_notification: bool = False,
+        parse_mode: str | None = None,
     ) -> None:
         chat = str(chat_id or "").strip()
         if not chat:
@@ -45,6 +46,9 @@ class TelegramClient:
             "text": str(text or "")[:4096],
             "disable_notification": bool(disable_notification),
         }
+        # Safe default: plain text only; callers must opt in explicitly.
+        if parse_mode is not None:
+            payload["parse_mode"] = str(parse_mode)
         if disable_preview is not None:
             payload["disable_web_page_preview"] = bool(disable_preview)
         resp = requests.post(self._api_base() + "/sendMessage", data=payload, timeout=self.timeout)
@@ -65,6 +69,7 @@ class TelegramClient:
         *,
         caption: str | None = None,
         disable_notification: bool = False,
+        parse_mode: str | None = None,
     ) -> None:
         chat = str(chat_id or "").strip()
         if not chat:
@@ -79,6 +84,9 @@ class TelegramClient:
         }
         if caption is not None:
             payload["caption"] = str(caption)[:1024]
+        # Safe default: plain text caption only; callers must opt in explicitly.
+        if parse_mode is not None:
+            payload["parse_mode"] = str(parse_mode)
         with path.open("rb") as file_handle:
             files = {"document": (path.name, file_handle, "text/markdown")}
             resp = requests.post(self._api_base() + "/sendDocument", data=payload, files=files, timeout=self.timeout)
