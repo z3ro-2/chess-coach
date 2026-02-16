@@ -72,6 +72,68 @@ def test_process_game_does_not_fail_without_postgres(monkeypatch, tmp_path) -> N
     assert (tmp_path / "output" / "player_stats.md").exists()
 
 
+def test_process_game_does_not_skip_when_flags_not_terminal(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(chess_review, "run_analysis_pipeline", lambda **_kwargs: "# review")
+    monkeypatch.setattr(
+        chess_review,
+        "get_game_processing_flags",
+        lambda **_kwargs: {
+            "available": True,
+            "reason": "ok",
+            "found": True,
+            "success_notified": False,
+            "engine_failed": False,
+            "attempt_count": 2,
+        },
+    )
+
+    caplog.set_level(logging.INFO, logger="chess_review")
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        output_path = chess_review.process_game(conn, _base_args(tmp_path), _sample_game())
+    finally:
+        conn.close()
+
+    assert output_path is not None
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "process_game evaluating url=https://www.chess.com/game/live/123 success_notified=False engine_failed=False attempt_count=2" in text
+
+
+def test_process_game_skips_when_success_notified_true(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        chess_review,
+        "run_analysis_pipeline",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("analysis should not run")),
+    )
+    monkeypatch.setattr(
+        chess_review,
+        "get_game_processing_flags",
+        lambda **_kwargs: {
+            "available": True,
+            "reason": "ok",
+            "found": True,
+            "success_notified": True,
+            "engine_failed": False,
+            "attempt_count": 3,
+        },
+    )
+
+    caplog.set_level(logging.INFO, logger="chess_review")
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        output_path = chess_review.process_game(conn, _base_args(tmp_path), _sample_game())
+    finally:
+        conn.close()
+
+    assert output_path is None
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "process_game skip url=https://www.chess.com/game/live/123 reason=already_processed_success" in text
+
+
 def test_process_game_does_not_fail_when_postgres_is_down(monkeypatch, tmp_path) -> None:
     ingest_check_module.close_ingest_db_check()
     monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/chess")
@@ -329,36 +391,18 @@ def test_polling_debug_logs_skip_reasons_when_enabled(monkeypatch, tmp_path, cap
         args.dry_run = True
         args.retries = 1
 
-        processed_game = chess_review.parse_game(raw_games[3], "logan")
-        assert processed_game is not None
-        md_path = tmp_path / "output" / "md" / "already.md"
-        pgn_path = tmp_path / "output" / "pgn" / "already.pgn"
-        chess_review.write_text(md_path, "# review")
-        chess_review.write_text(pgn_path, processed_game.pgn)
-        chess_review.mark_processed(
-            conn=conn,
-            game_url=processed_game.game_url,
-            end_time=processed_game.end_time,
-            md_path=md_path,
-            pgn_path=pgn_path,
-            provider=args.provider,
-            model=args.ollama_model,
-            content_hash="h",
-        )
-
         caplog.set_level(logging.INFO, logger="chess_review")
         created = chess_review.poll_once(conn, args)
     finally:
         conn.close()
 
-    assert created == 1
+    assert created == 2
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "[POLL-DEBUG] total games fetched from chess.com: 5" in text
     assert "reason=missing PGN" in text
     assert "reason=rules_filter mismatch" in text
     assert "reason=outside lookback window" in text
-    assert "reason=already processed" in text
-    assert "source=state_db" in text
+    assert "reason=already processed" not in text
     assert "Game selected for processing: https://www.chess.com/game/live/5" in text
 
 
@@ -387,6 +431,51 @@ def test_polling_debug_logs_suppressed_when_flag_disabled(monkeypatch, tmp_path,
 
     assert created == 0
     assert "[POLL-DEBUG]" not in "\n".join(record.getMessage() for record in caplog.records)
+
+
+def test_poll_once_discovered_row_skips_only_on_terminal_flags(monkeypatch, tmp_path, caplog) -> None:
+    ingest_check_module.close_ingest_db_check()
+    monkeypatch.setenv("ENABLE_POLL_EXEC_AUDIT", "1")
+    now_epoch = int(time.time())
+    raw = {
+        "url": "https://www.chess.com/game/live/terminal-skip",
+        "pgn": '[Event "Live Chess"]\n[Result "1-0"]\n1. e4 e5 1-0\n',
+        "end_time": now_epoch,
+        "rules": "chess",
+        "time_control": "600",
+        "white": {"username": "logan"},
+        "black": {"username": "opponent"},
+    }
+    monkeypatch.setattr(chess_review, "fetch_recent_games", lambda *_args, **_kwargs: [raw])
+    monkeypatch.setattr(
+        chess_review,
+        "get_game_processing_flags",
+        lambda **_kwargs: {
+            "available": True,
+            "reason": "ok",
+            "found": True,
+            "success_notified": True,
+            "engine_failed": False,
+            "attempt_count": 4,
+        },
+    )
+    monkeypatch.setattr(chess_review, "process_game", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not process")))
+
+    conn = chess_review.init_db(tmp_path / "state.sqlite")
+    try:
+        args = _base_args(tmp_path)
+        args.lookback_days = 10
+        args.rules_filter = "chess"
+        args.dry_run = False
+        args.retries = 1
+        caplog.set_level(logging.INFO, logger="chess_review")
+        created = chess_review.poll_once(conn, args)
+    finally:
+        conn.close()
+
+    assert created == 0
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "[POLL-EXEC] skip url=https://www.chess.com/game/live/terminal-skip reason=already_processed_success" in text
 
 
 def test_retry_failures_flag_processes_seeded_failed_game_once(monkeypatch, tmp_path) -> None:

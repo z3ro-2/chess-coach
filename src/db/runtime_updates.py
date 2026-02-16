@@ -120,6 +120,113 @@ def should_notify_engine_failure(
         cleanup()
 
 
+def get_game_processing_flags(
+    *,
+    player_username: str,
+    game_url: str,
+) -> dict[str, Any]:
+    """Fetch current processing flags for one game without mutating state."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not _is_postgres_url(database_url):
+        return {
+            "available": False,
+            "reason": "no_database_url",
+            "found": False,
+            "success_notified": False,
+            "engine_failed": False,
+            "attempt_count": 0,
+        }
+
+    try:
+        conn, cleanup = _connect_db(database_url)
+    except Exception:
+        logger.debug("Skipping game-processing-flags read: DB unavailable.", exc_info=True)
+        return {
+            "available": False,
+            "reason": "db_unreachable",
+            "found": False,
+            "success_notified": False,
+            "engine_failed": False,
+            "attempt_count": 0,
+        }
+
+    try:
+        player_columns = _table_columns(conn, "players")
+        game_columns = _table_columns(conn, "games")
+        if not player_columns or not game_columns:
+            return {
+                "available": False,
+                "reason": "schema_missing",
+                "found": False,
+                "success_notified": False,
+                "engine_failed": False,
+                "attempt_count": 0,
+            }
+        player_row = _find_player_row(conn, player_username, player_columns)
+        if player_row is None:
+            return {
+                "available": True,
+                "reason": "player_not_found",
+                "found": False,
+                "success_notified": False,
+                "engine_failed": False,
+                "attempt_count": 0,
+            }
+        player_id = int(player_row["id"])
+        url_col = "game_url" if "game_url" in game_columns else ("url" if "url" in game_columns else None)
+        if not url_col:
+            return {
+                "available": False,
+                "reason": "schema_missing",
+                "found": False,
+                "success_notified": False,
+                "engine_failed": False,
+                "attempt_count": 0,
+            }
+        row = _fetchone(
+            conn,
+            f"""
+            SELECT
+              COALESCE(success_notified, FALSE) AS success_notified,
+              COALESCE(engine_failed, FALSE) AS engine_failed,
+              COALESCE(attempt_count, 0) AS attempt_count
+            FROM games
+            WHERE player_id = %s AND {url_col} = %s
+            LIMIT 1
+            """,
+            (player_id, str(game_url or "").strip()),
+        )
+        if not row:
+            return {
+                "available": True,
+                "reason": "row_not_found",
+                "found": False,
+                "success_notified": False,
+                "engine_failed": False,
+                "attempt_count": 0,
+            }
+        return {
+            "available": True,
+            "reason": "ok",
+            "found": True,
+            "success_notified": bool(row.get("success_notified", False)),
+            "engine_failed": bool(row.get("engine_failed", False)),
+            "attempt_count": int(row.get("attempt_count", 0) or 0),
+        }
+    except Exception:
+        logger.debug("Skipping game-processing-flags read due to unexpected error.", exc_info=True)
+        return {
+            "available": False,
+            "reason": "runtime_error",
+            "found": False,
+            "success_notified": False,
+            "engine_failed": False,
+            "attempt_count": 0,
+        }
+    finally:
+        cleanup()
+
+
 def mark_engine_failure_notified(
     *,
     player_username: str,

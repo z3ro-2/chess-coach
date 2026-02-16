@@ -73,10 +73,11 @@ from src.config.provider_config import get_provider, set_provider
 from src.config.output_paths import get_output_root
 from src.db.eligibility import eligibility_rejection_reasons, is_game_eligible_for_processing
 from src.db.bootstrap import ensure_bootstrap
-from src.db.ingest_check import close_ingest_db_check, is_game_ingested_in_db
+from src.db.ingest_check import close_ingest_db_check
 from src.db.player_metrics import record_player_rating_for_game
 from src.db.runtime_updates import (
     cleanup_completed_games,
+    get_game_processing_flags,
     fetch_player_runtime_snapshot,
     clear_engine_failed,
     get_pending_games_for_processing,
@@ -742,8 +743,6 @@ def is_processed(conn: sqlite3.Connection, game_url: str) -> bool:
 
 
 def _processed_status(conn: sqlite3.Connection, game_url: str) -> tuple[bool, str]:
-    if is_game_ingested_in_db(game_url):
-        return True, "ingest_db"
     cur = conn.execute("SELECT 1 FROM processed_games WHERE game_url = ?", (game_url,))
     if cur.fetchone() is not None:
         return True, "state_db"
@@ -2517,9 +2516,25 @@ def update_index(out_dir: Path, limit: int = 5000) -> None:
 # Main processing loop
 # -----------------------------
 def process_game(conn: sqlite3.Connection, args: argparse.Namespace, game: GameInfo) -> Optional[Path]:
-    processed, processed_source = _processed_status(conn, game.game_url)
-    if processed:
-        logger.info("process_game skip url=%s reason=already_processed source=%s", game.game_url, processed_source)
+    status = get_game_processing_flags(
+        player_username=str(args.username),
+        game_url=str(game.game_url),
+    )
+    success_notified = bool(status.get("success_notified", False))
+    engine_failed = bool(status.get("engine_failed", False))
+    attempt_count = int(status.get("attempt_count", 0) or 0)
+    logger.info(
+        "process_game evaluating url=%s success_notified=%s engine_failed=%s attempt_count=%s",
+        game.game_url,
+        success_notified,
+        engine_failed,
+        attempt_count,
+    )
+    if success_notified:
+        logger.info("process_game skip url=%s reason=already_processed_success", game.game_url)
+        return None
+    if engine_failed:
+        logger.info("process_game skip url=%s reason=already_processed_engine_failed", game.game_url)
         return None
 
     ensure_dirs(args.out)
@@ -3113,12 +3128,21 @@ def poll_once(conn: sqlite3.Connection, args: argparse.Namespace, *, pending_onl
         }
         _poll_exec_audit("candidate url=%s source=%s", g.game_url, "pending" if from_pending_eligible else "discovered")
 
-        processed, processed_source = _processed_status(conn, g.game_url)
-        if (not retry_mode) and (not from_pending_eligible) and processed:
-            _poll_debug("game skipped url=%s reason=already processed source=%s", g.game_url, processed_source)
-            _poll_exec_audit("skip url=%s reason=already_processed source=%s", g.game_url, processed_source)
-            cycle_skipped_counts["already_processed"] += 1
-            continue
+        if (not retry_mode) and (not from_pending_eligible):
+            status = get_game_processing_flags(
+                player_username=str(args.username),
+                game_url=str(g.game_url),
+            )
+            if bool(status.get("success_notified", False)):
+                _poll_debug("game skipped url=%s reason=already_processed_success", g.game_url)
+                _poll_exec_audit("skip url=%s reason=already_processed_success", g.game_url)
+                cycle_skipped_counts["already_processed"] += 1
+                continue
+            if bool(status.get("engine_failed", False)):
+                _poll_debug("game skipped url=%s reason=already_processed_engine_failed", g.game_url)
+                _poll_exec_audit("skip url=%s reason=already_processed_engine_failed", g.game_url)
+                cycle_skipped_counts["already_processed"] += 1
+                continue
 
         now_utc = datetime.now(timezone.utc)
         eligibility_row: dict[str, Any] = dict(candidate_meta_by_url.get(g.game_url, {}))

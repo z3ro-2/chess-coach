@@ -291,6 +291,44 @@ def test_mark_telegram_send_failed_persists_error(monkeypatch) -> None:
     assert state["commits"] == 1
 
 
+def test_get_game_processing_flags_returns_row_values(monkeypatch) -> None:
+    class _DummyConn:
+        def commit(self) -> None:
+            return None
+
+        def rollback(self) -> None:
+            return None
+
+    monkeypatch.setenv("DATABASE_URL", "postgres://example")
+    monkeypatch.setattr(runtime_updates, "_connect_db", lambda _url: (_DummyConn(), lambda: None))
+    monkeypatch.setattr(
+        runtime_updates,
+        "_table_columns",
+        lambda _conn, table: {"id", "platform_user"} if table == "players" else {"id", "player_id", "game_url", "success_notified", "engine_failed", "attempt_count"},
+    )
+    monkeypatch.setattr(runtime_updates, "_find_player_row", lambda *_args, **_kwargs: {"id": 7})
+    monkeypatch.setattr(
+        runtime_updates,
+        "_fetchone",
+        lambda *_args, **_kwargs: {
+            "success_notified": False,
+            "engine_failed": True,
+            "attempt_count": 4,
+        },
+    )
+
+    out = runtime_updates.get_game_processing_flags(
+        player_username="logan",
+        game_url="https://www.chess.com/game/live/123",
+    )
+
+    assert out["available"] is True
+    assert out["found"] is True
+    assert out["success_notified"] is False
+    assert out["engine_failed"] is True
+    assert out["attempt_count"] == 4
+
+
 def test_record_pgn_missing_not_found_marks_permanent_after_cap(monkeypatch) -> None:
     state = {"commits": 0, "params": None}
 
