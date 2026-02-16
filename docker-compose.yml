@@ -1,8 +1,6 @@
-
 services:
   postgres:
     image: postgres:16
-    container_name: chess-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: chesscoach
@@ -12,16 +10,20 @@ services:
       - chessnet
     volumes:
       - chess_postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chess -d chesscoach"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   chess-coach:
     build:
       context: .
-    container_name: chess-coach
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
     env_file:
       - .env
     environment:
@@ -29,13 +31,13 @@ services:
       CHESS_OUTPUT_DIR: ${CHESS_OUTPUT_DIR:-/data}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       ENABLE_ENGINE: ${ENABLE_ENGINE:-true}
-      STOCKFISH_PATH: ${STOCKFISH_PATH:-/usr/bin/stockfish}
+      STOCKFISH_PATH: ${STOCKFISH_PATH:-/usr/games/stockfish}
       ENGINE_DEPTH: ${ENGINE_DEPTH:-15}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ${HOME}/chess:/data
-      - ./prompts:/app/prompts
+      - ${HOME}/chess/prompts:/app/prompts
     networks:
       - chessnet
 
